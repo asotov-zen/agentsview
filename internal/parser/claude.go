@@ -208,7 +208,7 @@ func parseLinear(
 	userCount := 0
 	firstMsg := ""
 	for _, m := range messages {
-		if m.Role == RoleUser && m.Content != "" {
+		if m.Role == RoleUser && m.Content != "" && !m.IsSystem {
 			userCount++
 			if firstMsg == "" {
 				firstMsg = truncate(
@@ -370,7 +370,7 @@ func parseDAG(
 		userCount := 0
 		firstMsg := ""
 		for _, m := range messages {
-			if m.Role == RoleUser && m.Content != "" {
+			if m.Role == RoleUser && m.Content != "" && !m.IsSystem {
 				userCount++
 				if firstMsg == "" {
 					firstMsg = truncate(
@@ -460,11 +460,12 @@ func extractMessages(entries []dagEntry) (
 			endedAt = e.timestamp
 		}
 
-		// Tier 1: skip system-injected user entries.
+		// Tier 1: system-injected user entries (isMeta, isCompactSummary).
+		isSystem := false
 		if e.entryType == "user" {
 			if gjson.Get(e.line, "isMeta").Bool() ||
 				gjson.Get(e.line, "isCompactSummary").Bool() {
-				continue
+				isSystem = true
 			}
 		}
 
@@ -475,9 +476,9 @@ func extractMessages(entries []dagEntry) (
 			continue
 		}
 
-		// Tier 2: skip known system-injected patterns.
+		// Tier 2: known system-injected patterns.
 		if e.entryType == "user" && isClaudeSystemMessage(text) {
-			continue
+			isSystem = true
 		}
 
 		messages = append(messages, ParsedMessage{
@@ -487,6 +488,7 @@ func extractMessages(entries []dagEntry) (
 			Timestamp:     e.timestamp,
 			HasThinking:   hasThinking,
 			HasToolUse:    hasToolUse,
+			IsSystem:      isSystem,
 			ContentLength: len(text),
 			ToolCalls:     tcs,
 			ToolResults:   trs,

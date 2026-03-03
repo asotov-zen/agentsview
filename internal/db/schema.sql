@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS messages (
     timestamp      TEXT,
     has_thinking   INTEGER NOT NULL DEFAULT 0,
     has_tool_use   INTEGER NOT NULL DEFAULT 0,
+    is_system      INTEGER NOT NULL DEFAULT 0,
     content_length INTEGER NOT NULL DEFAULT 0,
     UNIQUE(session_id, ordinal)
 );

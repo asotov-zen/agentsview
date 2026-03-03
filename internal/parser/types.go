@@ -260,6 +260,7 @@ type ParsedMessage struct {
 	Timestamp     time.Time
 	HasThinking   bool
 	HasToolUse    bool
+	IsSystem      bool
 	ContentLength int
 	ToolCalls     []ParsedToolCall
 	ToolResults   []ParsedToolResult

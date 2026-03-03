@@ -221,7 +221,21 @@ func needsRebuild(path string) (bool, error) {
 			"probing schema: %w", err,
 		)
 	}
-	return subagentColCount == 0, nil
+	if subagentColCount == 0 {
+		return true, nil
+	}
+
+	var isSystemCount int
+	err = conn.QueryRow(
+		`SELECT count(*) FROM pragma_table_info('messages')
+		 WHERE name = 'is_system'`,
+	).Scan(&isSystemCount)
+	if err != nil {
+		return false, fmt.Errorf(
+			"probing schema: %w", err,
+		)
+	}
+	return isSystemCount == 0, nil
 }
 
 func dropDatabase(path string) error {

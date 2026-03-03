@@ -78,7 +78,21 @@ func (b *zencoderSessionBuilder) processMessage(line string) {
 		b.handleAssistantMessage(line)
 	case "tool":
 		b.handleToolMessage(line)
-		// "finish", "permission" — skip entirely.
+	case "finish":
+		reason := gjson.Get(line, "reason").Str
+		if reason == "" {
+			reason = "unknown"
+		}
+		content := "[Turn finished: " + reason + "]"
+		b.messages = append(b.messages, ParsedMessage{
+			Ordinal:       b.ordinal,
+			Role:          RoleUser,
+			IsSystem:      true,
+			Content:       content,
+			ContentLength: len(content),
+		})
+		b.ordinal++
+		// "permission" — skip entirely.
 	}
 }
 
@@ -98,31 +112,51 @@ func (b *zencoderSessionBuilder) handleSystemMessage(
 			b.project = proj
 		}
 	}
+
+	// Store the system message for display.
+	b.messages = append(b.messages, ParsedMessage{
+		Ordinal:       b.ordinal,
+		Role:          RoleUser,
+		IsSystem:      true,
+		Content:       content,
+		ContentLength: len(content),
+	})
+	b.ordinal++
 }
 
 func (b *zencoderSessionBuilder) handleUserMessage(
 	line string,
 ) {
-	content := extractZencoderUserContent(
+	userContent, systemContent := extractZencoderUserContent(
 		gjson.Get(line, "content"),
 	)
-	if strings.TrimSpace(content) == "" {
-		return
+
+	if strings.TrimSpace(userContent) != "" {
+		if b.firstMessage == "" {
+			b.firstMessage = truncate(
+				strings.ReplaceAll(userContent, "\n", " "), 300,
+			)
+		}
+
+		b.messages = append(b.messages, ParsedMessage{
+			Ordinal:       b.ordinal,
+			Role:          RoleUser,
+			Content:       userContent,
+			ContentLength: len(userContent),
+		})
+		b.ordinal++
 	}
 
-	if b.firstMessage == "" {
-		b.firstMessage = truncate(
-			strings.ReplaceAll(content, "\n", " "), 300,
-		)
+	if strings.TrimSpace(systemContent) != "" {
+		b.messages = append(b.messages, ParsedMessage{
+			Ordinal:       b.ordinal,
+			Role:          RoleUser,
+			IsSystem:      true,
+			Content:       systemContent,
+			ContentLength: len(systemContent),
+		})
+		b.ordinal++
 	}
-
-	b.messages = append(b.messages, ParsedMessage{
-		Ordinal:       b.ordinal,
-		Role:          RoleUser,
-		Content:       content,
-		ContentLength: len(content),
-	})
-	b.ordinal++
 }
 
 func (b *zencoderSessionBuilder) handleAssistantMessage(
@@ -207,30 +241,35 @@ func (b *zencoderSessionBuilder) handleToolMessage(
 }
 
 // extractZencoderUserContent extracts text from a Zencoder user
-// message content array, filtering by tag. Only includes blocks
-// where tag is "user-input" or absent.
+// message content array, filtering by tag. Returns user text
+// (blocks with tag "" or "user-input") and system text (blocks
+// with tags like "instructions", "system-reminder", "todo-reminder").
 func extractZencoderUserContent(
 	content gjson.Result,
-) string {
+) (userText, systemText string) {
 	if !content.IsArray() {
-		return ""
+		return "", ""
 	}
 
-	var parts []string
+	var userParts, systemParts []string
 	content.ForEach(func(_, block gjson.Result) bool {
 		if block.Get("type").Str != "text" {
 			return true
 		}
-		tag := block.Get("tag").Str
-		if tag != "" && tag != "user-input" {
+		text := block.Get("text").Str
+		if text == "" {
 			return true
 		}
-		if text := block.Get("text").Str; text != "" {
-			parts = append(parts, text)
+		tag := block.Get("tag").Str
+		if tag == "" || tag == "user-input" {
+			userParts = append(userParts, text)
+		} else {
+			systemParts = append(systemParts, text)
 		}
 		return true
 	})
-	return strings.Join(parts, "\n")
+	return strings.Join(userParts, "\n"),
+		strings.Join(systemParts, "\n")
 }
 
 // extractZencoderAssistantContent extracts text, thinking, and
@@ -395,7 +434,7 @@ func ParseZencoderSession(
 
 	userCount := 0
 	for _, m := range b.messages {
-		if m.Role == RoleUser && m.Content != "" {
+		if m.Role == RoleUser && m.Content != "" && !m.IsSystem {
 			userCount++
 		}
 	}

@@ -109,27 +109,33 @@ func TestParseClaudeSession_EdgeCases(t *testing.T) {
 }
 
 func TestParseClaudeSession_SkippedMessages(t *testing.T) {
-	t.Run("skips isMeta user messages", func(t *testing.T) {
+	t.Run("isMeta user messages marked as system", func(t *testing.T) {
 		content := testjsonl.JoinJSONL(
 			testjsonl.ClaudeMetaUserJSON("meta context", tsZero, true, false),
 			testjsonl.ClaudeUserJSON("real question", tsZeroS1),
 		)
-		sess, _ := runClaudeParserTest(t, "test.jsonl", content)
-		assert.Equal(t, 1, sess.MessageCount)
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		assert.Equal(t, 2, sess.MessageCount)
+		assert.Equal(t, 1, sess.UserMessageCount)
+		assert.True(t, msgs[0].IsSystem)
+		assert.False(t, msgs[1].IsSystem)
 		assert.Equal(t, "real question", sess.FirstMessage)
 	})
 
-	t.Run("skips isCompactSummary user messages", func(t *testing.T) {
+	t.Run("isCompactSummary user messages marked as system", func(t *testing.T) {
 		content := testjsonl.JoinJSONL(
 			testjsonl.ClaudeMetaUserJSON("summary of prior turns", tsZero, false, true),
 			testjsonl.ClaudeUserJSON("actual prompt", tsZeroS1),
 		)
-		sess, _ := runClaudeParserTest(t, "test.jsonl", content)
-		assert.Equal(t, 1, sess.MessageCount)
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		assert.Equal(t, 2, sess.MessageCount)
+		assert.Equal(t, 1, sess.UserMessageCount)
+		assert.True(t, msgs[0].IsSystem)
+		assert.False(t, msgs[1].IsSystem)
 		assert.Equal(t, "actual prompt", sess.FirstMessage)
 	})
 
-	t.Run("skips content-heuristic system messages", func(t *testing.T) {
+	t.Run("content-heuristic system messages marked as system", func(t *testing.T) {
 		content := testjsonl.JoinJSONL(
 			testjsonl.ClaudeUserJSON("This session is being continued from a previous conversation.", tsZero),
 			testjsonl.ClaudeUserJSON("[Request interrupted by user]", tsZeroS1),
@@ -141,20 +147,28 @@ func TestParseClaudeSession_SkippedMessages(t *testing.T) {
 			testjsonl.ClaudeUserJSON("real user message", "2024-01-01T00:00:07Z"),
 		)
 		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
-		assert.Equal(t, 1, sess.MessageCount)
-		assert.Equal(t, "real user message", msgs[0].Content)
+		assert.Equal(t, 8, sess.MessageCount)
+		assert.Equal(t, 1, sess.UserMessageCount)
+		// First 7 messages are system, last is regular.
+		for i := 0; i < 7; i++ {
+			assert.True(t, msgs[i].IsSystem, "msgs[%d] should be system", i)
+		}
+		assert.False(t, msgs[7].IsSystem)
+		assert.Equal(t, "real user message", msgs[7].Content)
 		assert.Equal(t, "real user message", sess.FirstMessage)
 	})
 
-	t.Run("assistant with system-like content not filtered", func(t *testing.T) {
+	t.Run("assistant with system-like content not marked system", func(t *testing.T) {
 		content := testjsonl.JoinJSONL(
 			testjsonl.ClaudeUserJSON("hello", tsZero),
 			testjsonl.ClaudeAssistantJSON([]map[string]any{
 				{"type": "text", "text": "This session is being continued from a previous conversation."},
 			}, tsZeroS1),
 		)
-		sess, _ := runClaudeParserTest(t, "test.jsonl", content)
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
 		assert.Equal(t, 2, sess.MessageCount)
+		assert.False(t, msgs[0].IsSystem)
+		assert.False(t, msgs[1].IsSystem)
 	})
 
 	t.Run("firstMsg from first non-system user message", func(t *testing.T) {
@@ -163,8 +177,12 @@ func TestParseClaudeSession_SkippedMessages(t *testing.T) {
 			testjsonl.ClaudeUserJSON("This session is being continued from a previous conversation.", tsZeroS1),
 			testjsonl.ClaudeUserJSON("Fix the auth bug", tsZeroS2),
 		)
-		sess, _ := runClaudeParserTest(t, "test.jsonl", content)
-		assert.Equal(t, 1, sess.MessageCount)
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		assert.Equal(t, 3, sess.MessageCount)
+		assert.Equal(t, 1, sess.UserMessageCount)
+		assert.True(t, msgs[0].IsSystem)
+		assert.True(t, msgs[1].IsSystem)
+		assert.False(t, msgs[2].IsSystem)
 		assert.Equal(t, "Fix the auth bug", sess.FirstMessage)
 	})
 }
