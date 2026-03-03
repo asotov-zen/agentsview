@@ -346,6 +346,87 @@ func TestParseZencoderSession_NewChatNoRelationship(t *testing.T) {
 	assert.Equal(t, RelNone, sess.RelationshipType)
 }
 
+func TestParseZencoderSession_SubagentSessionID(t *testing.T) {
+	header := `{"id":"parent-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
+	user := `{"role":"user","content":[{"type":"text","text":"Use subagent."}]}`
+	assistant := `{"role":"assistant","content":[` +
+		`{"type":"tool-call","toolCallId":"tc_sub1","toolName":"mcp__zen_subagents__spawn_subagent","input":{"prompt":"do stuff","agent":"research"}}` +
+		`]}`
+	tool := `{"role":"tool","content":[` +
+		`{"type":"tool-result","toolCallId":"tc_sub1","toolName":"mcp__zen_subagents__spawn_subagent","content":[{"type":"text","text":"Subagent completed.\n<session-id>child-abc-123</session-id>"}],"isError":false}` +
+		`]}`
+
+	content := strings.Join([]string{
+		header, user, assistant, tool,
+	}, "\n")
+
+	_, msgs, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+
+	// The assistant message should have the tool call with
+	// SubagentSessionID set from the tool-result's <session-id>.
+	require.Equal(t, 3, len(msgs))
+	require.Equal(t, 1, len(msgs[1].ToolCalls))
+	assert.Equal(t,
+		"zencoder:child-abc-123",
+		msgs[1].ToolCalls[0].SubagentSessionID,
+	)
+}
+
+func TestParseZencoderSession_SubagentMultiple(t *testing.T) {
+	header := `{"id":"parent-456","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
+	user := `{"role":"user","content":[{"type":"text","text":"Use subagents."}]}`
+	assistant := `{"role":"assistant","content":[` +
+		`{"type":"tool-call","toolCallId":"tc_a","toolName":"Zencoder_subagent__ZencoderSubagent","input":{"prompt":"task A","agent":"plan"}},` +
+		`{"type":"tool-call","toolCallId":"tc_b","toolName":"mcp__zen_subagents__spawn_subagent","input":{"prompt":"task B","agent":"research"}}` +
+		`]}`
+	toolA := `{"role":"tool","content":[` +
+		`{"type":"tool-result","toolCallId":"tc_a","content":[{"type":"text","text":"Done A.\n<session-id>child-aaa</session-id>"}],"isError":false}` +
+		`]}`
+	toolB := `{"role":"tool","content":[` +
+		`{"type":"tool-result","toolCallId":"tc_b","content":[{"type":"text","text":"Done B.\n<session-id>child-bbb</session-id>"}],"isError":false}` +
+		`]}`
+
+	content := strings.Join([]string{
+		header, user, assistant, toolA, toolB,
+	}, "\n")
+
+	_, msgs, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+
+	require.Equal(t, 2, len(msgs[1].ToolCalls))
+	assert.Equal(t,
+		"zencoder:child-aaa",
+		msgs[1].ToolCalls[0].SubagentSessionID,
+	)
+	assert.Equal(t,
+		"zencoder:child-bbb",
+		msgs[1].ToolCalls[1].SubagentSessionID,
+	)
+}
+
+func TestParseZencoderSession_NoSessionIDTag(t *testing.T) {
+	header := `{"id":"parent-789","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
+	user := `{"role":"user","content":[{"type":"text","text":"Read file."}]}`
+	assistant := `{"role":"assistant","content":[` +
+		`{"type":"tool-call","toolCallId":"tc_read","toolName":"Read","input":{"file_path":"main.go"}}` +
+		`]}`
+	tool := `{"role":"tool","content":[` +
+		`{"type":"tool-result","toolCallId":"tc_read","content":[{"type":"text","text":"package main"}],"isError":false}` +
+		`]}`
+
+	content := strings.Join([]string{
+		header, user, assistant, tool,
+	}, "\n")
+
+	_, msgs, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+
+	// Non-subagent tool call should have empty SubagentSessionID.
+	require.Equal(t, 1, len(msgs[1].ToolCalls))
+	assert.Empty(t, msgs[1].ToolCalls[0].SubagentSessionID)
+}
+
 func mustParseTime(t *testing.T, s string) time.Time {
 	t.Helper()
 	ts := parseTimestamp(s)

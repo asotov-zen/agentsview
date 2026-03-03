@@ -433,6 +433,33 @@ func (db *DB) GetChildSessions(
 	return scanSessionRows(rows)
 }
 
+// LinkSubagentSessions sets parent_session_id and
+// relationship_type on sessions that are referenced by
+// tool_calls.subagent_session_id but don't yet have a parent.
+func (db *DB) LinkSubagentSessions() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	_, err := db.getWriter().Exec(`
+		UPDATE sessions
+		SET parent_session_id = (
+			SELECT tc.session_id
+			FROM tool_calls tc
+			WHERE tc.subagent_session_id = sessions.id
+			LIMIT 1
+		),
+		relationship_type = 'subagent'
+		WHERE (parent_session_id IS NULL OR parent_session_id = '')
+		AND EXISTS (
+			SELECT 1 FROM tool_calls tc
+			WHERE tc.subagent_session_id = sessions.id
+		)`)
+	if err != nil {
+		return fmt.Errorf("linking subagent sessions: %w", err)
+	}
+	return nil
+}
+
 // GetSessionFileInfo returns file_size and file_mtime for a
 // session. Used for fast skip checks during sync.
 func (db *DB) GetSessionFileInfo(

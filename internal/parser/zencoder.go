@@ -18,10 +18,17 @@ var zencoderCwdRe = regexp.MustCompile(
 	`Working directory:\s+(.+)`,
 )
 
+// zencoderSessionIDRe extracts a subagent session ID from a
+// tool-result text block (e.g. "<session-id>uuid</session-id>").
+var zencoderSessionIDRe = regexp.MustCompile(
+	`<session-id>([^<]+)</session-id>`,
+)
+
 // zencoderSessionBuilder accumulates state while scanning a
 // Zencoder JSONL session file line by line.
 type zencoderSessionBuilder struct {
 	messages        []ParsedMessage
+	subagentMap     map[string]string // toolCallId → "zencoder:<session-id>"
 	firstMessage    string
 	startedAt       time.Time
 	endedAt         time.Time
@@ -35,7 +42,8 @@ type zencoderSessionBuilder struct {
 
 func newZencoderSessionBuilder() *zencoderSessionBuilder {
 	return &zencoderSessionBuilder{
-		project: "unknown",
+		subagentMap: map[string]string{},
+		project:     "unknown",
 	}
 }
 
@@ -161,6 +169,21 @@ func (b *zencoderSessionBuilder) handleToolMessage(
 				ToolUseID:     toolCallID,
 				ContentLength: cl,
 			})
+
+			// Extract <session-id> from tool-result content
+			// to map subagent tool calls to their sessions.
+			block.Get("content").ForEach(
+				func(_, cb gjson.Result) bool {
+					if m := zencoderSessionIDRe.FindStringSubmatch(
+						cb.Get("text").Str,
+					); len(m) > 1 {
+						b.subagentMap[toolCallID] =
+							"zencoder:" + m[1]
+					}
+					return true
+				},
+			)
+
 			return true
 		},
 	)
@@ -366,6 +389,9 @@ func ParseZencoderSession(
 			// "newChat" or unknown → no relationship.
 		}
 	}
+
+	// Annotate tool calls with their subagent session IDs.
+	annotateSubagentSessions(b.messages, b.subagentMap)
 
 	userCount := 0
 	for _, m := range b.messages {
