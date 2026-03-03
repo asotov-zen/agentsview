@@ -17,6 +17,7 @@ const (
 	AgentCursor        AgentType = "cursor"
 	AgentIflow         AgentType = "iflow"
 	AgentAmp           AgentType = "amp"
+	AgentZencoder      AgentType = "zencoder"
 	AgentVSCodeCopilot AgentType = "vscode-copilot"
 	AgentPi            AgentType = "pi"
 	AgentOpenClaw      AgentType = "openclaw"
@@ -121,6 +122,17 @@ var Registry = []AgentDef{
 		FileBased:      true,
 		DiscoverFunc:   DiscoverAmpSessions,
 		FindSourceFunc: FindAmpSourceFile,
+	},
+	{
+		Type:           AgentZencoder,
+		DisplayName:    "Zencoder",
+		EnvVar:         "ZENCODER_DIR",
+		ConfigKey:      "zencoder_dirs",
+		DefaultDirs:    []string{".zencoder/sessions"},
+		IDPrefix:       "zencoder:",
+		FileBased:      true,
+		DiscoverFunc:   DiscoverZencoderSessions,
+		FindSourceFunc: FindZencoderSourceFile,
 	},
 	{
 		Type:           AgentIflow,

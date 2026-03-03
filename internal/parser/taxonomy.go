@@ -112,6 +112,16 @@ func NormalizeToolCategory(rawName string) string {
 	case "subagents", "agents_list", "session_status":
 		return "Task"
 
+	// Zencoder tools (not already covered above)
+	case "WebFetch":
+		return "Read"
+	case "TodoWrite":
+		return "Tool"
+	case "subagent__ZencoderSubagent":
+		return "Task"
+	case "zencoder-rag-mcp__web_search":
+		return "Read"
+
 	default:
 		return "Other"
 	}
