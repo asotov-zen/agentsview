@@ -106,6 +106,7 @@ function readStoredLayout(): MessageLayout {
 
 class UIStore {
   theme: Theme = $state(readStoredTheme() || "light");
+  showSystem: boolean = $state(false);
   sortNewestFirst: boolean = $state(false);
   messageLayout: MessageLayout = $state(readStoredLayout());
   activeModal: ModalType = $state(null);
@@ -231,6 +232,10 @@ class UIStore {
     } catch {
       // ignore
     }
+  }
+
+  toggleSystem() {
+    this.showSystem = !this.showSystem;
   }
 
   toggleSort() {

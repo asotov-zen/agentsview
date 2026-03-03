@@ -61,6 +61,7 @@ export interface Message {
   timestamp: string;
   has_thinking: boolean;
   has_tool_use: boolean;
+  is_system: boolean;
   content_length: number;
   tool_calls?: ToolCall[];
 }
@@ -68,7 +69,7 @@ export interface Message {
 /** Matches Go MinimapEntry struct */
 export type MinimapEntry = Pick<
   Message,
-  "ordinal" | "role" | "content_length" | "has_thinking" | "has_tool_use"
+  "ordinal" | "role" | "content_length" | "has_thinking" | "has_tool_use" | "is_system"
 >;
 
 /** Matches Go SearchResult struct in internal/db/search.go */

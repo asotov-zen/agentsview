@@ -109,11 +109,9 @@ func (b *codexSessionBuilder) handleResponseItem(
 		return
 	}
 
-	if role == "user" && isCodexSystemMessage(content) {
-		return
-	}
+	isSystem := role == "user" && isCodexSystemMessage(content)
 
-	if role == "user" && b.firstMessage == "" {
+	if role == "user" && !isSystem && b.firstMessage == "" {
 		b.firstMessage = truncate(
 			strings.ReplaceAll(content, "\n", " "), 300,
 		)
@@ -124,6 +122,7 @@ func (b *codexSessionBuilder) handleResponseItem(
 		Role:          RoleType(role),
 		Content:       content,
 		Timestamp:     ts,
+		IsSystem:      isSystem,
 		ContentLength: len(content),
 	})
 	b.ordinal++
@@ -575,7 +574,7 @@ func ParseCodexSession(
 
 	userCount := 0
 	for _, m := range b.messages {
-		if m.Role == RoleUser && m.Content != "" {
+		if m.Role == RoleUser && m.Content != "" && !m.IsSystem {
 			userCount++
 		}
 	}

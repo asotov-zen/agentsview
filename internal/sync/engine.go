@@ -1792,6 +1792,7 @@ func toDBMessages(pw pendingWrite, blocked map[string]bool) []db.Message {
 			Timestamp:     timeutil.Format(m.Timestamp),
 			HasThinking:   m.HasThinking,
 			HasToolUse:    m.HasToolUse,
+			IsSystem:      m.IsSystem,
 			ContentLength: m.ContentLength,
 			ToolCalls: convertToolCalls(
 				pw.sess.ID, m.ToolCalls,
@@ -1803,10 +1804,11 @@ func toDBMessages(pw pendingWrite, blocked map[string]bool) []db.Message {
 }
 
 // postFilterCounts returns the total and user message counts
-// from a filtered message slice.
+// from a filtered message slice. System messages are excluded
+// from the user count.
 func postFilterCounts(msgs []db.Message) (total, user int) {
 	for _, m := range msgs {
-		if m.Role == "user" {
+		if m.Role == "user" && !m.IsSystem {
 			user++
 		}
 	}

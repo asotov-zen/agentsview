@@ -11,10 +11,10 @@ import (
 
 const (
 	selectMessageCols = `id, session_id, ordinal, role, content,
-		timestamp, has_thinking, has_tool_use, content_length`
+		timestamp, has_thinking, has_tool_use, is_system, content_length`
 
 	insertMessageCols = `session_id, ordinal, role, content,
-		timestamp, has_thinking, has_tool_use, content_length`
+		timestamp, has_thinking, has_tool_use, is_system, content_length`
 
 	// DefaultMessageLimit is the default number of messages returned.
 	DefaultMessageLimit = 100
@@ -58,6 +58,7 @@ type Message struct {
 	Timestamp     string       `json:"timestamp"`
 	HasThinking   bool         `json:"has_thinking"`
 	HasToolUse    bool         `json:"has_tool_use"`
+	IsSystem      bool         `json:"is_system"`
 	ContentLength int          `json:"content_length"`
 	ToolCalls     []ToolCall   `json:"tool_calls,omitempty"`
 	ToolResults   []ToolResult `json:"-"` // transient, for pairing
@@ -70,6 +71,7 @@ type MinimapEntry struct {
 	ContentLength int    `json:"content_length"`
 	HasThinking   bool   `json:"has_thinking"`
 	HasToolUse    bool   `json:"has_tool_use"`
+	IsSystem      bool   `json:"is_system"`
 }
 
 // GetMessages returns paginated messages for a session.
@@ -151,7 +153,7 @@ func (db *DB) GetMinimapFrom(
 	ctx context.Context, sessionID string, from int,
 ) ([]MinimapEntry, error) {
 	rows, err := db.getReader().QueryContext(ctx, `
-		SELECT ordinal, role, content_length, has_thinking, has_tool_use
+		SELECT ordinal, role, content_length, has_thinking, has_tool_use, is_system
 		FROM messages
 		WHERE session_id = ? AND ordinal >= ?
 		ORDER BY ordinal ASC`, sessionID, from)
@@ -165,7 +167,7 @@ func (db *DB) GetMinimapFrom(
 		var e MinimapEntry
 		if err := rows.Scan(
 			&e.Ordinal, &e.Role, &e.ContentLength,
-			&e.HasThinking, &e.HasToolUse,
+			&e.HasThinking, &e.HasToolUse, &e.IsSystem,
 		); err != nil {
 			return nil, fmt.Errorf("scanning minimap entry: %w", err)
 		}
@@ -204,7 +206,7 @@ func (db *DB) insertMessagesTx(
 ) ([]int64, error) {
 	stmt, err := tx.Prepare(fmt.Sprintf(`
 		INSERT INTO messages (%s)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, insertMessageCols))
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, insertMessageCols))
 	if err != nil {
 		return nil, fmt.Errorf("preparing insert: %w", err)
 	}
@@ -215,7 +217,7 @@ func (db *DB) insertMessagesTx(
 		res, err := stmt.Exec(
 			m.SessionID, m.Ordinal, m.Role, m.Content,
 			m.Timestamp, m.HasThinking, m.HasToolUse,
-			m.ContentLength,
+			m.IsSystem, m.ContentLength,
 		)
 		if err != nil {
 			return nil, fmt.Errorf(
@@ -497,7 +499,8 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 		err := rows.Scan(
 			&m.ID, &m.SessionID, &m.Ordinal, &m.Role,
 			&m.Content, &m.Timestamp,
-			&m.HasThinking, &m.HasToolUse, &m.ContentLength,
+			&m.HasThinking, &m.HasToolUse, &m.IsSystem,
+			&m.ContentLength,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning message: %w", err)
@@ -531,7 +534,8 @@ func (db *DB) GetMessageByOrdinal(
 	err := row.Scan(
 		&m.ID, &m.SessionID, &m.Ordinal, &m.Role,
 		&m.Content, &m.Timestamp,
-		&m.HasThinking, &m.HasToolUse, &m.ContentLength,
+		&m.HasThinking, &m.HasToolUse, &m.IsSystem,
+		&m.ContentLength,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil

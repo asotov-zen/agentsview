@@ -29,6 +29,7 @@
   );
 
   let isUser = $derived(message.role === "user");
+  let isSystem = $derived(message.is_system);
 
   /** Whether the text (prose) segments for this role should render. */
   let showText = $derived(
@@ -36,11 +37,19 @@
   );
 
   let accentColor = $derived(
-    isUser ? "var(--accent-blue)" : "var(--accent-purple)",
+    isSystem
+      ? "var(--text-muted)"
+      : isUser
+        ? "var(--accent-blue)"
+        : "var(--accent-purple)",
   );
 
   let roleBg = $derived(
-    isUser ? "var(--user-bg)" : "var(--assistant-bg)",
+    isSystem
+      ? "var(--bg-inset)"
+      : isUser
+        ? "var(--user-bg)"
+        : "var(--assistant-bg)",
   );
 
   let pinned = $derived(pins.isPinned(message.id));
@@ -78,6 +87,7 @@
 <div
   class="message"
   class:is-user={isUser}
+  class:is-system={isSystem}
   style:border-left-color={accentColor}
   style:background={roleBg}
 >
@@ -86,13 +96,13 @@
       class="role-icon"
       style:background={accentColor}
     >
-      {isUser ? "U" : "A"}
+      {isSystem ? "S" : isUser ? "U" : "A"}
     </span>
     <span
       class="role-label"
       style:color={accentColor}
     >
-      {isUser ? "User" : "Assistant"}
+      {isSystem ? "System" : isUser ? "User" : "Assistant"}
     </span>
     <button
       type="button"
@@ -164,6 +174,16 @@
     border-left: 4px solid;
     padding: 14px 20px;
     border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  }
+
+  .message.is-system {
+    opacity: 0.7;
+    font-size: 13px;
+  }
+
+  .message.is-system .text-content {
+    font-family: var(--font-mono);
+    font-size: 12px;
   }
 
   .message-header {

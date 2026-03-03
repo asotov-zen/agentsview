@@ -40,7 +40,8 @@ func TestParseZencoderSession_Basic(t *testing.T) {
 	)
 
 	assert.Equal(t, "Fix the bug.", sess.FirstMessage)
-	assertMessageCount(t, sess.MessageCount, 2)
+	// System message + user + assistant + finish = 4
+	assertMessageCount(t, sess.MessageCount, 4)
 	assert.Equal(t, 1, sess.UserMessageCount)
 
 	wantStart := mustParseTime(t, "2024-01-01T00:00:00Z")
@@ -49,11 +50,20 @@ func TestParseZencoderSession_Basic(t *testing.T) {
 	wantEnd := mustParseTime(t, "2024-01-01T00:01:00Z")
 	assertTimestamp(t, sess.EndedAt, wantEnd)
 
-	require.Equal(t, 2, len(msgs))
-	assertMessage(t, msgs[0], RoleUser, "Fix the bug.")
-	assertMessage(t, msgs[1], RoleAssistant, "Sure, I will fix it.")
-	assert.Equal(t, 0, msgs[0].Ordinal)
-	assert.Equal(t, 1, msgs[1].Ordinal)
+	require.Equal(t, 4, len(msgs))
+	// msg[0]: system message (IsSystem=true)
+	assert.True(t, msgs[0].IsSystem)
+	assert.Equal(t, RoleUser, msgs[0].Role)
+	assert.Contains(t, msgs[0].Content, "Working directory")
+	// msg[1]: user message
+	assertMessage(t, msgs[1], RoleUser, "Fix the bug.")
+	assert.False(t, msgs[1].IsSystem)
+	// msg[2]: assistant message
+	assertMessage(t, msgs[2], RoleAssistant, "Sure, I will fix it.")
+	assert.False(t, msgs[2].IsSystem)
+	// msg[3]: finish message (IsSystem=true)
+	assert.True(t, msgs[3].IsSystem)
+	assert.Equal(t, "[Turn finished: endTurn]", msgs[3].Content)
 
 	// No parent → no relationship.
 	assert.Empty(t, sess.ParentSessionID)
@@ -140,10 +150,25 @@ func TestParseZencoderSession_UserInputTagFiltering(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 
-	// Only "user-input" tagged content should be extracted.
+	// User message has only "user-input" tagged content.
 	assert.Equal(t, "actual user input", msgs[0].Content)
+	assert.False(t, msgs[0].IsSystem)
 	assert.NotContains(t, msgs[0].Content, "system instructions")
 	assert.NotContains(t, msgs[0].Content, "todo reminder")
+
+	// System-tagged content stored as separate system message.
+	assert.True(t, msgs[1].IsSystem)
+	assert.Equal(t, RoleUser, msgs[1].Role)
+	assert.Contains(t, msgs[1].Content, "system instructions")
+	assert.Contains(t, msgs[1].Content, "todo reminder")
+
+	// Assistant message follows.
+	assert.Equal(t, RoleAssistant, msgs[2].Role)
+	assert.False(t, msgs[2].IsSystem)
+
+	// UserMessageCount should exclude system messages.
+	assert.Equal(t, 1, sess.UserMessageCount)
+	assert.Equal(t, "actual user input", sess.FirstMessage)
 }
 
 func TestParseZencoderSession_DirectContinuation(t *testing.T) {
@@ -189,11 +214,16 @@ func TestParseZencoderSession_ProjectExtraction(t *testing.T) {
 		header, system, user,
 	}, "\n")
 
-	sess, _, err := runZencoderParserTest(t, content)
+	sess, msgs, err := runZencoderParserTest(t, content)
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 
 	assert.Equal(t, "coolproject", sess.Project)
+	// System message stored + user message = 2
+	assert.Equal(t, 2, sess.MessageCount)
+	assert.Equal(t, 1, sess.UserMessageCount)
+	assert.True(t, msgs[0].IsSystem)
+	assert.False(t, msgs[1].IsSystem)
 }
 
 func TestParseZencoderSession_EmptySession(t *testing.T) {
@@ -206,7 +236,7 @@ func TestParseZencoderSession_EmptySession(t *testing.T) {
 	assert.Nil(t, msgs)
 }
 
-func TestParseZencoderSession_PermissionAndFinishSkipped(t *testing.T) {
+func TestParseZencoderSession_PermissionSkippedFinishStored(t *testing.T) {
 	header := `{"id":"skip-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
 	user := `{"role":"user","content":[{"type":"text","text":"Do it."}]}`
 	permission := `{"role":"permission","data":{"allowed":true}}`
@@ -221,9 +251,15 @@ func TestParseZencoderSession_PermissionAndFinishSkipped(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 
-	// permission and finish are skipped, only user + assistant.
-	assertMessageCount(t, sess.MessageCount, 2)
-	require.Equal(t, 2, len(msgs))
+	// permission is skipped; finish is stored as system.
+	// user + assistant + finish = 3
+	assertMessageCount(t, sess.MessageCount, 3)
+	require.Equal(t, 3, len(msgs))
+	assert.False(t, msgs[0].IsSystem) // user
+	assert.False(t, msgs[1].IsSystem) // assistant
+	assert.True(t, msgs[2].IsSystem)  // finish
+	assert.Equal(t, "[Turn finished: endTurn]", msgs[2].Content)
+	assert.Equal(t, 1, sess.UserMessageCount)
 }
 
 func TestParseZencoderSession_FirstMessageTruncation(t *testing.T) {

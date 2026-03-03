@@ -278,7 +278,7 @@ func TestParseCodexSession_InputJSON(t *testing.T) {
 }
 
 func TestParseCodexSession_EdgeCases(t *testing.T) {
-	t.Run("skips system messages", func(t *testing.T) {
+	t.Run("marks system messages", func(t *testing.T) {
 		content := testjsonl.JoinJSONL(
 			testjsonl.CodexSessionMetaJSON("abc", "/tmp", "user", tsEarly),
 			testjsonl.CodexMsgJSON("user", "# AGENTS.md\nsome instructions", tsEarlyS1),
@@ -288,8 +288,14 @@ func TestParseCodexSession_EdgeCases(t *testing.T) {
 		)
 		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
 		require.NotNil(t, sess)
-		assert.Equal(t, 1, len(msgs))
-		assert.Equal(t, "Actual user message", msgs[0].Content)
+		assert.Equal(t, 4, len(msgs))
+		assert.True(t, msgs[0].IsSystem)
+		assert.True(t, msgs[1].IsSystem)
+		assert.True(t, msgs[2].IsSystem)
+		assert.False(t, msgs[3].IsSystem)
+		assert.Equal(t, "Actual user message", msgs[3].Content)
+		assert.Equal(t, 1, sess.UserMessageCount)
+		assert.Equal(t, "Actual user message", sess.FirstMessage)
 	})
 
 	t.Run("fallback ID from filename", func(t *testing.T) {
