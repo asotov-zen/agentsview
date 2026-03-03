@@ -15,6 +15,8 @@ describe("KNOWN_AGENTS", () => {
       "opencode",
       "cursor",
       "amp",
+      "zencoder",
+      "vscode-copilot",
     ]);
   });
 
@@ -47,6 +49,12 @@ describe("agentColor", () => {
     );
     expect(agentColor("amp")).toBe(
       "var(--accent-coral)",
+    );
+    expect(agentColor("zencoder")).toBe(
+      "var(--accent-red)",
+    );
+    expect(agentColor("vscode-copilot")).toBe(
+      "var(--accent-teal)",
     );
   });
 

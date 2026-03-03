@@ -85,6 +85,16 @@ func NormalizeToolCategory(rawName string) string {
 	case "skill":
 		return "Tool"
 
+	// Zencoder tools (not already covered above)
+	case "WebFetch":
+		return "Read"
+	case "TodoWrite":
+		return "Tool"
+	case "subagent__ZencoderSubagent":
+		return "Task"
+	case "zencoder-rag-mcp__web_search":
+		return "Read"
+
 	default:
 		return "Other"
 	}
