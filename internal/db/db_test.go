@@ -2619,3 +2619,77 @@ func TestGetAgentsEmptyResultSerializesAsArray(t *testing.T) {
 		t.Errorf("JSON = %s, want []", b)
 	}
 }
+
+func TestSessionCwd(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	t.Run("RoundTrip", func(t *testing.T) {
+		insertSession(t, d, "cwd-1", "proj", func(s *Session) {
+			s.Cwd = Ptr("/home/user/project")
+			s.MessageCount = 1
+			s.StartedAt = Ptr(tsZero)
+			s.EndedAt = Ptr(tsHour1)
+		})
+
+		// List (base cols) returns cwd.
+		page, err := d.ListSessions(ctx, SessionFilter{Limit: 10})
+		requireNoError(t, err, "ListSessions")
+		if len(page.Sessions) != 1 {
+			t.Fatalf("expected 1 session, got %d", len(page.Sessions))
+		}
+		if page.Sessions[0].Cwd == nil || *page.Sessions[0].Cwd != "/home/user/project" {
+			t.Errorf("Cwd = %v, want /home/user/project", page.Sessions[0].Cwd)
+		}
+
+		// GetSession (base cols) returns cwd.
+		got, err := d.GetSession(ctx, "cwd-1")
+		requireNoError(t, err, "GetSession")
+		if got.Cwd == nil || *got.Cwd != "/home/user/project" {
+			t.Errorf("GetSession Cwd = %v, want /home/user/project", got.Cwd)
+		}
+
+		// GetSessionFull returns cwd.
+		full, err := d.GetSessionFull(ctx, "cwd-1")
+		requireNoError(t, err, "GetSessionFull")
+		if full.Cwd == nil || *full.Cwd != "/home/user/project" {
+			t.Errorf("GetSessionFull Cwd = %v, want /home/user/project", full.Cwd)
+		}
+	})
+
+	t.Run("NullCwd", func(t *testing.T) {
+		insertSession(t, d, "cwd-2", "proj", func(s *Session) {
+			s.MessageCount = 1
+			s.StartedAt = Ptr(tsZero)
+			s.EndedAt = Ptr(tsHour1)
+		})
+
+		got, err := d.GetSession(ctx, "cwd-2")
+		requireNoError(t, err, "GetSession")
+		if got.Cwd != nil {
+			t.Errorf("Cwd = %v, want nil", got.Cwd)
+		}
+	})
+
+	t.Run("UpsertUpdatesCwd", func(t *testing.T) {
+		insertSession(t, d, "cwd-3", "proj", func(s *Session) {
+			s.Cwd = Ptr("/old/path")
+			s.MessageCount = 1
+			s.StartedAt = Ptr(tsZero)
+			s.EndedAt = Ptr(tsHour1)
+		})
+		// Update cwd via upsert.
+		insertSession(t, d, "cwd-3", "proj", func(s *Session) {
+			s.Cwd = Ptr("/new/path")
+			s.MessageCount = 2
+			s.StartedAt = Ptr(tsZero)
+			s.EndedAt = Ptr(tsHour1)
+		})
+
+		got, err := d.GetSession(ctx, "cwd-3")
+		requireNoError(t, err, "GetSession")
+		if got.Cwd == nil || *got.Cwd != "/new/path" {
+			t.Errorf("Cwd = %v, want /new/path", got.Cwd)
+		}
+	})
+}

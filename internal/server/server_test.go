@@ -2517,3 +2517,54 @@ func TestFindAvailablePortSkipsOccupied(t *testing.T) {
 	}
 	ln2.Close()
 }
+
+func TestRawDownload(t *testing.T) {
+	te := setup(t)
+
+	// Create a temp file to act as the raw session file.
+	tmpFile := filepath.Join(te.dataDir, "test-session.jsonl")
+	content := `{"type":"user","message":{"content":[{"type":"text","text":"hello"}]}}`
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("writing temp file: %v", err)
+	}
+
+	te.seedSession(t, "raw-1", "proj", 1, func(s *db.Session) {
+		s.FilePath = dbtest.Ptr(tmpFile)
+		s.FileSize = dbtest.Ptr(int64(len(content)))
+	})
+
+	w := te.get(t, "/api/v1/sessions/raw-1/raw")
+	assertStatus(t, w, http.StatusOK)
+
+	cd := w.Header().Get("Content-Disposition")
+	if !strings.Contains(cd, "test-session.jsonl") {
+		t.Errorf("expected filename in Content-Disposition, got %q", cd)
+	}
+	if w.Body.String() != content {
+		t.Errorf("body = %q, want %q", w.Body.String(), content)
+	}
+}
+
+func TestRawDownload_NotFound(t *testing.T) {
+	te := setup(t)
+	w := te.get(t, "/api/v1/sessions/nonexistent/raw")
+	assertStatus(t, w, http.StatusNotFound)
+}
+
+func TestRawDownload_NoFilePath(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "raw-no-path", "proj", 1)
+
+	w := te.get(t, "/api/v1/sessions/raw-no-path/raw")
+	assertStatus(t, w, http.StatusNotFound)
+}
+
+func TestRawDownload_FileNotOnDisk(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "raw-missing", "proj", 1, func(s *db.Session) {
+		s.FilePath = dbtest.Ptr("/nonexistent/path/session.jsonl")
+	})
+
+	w := te.get(t, "/api/v1/sessions/raw-missing/raw")
+	assertStatus(t, w, http.StatusNotFound)
+}

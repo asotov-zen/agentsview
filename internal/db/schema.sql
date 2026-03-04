@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     file_size   INTEGER,
     file_mtime  INTEGER,
     file_hash   TEXT,
+    cwd         TEXT,
     parent_session_id TEXT,
     relationship_type TEXT NOT NULL DEFAULT '',
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))

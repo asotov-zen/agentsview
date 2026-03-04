@@ -20,21 +20,21 @@ var ErrInvalidCursor = errors.New("invalid cursor")
 const sessionBaseCols = `id, project, machine, agent,
 	first_message, started_at, ended_at,
 	message_count, user_message_count,
-	parent_session_id, relationship_type, created_at`
+	parent_session_id, relationship_type, cwd, created_at`
 
 // sessionPruneCols extends sessionBaseCols with file metadata
 // needed by FindPruneCandidates.
 const sessionPruneCols = `id, project, machine, agent,
 	first_message, started_at, ended_at,
 	message_count, user_message_count,
-	parent_session_id, relationship_type,
+	parent_session_id, relationship_type, cwd,
 	file_path, file_size, created_at`
 
 // sessionFullCols includes all columns for a complete session record.
 const sessionFullCols = `id, project, machine, agent,
 	first_message, started_at, ended_at,
 	message_count, user_message_count,
-	parent_session_id, relationship_type,
+	parent_session_id, relationship_type, cwd,
 	file_path, file_size, file_mtime,
 	file_hash, created_at`
 
@@ -59,7 +59,7 @@ func scanSessionRow(rs rowScanner) (Session, error) {
 		&s.FirstMessage, &s.StartedAt, &s.EndedAt,
 		&s.MessageCount, &s.UserMessageCount,
 		&s.ParentSessionID, &s.RelationshipType,
-		&s.CreatedAt,
+		&s.Cwd, &s.CreatedAt,
 	)
 	return s, err
 }
@@ -77,6 +77,7 @@ type Session struct {
 	UserMessageCount int     `json:"user_message_count"`
 	ParentSessionID  *string `json:"parent_session_id,omitempty"`
 	RelationshipType string  `json:"relationship_type,omitempty"`
+	Cwd              *string `json:"cwd,omitempty"`
 	FilePath         *string `json:"file_path,omitempty"`
 	FileSize         *int64  `json:"file_size,omitempty"`
 	FileMtime        *int64  `json:"file_mtime,omitempty"`
@@ -363,7 +364,7 @@ func (db *DB) GetSessionFull(
 		&s.FirstMessage, &s.StartedAt, &s.EndedAt,
 		&s.MessageCount, &s.UserMessageCount,
 		&s.ParentSessionID, &s.RelationshipType,
-		&s.FilePath, &s.FileSize,
+		&s.Cwd, &s.FilePath, &s.FileSize,
 		&s.FileMtime, &s.FileHash, &s.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -385,9 +386,9 @@ func (db *DB) UpsertSession(s Session) error {
 			id, project, machine, agent, first_message,
 			started_at, ended_at, message_count,
 			user_message_count, parent_session_id,
-			relationship_type,
+			relationship_type, cwd,
 			file_path, file_size, file_mtime, file_hash
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			project = excluded.project,
 			machine = excluded.machine,
@@ -399,6 +400,7 @@ func (db *DB) UpsertSession(s Session) error {
 			user_message_count = excluded.user_message_count,
 			parent_session_id = excluded.parent_session_id,
 			relationship_type = excluded.relationship_type,
+			cwd = excluded.cwd,
 			file_path = excluded.file_path,
 			file_size = excluded.file_size,
 			file_mtime = excluded.file_mtime,
@@ -406,7 +408,7 @@ func (db *DB) UpsertSession(s Session) error {
 		s.ID, s.Project, s.Machine, s.Agent, s.FirstMessage,
 		s.StartedAt, s.EndedAt, s.MessageCount,
 		s.UserMessageCount, s.ParentSessionID,
-		s.RelationshipType,
+		s.RelationshipType, s.Cwd,
 		s.FilePath, s.FileSize, s.FileMtime, s.FileHash)
 	if err != nil {
 		return fmt.Errorf("upserting session %s: %w", s.ID, err)
@@ -704,7 +706,7 @@ func (db *DB) FindPruneCandidates(
 			&s.FirstMessage, &s.StartedAt, &s.EndedAt,
 			&s.MessageCount, &s.UserMessageCount,
 			&s.ParentSessionID, &s.RelationshipType,
-			&s.FilePath, &s.FileSize, &s.CreatedAt,
+			&s.Cwd, &s.FilePath, &s.FileSize, &s.CreatedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning prune candidate: %w", err)

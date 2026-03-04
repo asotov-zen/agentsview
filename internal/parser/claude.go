@@ -62,6 +62,7 @@ func ParseClaudeSession(
 		allHaveUUID     bool
 		parentSessionID string
 		foundParentSID  bool
+		sessionCwd      string
 		lineIndex       int
 		subagentMap     = map[string]string{}
 		globalStart     time.Time
@@ -143,6 +144,12 @@ func ParseClaudeSession(
 			}
 		}
 
+		if sessionCwd == "" && entryType == "user" {
+			if cwd := gjson.Get(line, "cwd").Str; cwd != "" {
+				sessionCwd = cwd
+			}
+		}
+
 		uuid := gjson.Get(line, "uuid").Str
 		parentUuid := gjson.Get(line, "parentUuid").Str
 
@@ -179,7 +186,7 @@ func ParseClaudeSession(
 	if hasAnyUUID && allHaveUUID {
 		return parseDAG(
 			entries, sessionID, project, machine,
-			parentSessionID, fileInfo, subagentMap,
+			parentSessionID, sessionCwd, fileInfo, subagentMap,
 			globalStart, globalEnd,
 		)
 	}
@@ -187,7 +194,7 @@ func ParseClaudeSession(
 	// Fall back to linear processing.
 	return parseLinear(
 		entries, sessionID, project, machine,
-		parentSessionID, fileInfo, subagentMap,
+		parentSessionID, sessionCwd, fileInfo, subagentMap,
 		globalStart, globalEnd,
 	)
 }
@@ -195,7 +202,7 @@ func ParseClaudeSession(
 // parseLinear processes entries sequentially without DAG awareness.
 func parseLinear(
 	entries []dagEntry,
-	sessionID, project, machine, parentSessionID string,
+	sessionID, project, machine, parentSessionID, sessionCwd string,
 	fileInfo FileInfo,
 	subagentMap map[string]string,
 	globalStart, globalEnd time.Time,
@@ -224,6 +231,7 @@ func parseLinear(
 		Machine:          machine,
 		Agent:            AgentClaude,
 		ParentSessionID:  parentSessionID,
+		Cwd:              sessionCwd,
 		FirstMessage:     firstMsg,
 		StartedAt:        startedAt,
 		EndedAt:          endedAt,
@@ -240,7 +248,7 @@ func parseLinear(
 // ParseResults; small-gap retries follow the latest branch.
 func parseDAG(
 	entries []dagEntry,
-	sessionID, project, machine, parentSessionID string,
+	sessionID, project, machine, parentSessionID, sessionCwd string,
 	fileInfo FileInfo,
 	subagentMap map[string]string,
 	globalStart, globalEnd time.Time,
@@ -267,7 +275,7 @@ func parseDAG(
 	if len(roots) != 1 {
 		return parseLinear(
 			entries, sessionID, project, machine,
-			parentSessionID, fileInfo, subagentMap,
+			parentSessionID, sessionCwd, fileInfo, subagentMap,
 			globalStart, globalEnd,
 		)
 	}
@@ -276,7 +284,7 @@ func parseDAG(
 			if _, ok := uuidSet[e.parentUuid]; !ok {
 				return parseLinear(
 					entries, sessionID, project, machine,
-					parentSessionID, fileInfo, subagentMap,
+					parentSessionID, sessionCwd, fileInfo, subagentMap,
 					globalStart, globalEnd,
 				)
 			}
@@ -399,6 +407,7 @@ func parseDAG(
 			Agent:            AgentClaude,
 			ParentSessionID:  pSID,
 			RelationshipType: relType,
+			Cwd:              sessionCwd,
 			FirstMessage:     firstMsg,
 			StartedAt:        startedAt,
 			EndedAt:          endedAt,

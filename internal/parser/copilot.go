@@ -28,6 +28,7 @@ type copilotSessionBuilder struct {
 	endedAt      time.Time
 	sessionID    string
 	project      string
+	cwd          string
 	ordinal      int
 }
 
@@ -73,6 +74,7 @@ func (b *copilotSessionBuilder) handleSessionStart(
 	cwd := data.Get("context.cwd").Str
 	branch := data.Get("context.branch").Str
 	if cwd != "" {
+		b.cwd = cwd
 		if p := ExtractProjectFromCwdWithBranch(
 			cwd, branch,
 		); p != "" {
@@ -278,6 +280,7 @@ func ParseCopilotSession(
 		Project:          b.project,
 		Machine:          machine,
 		Agent:            AgentCopilot,
+		Cwd:              b.cwd,
 		FirstMessage:     b.firstMessage,
 		StartedAt:        b.startedAt,
 		EndedAt:          b.endedAt,

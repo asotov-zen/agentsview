@@ -1451,6 +1451,7 @@ func toDBSession(pw pendingWrite) db.Session {
 		UserMessageCount: pw.sess.UserMessageCount,
 		ParentSessionID:  strPtr(pw.sess.ParentSessionID),
 		RelationshipType: string(pw.sess.RelationshipType),
+		Cwd:              strPtr(pw.sess.Cwd),
 		FilePath:         strPtr(pw.sess.File.Path),
 		FileSize:         int64Ptr(pw.sess.File.Size),
 		FileMtime:        int64Ptr(pw.sess.File.Mtime),

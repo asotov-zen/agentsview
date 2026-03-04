@@ -319,6 +319,11 @@ export function getExportUrl(sessionId: string): string {
   return `${BASE}/sessions/${sessionId}/export`;
 }
 
+/** Get the raw file download URL for a session */
+export function getRawUrl(sessionId: string): string {
+  return `${BASE}/sessions/${sessionId}/raw`;
+}
+
 /* Publish / GitHub config */
 
 export function publishSession(sessionId: string): Promise<PublishResponse> {

@@ -226,6 +226,7 @@ type ParsedSession struct {
 	Agent            AgentType
 	ParentSessionID  string
 	RelationshipType RelationshipType
+	Cwd              string
 	FirstMessage     string
 	StartedAt        time.Time
 	EndedAt          time.Time

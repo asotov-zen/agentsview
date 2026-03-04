@@ -18,6 +18,7 @@ export interface Session {
   user_message_count: number;
   parent_session_id?: string;
   relationship_type?: string;
+  cwd?: string;
   file_path?: string;
   file_size?: number;
   file_mtime?: number;
