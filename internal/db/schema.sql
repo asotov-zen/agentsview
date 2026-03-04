@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     file_size   INTEGER,
     file_mtime  INTEGER,
     file_hash   TEXT,
+    cwd         TEXT,
     parent_session_id TEXT,
     relationship_type TEXT NOT NULL DEFAULT '',
     deleted_at  TEXT,

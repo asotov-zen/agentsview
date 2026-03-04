@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -40,6 +42,37 @@ func (s *Server) getSessionWithMessages(
 		return nil, nil, false
 	}
 	return session, msgs, true
+}
+
+func (s *Server) handleRawDownload(
+	w http.ResponseWriter, r *http.Request,
+) {
+	id := r.PathValue("id")
+	session, err := s.db.GetSessionFull(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if session == nil {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	if session.FilePath == nil || *session.FilePath == "" {
+		writeError(w, http.StatusNotFound,
+			"no source file for this session")
+		return
+	}
+	filePath := *session.FilePath
+	if _, err := os.Stat(filePath); err != nil {
+		writeError(w, http.StatusNotFound,
+			"source file not found on disk")
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition",
+		fmt.Sprintf(`attachment; filename="%s"`,
+			filepath.Base(filePath)))
+	http.ServeFile(w, r, filePath)
 }
 
 func (s *Server) handleExportSession(

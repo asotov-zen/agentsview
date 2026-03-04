@@ -36,6 +36,7 @@ type zencoderSessionBuilder struct {
 	parentID        string
 	creationReason  string
 	project         string
+	cwd             string
 	ordinal         int
 	headerProcessed bool
 }
@@ -108,6 +109,9 @@ func (b *zencoderSessionBuilder) handleSystemMessage(
 	// Extract project from "Working directory: /path".
 	if m := zencoderCwdRe.FindStringSubmatch(content); len(m) > 1 {
 		cwd := strings.TrimSpace(m[1])
+		if b.cwd == "" {
+			b.cwd = cwd
+		}
 		if proj := ExtractProjectFromCwd(cwd); proj != "" {
 			b.project = proj
 		}
@@ -446,6 +450,7 @@ func ParseZencoderSession(
 		Agent:            AgentZencoder,
 		ParentSessionID:  parentSessionID,
 		RelationshipType: relType,
+		Cwd:              b.cwd,
 		FirstMessage:     b.firstMessage,
 		StartedAt:        b.startedAt,
 		EndedAt:          b.endedAt,

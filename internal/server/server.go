@@ -144,6 +144,10 @@ func (s *Server) routes() {
 	s.mux.Handle(
 		"GET /api/v1/sessions/{id}/export", http.HandlerFunc(s.handleExportSession),
 	)
+	// Raw: serve the original session file.
+	s.mux.Handle(
+		"GET /api/v1/sessions/{id}/raw", http.HandlerFunc(s.handleRawDownload),
+	)
 	s.mux.Handle(
 		"POST /api/v1/sessions/{id}/publish", s.withTimeout(s.handlePublishSession),
 	)

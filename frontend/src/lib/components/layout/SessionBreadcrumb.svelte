@@ -34,6 +34,8 @@
   let openFeedback = $state("");
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
   let sessionDir = $state<string | null>(null);
+  let showInfoPanel = $state(false);
+  let copiedField = $state("");
 
   onMount(() => {
     listOpeners()
@@ -57,6 +59,19 @@
     return idx >= 0 ? id.slice(idx + 1) : id;
   }
 
+  function toggleInfoPanel() {
+    showInfoPanel = !showInfoPanel;
+  }
+
+  async function copyField(value: string, field: string) {
+    const ok = await copyToClipboard(value);
+    if (!ok) return;
+    copiedField = field;
+    setTimeout(() => {
+      if (copiedField === field) copiedField = "";
+    }, 1500);
+  }
+
   async function copySessionId(
     rawId: string,
     sessionId: string,
@@ -68,7 +83,6 @@
       if (copiedSessionId === sessionId) copiedSessionId = "";
     }, 1500);
   }
-
 
   function toggleMenu() {
     menuOpen = !menuOpen;
@@ -241,6 +255,20 @@
     sessionDir !== null,
   );
 
+  const isClaudeAgent = $derived(
+    session?.agent === "claude",
+  );
+
+  const resumeCommand = $derived.by(() => {
+    if (!session || !isClaudeAgent) return "";
+    const rawId = sessionDisplayId(session.id);
+    const cwd = session.cwd;
+    if (cwd) {
+      return `cd ${cwd} && claude --resume ${rawId}`;
+    }
+    return `claude --resume ${rawId}`;
+  });
+
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === "Escape") {
       if (renaming) {
@@ -290,6 +318,7 @@
 />
 
 
+<div class="session-breadcrumb-wrapper">
 <div class="session-breadcrumb">
   <button class="breadcrumb-link" onclick={onBack}>
     Sessions
@@ -429,12 +458,16 @@
         {@const rawId = sessionDisplayId(session.id)}
         <button
           class="session-id"
-          title={rawId}
-          onclick={() => copySessionId(rawId, session.id)}
+          class:active={showInfoPanel}
+          title="Session info"
+          onclick={toggleInfoPanel}
         >
           {copiedSessionId === session.id
             ? "Copied!"
             : rawId.slice(0, 8)}
+          <svg class="info-chevron" class:open={showInfoPanel} width="8" height="8" viewBox="0 0 8 8" fill="currentColor">
+            <path d="M2 3l2 2 2-2"/>
+          </svg>
         </button>
       {/if}
       <div class="actions-wrapper">
@@ -476,7 +509,45 @@
   {/if}
 </div>
 
+  {#if showInfoPanel && session}
+    <div class="info-panel">
+      <div class="info-row">
+        <span class="info-label">Session ID</span>
+        <code class="info-value">{sessionDisplayId(session.id)}</code>
+        <button
+          class="info-copy"
+          onclick={() => copyField(sessionDisplayId(session.id), "id")}
+        >{copiedField === "id" ? "Copied" : "Copy"}</button>
+      </div>
+      {#if session.cwd}
+        <div class="info-row">
+          <span class="info-label">Path</span>
+          <code class="info-value">{session.cwd}</code>
+          <button
+            class="info-copy"
+            onclick={() => copyField(session.cwd!, "cwd")}
+          >{copiedField === "cwd" ? "Copied" : "Copy"}</button>
+        </div>
+      {/if}
+      {#if isClaudeAgent && resumeCommand}
+        <div class="info-row">
+          <span class="info-label">Resume</span>
+          <code class="info-value">{resumeCommand}</code>
+          <button
+            class="info-copy"
+            onclick={() => copyField(resumeCommand, "resume")}
+          >{copiedField === "resume" ? "Copied" : "Copy"}</button>
+        </div>
+      {/if}
+    </div>
+  {/if}
+</div>
+
 <style>
+  .session-breadcrumb-wrapper {
+    flex-shrink: 0;
+  }
+
   .session-breadcrumb {
     display: flex;
     align-items: center;
@@ -664,6 +735,9 @@
     transition: color 0.15s, background 0.15s;
     white-space: nowrap;
     flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
   }
 
   .session-id:hover {
@@ -736,5 +810,70 @@
       var(--accent-red, #e55) 10%,
       transparent
     );
+  }
+
+  .session-id.active {
+    color: var(--accent-blue);
+    background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
+  }
+
+  .info-chevron {
+    transition: transform 0.15s;
+  }
+
+  .info-chevron.open {
+    transform: rotate(180deg);
+  }
+
+  .info-panel {
+    border-bottom: 1px solid var(--border-muted);
+    background: var(--bg-inset);
+    padding: 8px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .info-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 22px;
+  }
+
+  .info-label {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    width: 70px;
+    flex-shrink: 0;
+  }
+
+  .info-value {
+    font-size: 11px;
+    font-family: "SF Mono", "Menlo", "Consolas", monospace;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .info-copy {
+    font-size: 10px;
+    color: var(--text-muted);
+    padding: 1px 6px;
+    border-radius: 3px;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: color 0.12s, background 0.12s;
+  }
+
+  .info-copy:hover {
+    color: var(--accent-blue);
+    background: color-mix(in srgb, var(--accent-blue) 8%, transparent);
   }
 </style>

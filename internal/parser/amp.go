@@ -77,6 +77,9 @@ func ParseAmpSession(
 		project = "amp"
 	}
 
+	// Cwd from env.initial.trees[0].root.
+	ampCwd := root.Get("env.initial.trees.0.root").Str
+
 	// Title is used as FirstMessage when present.
 	title := root.Get("title").Str
 
@@ -147,6 +150,7 @@ func ParseAmpSession(
 		Project:          project,
 		Machine:          machine,
 		Agent:            AgentAmp,
+		Cwd:              ampCwd,
 		FirstMessage:     firstMessage,
 		StartedAt:        startTime,
 		EndedAt:          endTime,

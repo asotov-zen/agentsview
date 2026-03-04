@@ -435,6 +435,7 @@ func buildOpenCodeSession(
 		Machine:          machine,
 		Agent:            AgentOpenCode,
 		ParentSessionID:  parentID,
+		Cwd:              worktree,
 		FirstMessage:     firstMsg,
 		StartedAt:        startedAt,
 		EndedAt:          endedAt,
