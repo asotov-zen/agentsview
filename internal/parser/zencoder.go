@@ -191,6 +191,7 @@ func (b *zencoderSessionBuilder) handleToolMessage(
 	line string,
 ) {
 	var toolResults []ParsedToolResult
+	var systemParts []string
 	gjson.Get(line, "content").ForEach(
 		func(_, block gjson.Result) bool {
 			if block.Get("type").Str != "tool-result" {
@@ -210,6 +211,7 @@ func (b *zencoderSessionBuilder) handleToolMessage(
 
 			// Extract <session-id> from tool-result content
 			// to map subagent tool calls to their sessions.
+			// Also collect system-tagged text blocks.
 			block.Get("content").ForEach(
 				func(_, cb gjson.Result) bool {
 					if m := zencoderSessionIDRe.FindStringSubmatch(
@@ -217,6 +219,12 @@ func (b *zencoderSessionBuilder) handleToolMessage(
 					); len(m) > 1 {
 						b.subagentMap[toolCallID] =
 							"zencoder:" + m[1]
+					}
+					if tag := cb.Get("tag").Str; tag != "" &&
+						cb.Get("type").Str == "text" {
+						if text := cb.Get("text").Str; text != "" {
+							systemParts = append(systemParts, text)
+						}
 					}
 					return true
 				},
@@ -242,6 +250,18 @@ func (b *zencoderSessionBuilder) handleToolMessage(
 		ToolResults:   toolResults,
 	})
 	b.ordinal++
+
+	if len(systemParts) > 0 {
+		sysContent := strings.Join(systemParts, "\n")
+		b.messages = append(b.messages, ParsedMessage{
+			Ordinal:       b.ordinal,
+			Role:          RoleUser,
+			IsSystem:      true,
+			Content:       sysContent,
+			ContentLength: len(sysContent),
+		})
+		b.ordinal++
+	}
 }
 
 // extractZencoderUserContent extracts text from a Zencoder user
@@ -257,18 +277,27 @@ func extractZencoderUserContent(
 
 	var userParts, systemParts []string
 	content.ForEach(func(_, block gjson.Result) bool {
-		if block.Get("type").Str != "text" {
+		switch block.Get("type").Str {
+		case "text":
+			text := block.Get("text").Str
+			if text == "" {
+				return true
+			}
+			tag := block.Get("tag").Str
+			if tag == "" || tag == "user-input" {
+				userParts = append(userParts, text)
+			} else {
+				systemParts = append(systemParts, text)
+			}
+		case "skill":
+			name := block.Get("name").Str
+			body := block.Get("content").Str
+			if name != "" {
+				systemParts = append(systemParts,
+					"[Skill: "+name+"]\n"+body+"\n[/Skill]")
+			}
+		default:
 			return true
-		}
-		text := block.Get("text").Str
-		if text == "" {
-			return true
-		}
-		tag := block.Get("tag").Str
-		if tag == "" || tag == "user-input" {
-			userParts = append(userParts, text)
-		} else {
-			systemParts = append(systemParts, text)
 		}
 		return true
 	})

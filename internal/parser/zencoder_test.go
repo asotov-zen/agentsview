@@ -463,6 +463,81 @@ func TestParseZencoderSession_NoSessionIDTag(t *testing.T) {
 	assert.Empty(t, msgs[1].ToolCalls[0].SubagentSessionID)
 }
 
+func TestParseZencoderSession_SkillBlocks(t *testing.T) {
+	header := `{"id":"skill-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
+	user := `{"role":"user","content":[` +
+		`{"type":"text","text":"Do the thing.","tag":"user-input"},` +
+		`{"type":"text","text":"system instructions here","tag":"instructions"},` +
+		`{"type":"skill","name":"init","path":"/path/to/SKILL.md","content":"skill body content","disableModelInvocation":true}` +
+		`]}`
+	assistant := `{"role":"assistant","content":[{"type":"text","text":"OK."}]}`
+
+	content := strings.Join([]string{
+		header, user, assistant,
+	}, "\n")
+
+	sess, msgs, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+
+	// msg[0]: user message (only user-input text)
+	assert.Equal(t, "Do the thing.", msgs[0].Content)
+	assert.False(t, msgs[0].IsSystem)
+
+	// msg[1]: system message (instructions + skill)
+	assert.True(t, msgs[1].IsSystem)
+	assert.Equal(t, RoleUser, msgs[1].Role)
+	assert.Contains(t, msgs[1].Content, "system instructions here")
+	assert.Contains(t, msgs[1].Content, "[Skill: init]")
+	assert.Contains(t, msgs[1].Content, "skill body content")
+	assert.Contains(t, msgs[1].Content, "[/Skill]")
+
+	// msg[2]: assistant
+	assert.Equal(t, RoleAssistant, msgs[2].Role)
+
+	assert.Equal(t, 1, sess.UserMessageCount)
+	assert.Equal(t, "Do the thing.", sess.FirstMessage)
+}
+
+func TestParseZencoderSession_ToolResultSystemTags(t *testing.T) {
+	header := `{"id":"trsys-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
+	user := `{"role":"user","content":[{"type":"text","text":"Run it."}]}`
+	assistant := `{"role":"assistant","content":[` +
+		`{"type":"tool-call","toolCallId":"tc1","toolName":"Bash","input":{"command":"ls"}}` +
+		`]}`
+	tool := `{"role":"tool","content":[` +
+		`{"type":"tool-result","toolCallId":"tc1","toolName":"Bash","content":[` +
+		`{"type":"shell-result","text":"file1.go\nfile2.go"},` +
+		`{"type":"text","tag":"todo-reminder","text":"<system-reminder>Remember your tasks</system-reminder>"},` +
+		`{"type":"text","tag":"system-reminder","text":"<system-reminder>Extra context</system-reminder>"}` +
+		`],"isError":false}` +
+		`]}`
+
+	content := strings.Join([]string{
+		header, user, assistant, tool,
+	}, "\n")
+
+	sess, msgs, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+
+	// msg[0]: user, msg[1]: assistant, msg[2]: tool result,
+	// msg[3]: system message from tool-result tags
+	require.Equal(t, 4, len(msgs))
+
+	// Tool result message is unaffected.
+	assert.Equal(t, RoleUser, msgs[2].Role)
+	assert.False(t, msgs[2].IsSystem)
+	require.Equal(t, 1, len(msgs[2].ToolResults))
+	assert.Equal(t, "tc1", msgs[2].ToolResults[0].ToolUseID)
+
+	// System message from tool-result tags.
+	assert.True(t, msgs[3].IsSystem)
+	assert.Equal(t, RoleUser, msgs[3].Role)
+	assert.Contains(t, msgs[3].Content, "Remember your tasks")
+	assert.Contains(t, msgs[3].Content, "Extra context")
+}
+
 func mustParseTime(t *testing.T, s string) time.Time {
 	t.Helper()
 	ts := parseTimestamp(s)
