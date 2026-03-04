@@ -7,6 +7,7 @@
   import { formatTimestamp } from "../../utils/format.js";
   import ThinkingBlock from "./ThinkingBlock.svelte";
   import ToolBlock from "./ToolBlock.svelte";
+  import SkillBlock from "./SkillBlock.svelte";
   import CodeBlock from "./CodeBlock.svelte";
   import { ui } from "../../stores/ui.svelte.js";
   import { renderMarkdown } from "../../utils/markdown.js";
@@ -81,6 +82,8 @@
           label={segment.label}
           toolCall={segment.toolCall}
         />
+      {:else if segment.type === "skill"}
+        <SkillBlock content={segment.content} name={segment.label} />
       {:else if segment.type === "code"}
         <CodeBlock content={segment.content} language={segment.label} />
       {:else}
