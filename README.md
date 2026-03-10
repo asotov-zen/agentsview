@@ -1,16 +1,21 @@
 # agentsview
 
-A local web application for browsing, searching, and analyzing
-AI agent coding sessions. Supports Claude Code, Codex,
-Copilot CLI, Gemini CLI, OpenCode, Amp, and VSCode Copilot. A next-generation rewrite of
-[agent-session-viewer](https://github.com/wesm/agent-session-viewer)
-in Go.
+A local-first desktop and web application for browsing, searching,
+and analyzing AI agent coding sessions. Supports Claude Code, Codex,
+OpenCode, and 8 other agents.
 
 <p align="center">
   <img src="https://agentsview.io/screenshots/dashboard.png" alt="Analytics dashboard" width="720">
 </p>
 
-## Install
+## Desktop App
+
+Download the desktop installer for macOS or Windows from
+[GitHub Releases](https://github.com/wesm/agentsview/releases).
+The desktop app includes auto-updates and runs the server as a
+local sidecar -- no terminal required.
+
+## CLI Install
 
 ```bash
 curl -fsSL https://agentsview.io/install.sh | bash
@@ -22,8 +27,8 @@ curl -fsSL https://agentsview.io/install.sh | bash
 powershell -ExecutionPolicy ByPass -c "irm https://agentsview.io/install.ps1 | iex"
 ```
 
-The installer downloads the latest release, verifies the SHA-256
-checksum, and installs the binary.
+The CLI installer downloads the latest release, verifies the
+SHA-256 checksum, and installs the binary.
 
 **Build from source** (requires Go 1.25+ with CGO and Node.js 22+):
 
@@ -47,7 +52,8 @@ patterns over time.
 - **Full-text search** across all message content, instantly
 - **Analytics dashboard** with activity heatmaps, tool usage,
   velocity metrics, and project breakdowns
-- **Multi-agent support** for Claude Code, Codex, Copilot CLI, Gemini CLI, OpenCode, Amp, and VSCode Copilot
+- **Multi-agent support** for Claude Code, Codex, OpenCode, and
+  8 other agents ([full list](#supported-agents))
 - **Live updates** via SSE as active sessions receive new messages
 - **Keyboard-first** navigation (vim-style `j`/`k`/`[`/`]`)
 - **Export and publish** sessions as HTML or to GitHub Gist
@@ -62,10 +68,9 @@ agentsview -port 9090   # custom port
 agentsview -no-browser  # headless mode
 ```
 
-On startup, agentsview discovers sessions from Claude Code, Codex,
-Copilot CLI, Gemini CLI, OpenCode, Amp, and VSCode Copilot, syncs them into a local SQLite database
-with FTS5 full-text search, and opens a web UI at
-`http://127.0.0.1:8080`.
+On startup, agentsview discovers sessions from all supported
+agents, syncs them into a local SQLite database with FTS5
+full-text search, and opens a web UI at `http://127.0.0.1:8080`.
 
 ## Screenshots
 
@@ -112,31 +117,27 @@ Full documentation is available at
 ```bash
 make dev            # run Go server in dev mode
 make frontend-dev   # run Vite dev server (use alongside make dev)
-make desktop-dev    # run Tauri desktop wrapper (experimental)
+make desktop-dev    # run Tauri desktop app in dev mode
 make test           # Go tests (CGO_ENABLED=1 -tags fts5)
 make lint           # golangci-lint
 make e2e            # Playwright E2E tests
 ```
 
-## Desktop Wrapper (Experimental)
+## Desktop Development
 
-A Tauri desktop wrapper is available under `desktop/`.
-It launches the existing `agentsview` Go binary as a local sidecar and
-loads `http://127.0.0.1:<port>` in a native webview.
+The desktop app is a Tauri wrapper under `desktop/`. It launches
+the `agentsview` Go binary as a local sidecar and loads
+`http://127.0.0.1:<port>` in a native webview.
 
 ```bash
-make desktop-dev    # run desktop app in dev mode
-make desktop-build  # build desktop bundles (.app/.exe/etc.)
-make desktop-macos-app       # build macOS .app only
-make desktop-windows-installer  # build Windows installer (.exe)
+make desktop-dev                 # run desktop app in dev mode
+make desktop-build               # build desktop bundles (.app/.exe)
+make desktop-macos-app           # build macOS .app only
+make desktop-windows-installer   # build Windows installer (.exe)
 ```
 
-Friendly output copies are placed in:
-
-- `dist/desktop/macos/AgentsView.app`
-- `dist/desktop/windows/*.exe`
-
-Desktop env escape hatch: `~/.agentsview/desktop.env` (for PATH/API keys overrides).
+Desktop env escape hatch: `~/.agentsview/desktop.env` (for
+PATH/API keys overrides).
 
 ### Project Structure
 
@@ -144,7 +145,7 @@ Desktop env escape hatch: `~/.agentsview/desktop.env` (for PATH/API keys overrid
 cmd/agentsview/     CLI entrypoint
 internal/config/    Configuration loading
 internal/db/        SQLite operations (sessions, search, analytics)
-internal/parser/    Session parsers (Claude, Codex, Copilot, Gemini, OpenCode, Amp, VSCode Copilot)
+internal/parser/    Session parsers (all supported agents)
 internal/server/    HTTP handlers, SSE, middleware
 internal/sync/      Sync engine, file watcher, discovery
 frontend/           Svelte 5 SPA (Vite, TypeScript)
@@ -152,18 +153,19 @@ frontend/           Svelte 5 SPA (Vite, TypeScript)
 
 ## Supported Agents
 
-| Agent | Session Directory |
-|-------|-------------------|
-| Claude Code | `~/.claude/projects/` |
-| Codex | `~/.codex/sessions/` |
-| Copilot CLI | `~/.copilot/session-state/` |
-| Gemini CLI | `~/.gemini/` |
-| OpenCode | `~/.local/share/opencode/` |
-| Amp | `~/.local/share/amp/threads/` |
-| VSCode Copilot | `~/Library/Application Support/Code/User/` (macOS) |
-
-Override with `CLAUDE_PROJECTS_DIR`, `CODEX_SESSIONS_DIR`,
-`COPILOT_DIR`, `GEMINI_DIR`, `OPENCODE_DIR`, `AMP_DIR`, or `VSCODE_COPILOT_DIR` environment variables.
+| Agent | Session Directory | Env Override |
+|-------|-------------------|--------------|
+| Claude Code | `~/.claude/projects/` | `CLAUDE_PROJECTS_DIR` |
+| Codex | `~/.codex/sessions/` | `CODEX_SESSIONS_DIR` |
+| Copilot | `~/.copilot/` | `COPILOT_DIR` |
+| Gemini | `~/.gemini/` | `GEMINI_DIR` |
+| OpenCode | `~/.local/share/opencode/` | `OPENCODE_DIR` |
+| Cursor | `~/.cursor/projects/` | `CURSOR_PROJECTS_DIR` |
+| Amp | `~/.local/share/amp/threads/` | `AMP_DIR` |
+| iFlow | `~/.iflow/projects/` | `IFLOW_DIR` |
+| VSCode Copilot | `~/Library/Application Support/Code/User/` (macOS) | `VSCODE_COPILOT_DIR` |
+| Pi | `~/.pi/agent/sessions/` | `PI_DIR` |
+| OpenClaw | `~/.openclaw/agents/` | `OPENCLAW_DIR` |
 
 ## Acknowledgements
 
