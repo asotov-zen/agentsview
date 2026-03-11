@@ -1089,6 +1089,13 @@ func (e *Engine) collectAndBatch(
 		e.writeBatch(pending)
 	}
 
+	// Link subagent child sessions to their parents via
+	// tool_calls.subagent_session_id references. Run once
+	// after all batches to avoid repeated full-table scans.
+	if err := e.db.LinkSubagentSessions(); err != nil {
+		log.Printf("link subagent sessions: %v", err)
+	}
+
 	progress.Phase = PhaseDone
 	if onProgress != nil {
 		onProgress(progress)
@@ -1672,11 +1679,6 @@ func (e *Engine) writeBatch(batch []pendingWrite) {
 		e.writeMessages(pw.sess.ID, msgs)
 	}
 
-	// Link subagent child sessions to their parents via
-	// tool_calls.subagent_session_id references.
-	if err := e.db.LinkSubagentSessions(); err != nil {
-		log.Printf("link subagent sessions: %v", err)
-	}
 }
 
 // writeMessages uses an incremental append when possible.
