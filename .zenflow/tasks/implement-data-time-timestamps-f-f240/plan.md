@@ -40,3 +40,8 @@ Implement the bug fix.
 4. Update `{@artifacts_path}/investigation.md` with implementation notes and test results
 
 If blocked or uncertain, ask the user for direction.
+
+### [x] Step: Test
+<!-- chat-id: 54ea80e7-7dca-4616-85a5-e7307c19cdad -->
+
+Run tests and review why they are failing
