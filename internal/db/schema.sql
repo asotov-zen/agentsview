@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS messages (
     has_tool_use   INTEGER NOT NULL DEFAULT 0,
     is_system      INTEGER NOT NULL DEFAULT 0,
     content_length INTEGER NOT NULL DEFAULT 0,
+    model_id       TEXT,
+    provider_id    TEXT,
     UNIQUE(session_id, ordinal)
 );
 

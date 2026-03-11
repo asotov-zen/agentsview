@@ -105,6 +105,54 @@ func TestParseZencoderSession_ToolCallAndReasoning(t *testing.T) {
 	assert.Equal(t, "tc1", msgs[1].ToolCalls[0].ToolUseID)
 }
 
+func TestParseZencoderSession_ModelDetails(t *testing.T) {
+	header := `{"id":"md-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
+	user := `{"role":"user","content":[{"type":"text","text":"Hello."}]}`
+	assistant := `{"role":"assistant","content":[{"type":"text","text":"Hi there."}],"modelDetails":{"model":{"id":"gemini-3-flash-preview","options":{}},"provider":{"id":"gemini"}}}`
+	assistant2 := `{"role":"assistant","content":[{"type":"text","text":"Another reply."}],"modelDetails":{"model":{"id":"claude-opus-4.6","options":{}},"provider":{"id":"anthropic"}}}`
+
+	content := strings.Join([]string{
+		header, user, assistant, assistant2,
+	}, "\n")
+
+	sess, msgs, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+
+	// msg[0]: user, msg[1]: first assistant, msg[2]: second assistant
+	require.Equal(t, 3, len(msgs))
+
+	// User message has no model details.
+	assert.Empty(t, msgs[0].ModelID)
+	assert.Empty(t, msgs[0].ProviderID)
+
+	// First assistant message.
+	assert.Equal(t, "gemini-3-flash-preview", msgs[1].ModelID)
+	assert.Equal(t, "gemini", msgs[1].ProviderID)
+
+	// Second assistant message with different model.
+	assert.Equal(t, "claude-opus-4.6", msgs[2].ModelID)
+	assert.Equal(t, "anthropic", msgs[2].ProviderID)
+}
+
+func TestParseZencoderSession_ModelDetailsAbsent(t *testing.T) {
+	header := `{"id":"nomd-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
+	user := `{"role":"user","content":[{"type":"text","text":"Hello."}]}`
+	// Assistant without modelDetails (older format).
+	assistant := `{"role":"assistant","content":[{"type":"text","text":"Hi."}]}`
+
+	content := strings.Join([]string{
+		header, user, assistant,
+	}, "\n")
+
+	_, msgs, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+
+	// Assistant message without modelDetails should have empty fields.
+	assert.Empty(t, msgs[1].ModelID)
+	assert.Empty(t, msgs[1].ProviderID)
+}
+
 func TestParseZencoderSession_ToolResults(t *testing.T) {
 	header := `{"id":"tr-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
 	user := `{"role":"user","content":[{"type":"text","text":"Read it."}]}`

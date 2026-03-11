@@ -105,6 +105,12 @@
     >
       {isSystem ? "System" : isUser ? "User" : "Assistant"}
     </span>
+    {#if message.provider_id}
+      <span class="model-badge">{message.provider_id}</span>
+    {/if}
+    {#if message.model_id}
+      <span class="model-badge">{message.model_id}</span>
+    {/if}
     <button
       type="button"
       class="copy-btn"
@@ -214,6 +220,17 @@
     font-size: 13px;
     font-weight: 600;
     letter-spacing: 0.01em;
+  }
+
+  .model-badge {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-muted);
+    background: var(--bg-inset);
+    border: 1px solid var(--border-muted);
+    border-radius: var(--radius-sm, 4px);
+    padding: 1px 5px;
+    white-space: nowrap;
   }
 
   .timestamp {

@@ -299,6 +299,8 @@ type ParsedMessage struct {
 	HasToolUse    bool
 	IsSystem      bool
 	ContentLength int
+	ModelID       string // model identifier (e.g. "gemini-3-flash-preview")
+	ProviderID    string // provider identifier (e.g. "gemini")
 	ToolCalls     []ParsedToolCall
 	ToolResults   []ParsedToolResult
 }
