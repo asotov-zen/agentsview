@@ -100,3 +100,30 @@ field of each JSONL line.
 - Multiple messages from a single handler call (e.g.,
   `handleUserMessage` creates both user and system messages): Use the
   same timestamp from the line for all messages created from it.
+
+## Implementation Notes
+
+### Changes Made
+
+**`internal/parser/zencoder.go`**:
+- `processMessage()`: Extract `createdAt` from each JSONL line via
+  `parseTimestamp(gjson.Get(line, "createdAt").Str)` and pass the
+  resulting `time.Time` to each handler method.
+- `handleSystemMessage()`, `handleUserMessage()`,
+  `handleAssistantMessage()`, `handleToolMessage()`: Updated
+  signatures to accept `ts time.Time` and set `Timestamp` on every
+  `ParsedMessage` struct they create.
+- `finish` message handler: Also sets `Timestamp` from the line's
+  `createdAt`.
+
+**`internal/parser/zencoder_test.go`**:
+- Added `TestParseZencoderSession_MessageTimestamps`: Verifies that
+  each message type (system, user, assistant, tool result, finish)
+  gets the correct timestamp from its JSONL line's `createdAt` field.
+- Added `TestParseZencoderSession_MessageTimestamps_Missing`: Verifies
+  that lines without `createdAt` produce zero-time timestamps (same
+  behavior as other parsers for missing timestamps).
+
+### Test Results
+
+All 21 Zencoder parser tests pass. No regressions.

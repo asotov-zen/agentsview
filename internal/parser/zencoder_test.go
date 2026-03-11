@@ -70,6 +70,57 @@ func TestParseZencoderSession_Basic(t *testing.T) {
 	assert.Equal(t, RelNone, sess.RelationshipType)
 }
 
+func TestParseZencoderSession_MessageTimestamps(t *testing.T) {
+	header := `{"id":"ts-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:05:00Z"}`
+	system := `{"role":"system","content":"You are an AI.\n\nWorking directory: /home/user/proj","createdAt":"2024-01-01T00:00:01Z"}`
+	user := `{"role":"user","content":[{"type":"text","text":"Hello."}],"createdAt":"2024-01-01T00:00:02Z"}`
+	assistant := `{"role":"assistant","content":[{"type":"text","text":"Hi there."},{"type":"tool-call","toolCallId":"tc1","toolName":"Read","input":{"file_path":"a.go"}}],"createdAt":"2024-01-01T00:00:03Z"}`
+	tool := `{"role":"tool","content":[{"type":"tool-result","toolCallId":"tc1","content":[{"type":"text","text":"package main"}],"isError":false}],"createdAt":"2024-01-01T00:00:04Z"}`
+	finish := `{"role":"finish","reason":"endTurn","createdAt":"2024-01-01T00:00:05Z"}`
+
+	content := strings.Join([]string{
+		header, system, user, assistant, tool, finish,
+	}, "\n")
+
+	_, msgs, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+	require.Equal(t, 5, len(msgs))
+
+	// System message timestamp.
+	assertTimestamp(t, msgs[0].Timestamp,
+		mustParseTime(t, "2024-01-01T00:00:01Z"))
+	// User message timestamp.
+	assertTimestamp(t, msgs[1].Timestamp,
+		mustParseTime(t, "2024-01-01T00:00:02Z"))
+	// Assistant message timestamp.
+	assertTimestamp(t, msgs[2].Timestamp,
+		mustParseTime(t, "2024-01-01T00:00:03Z"))
+	// Tool result message timestamp.
+	assertTimestamp(t, msgs[3].Timestamp,
+		mustParseTime(t, "2024-01-01T00:00:04Z"))
+	// Finish message timestamp.
+	assertTimestamp(t, msgs[4].Timestamp,
+		mustParseTime(t, "2024-01-01T00:00:05Z"))
+}
+
+func TestParseZencoderSession_MessageTimestamps_Missing(t *testing.T) {
+	// Lines without createdAt should have zero timestamps.
+	header := `{"id":"nots-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
+	user := `{"role":"user","content":[{"type":"text","text":"No ts."}]}`
+	assistant := `{"role":"assistant","content":[{"type":"text","text":"OK."}]}`
+
+	content := strings.Join([]string{
+		header, user, assistant,
+	}, "\n")
+
+	_, msgs, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+	require.Equal(t, 2, len(msgs))
+
+	assert.True(t, msgs[0].Timestamp.IsZero())
+	assert.True(t, msgs[1].Timestamp.IsZero())
+}
+
 func TestParseZencoderSession_ToolCallAndReasoning(t *testing.T) {
 	header := `{"id":"tc-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
 	user := `{"role":"user","content":[{"type":"text","text":"Read the file."}]}`
