@@ -69,16 +69,17 @@ func (b *zencoderSessionBuilder) processHeader(line string) {
 // JSONL file.
 func (b *zencoderSessionBuilder) processMessage(line string) {
 	role := gjson.Get(line, "role").Str
+	ts := parseTimestamp(gjson.Get(line, "createdAt").Str)
 
 	switch role {
 	case "system":
-		b.handleSystemMessage(line)
+		b.handleSystemMessage(line, ts)
 	case "user":
-		b.handleUserMessage(line)
+		b.handleUserMessage(line, ts)
 	case "assistant":
-		b.handleAssistantMessage(line)
+		b.handleAssistantMessage(line, ts)
 	case "tool":
-		b.handleToolMessage(line)
+		b.handleToolMessage(line, ts)
 	case "finish":
 		reason := gjson.Get(line, "reason").Str
 		if reason == "" {
@@ -91,6 +92,7 @@ func (b *zencoderSessionBuilder) processMessage(line string) {
 			IsSystem:      true,
 			Content:       content,
 			ContentLength: len(content),
+			Timestamp:     ts,
 		})
 		b.ordinal++
 		// "permission" — skip entirely.
@@ -98,7 +100,7 @@ func (b *zencoderSessionBuilder) processMessage(line string) {
 }
 
 func (b *zencoderSessionBuilder) handleSystemMessage(
-	line string,
+	line string, ts time.Time,
 ) {
 	// System content is a plain string (not array).
 	content := gjson.Get(line, "content").Str
@@ -124,12 +126,13 @@ func (b *zencoderSessionBuilder) handleSystemMessage(
 		IsSystem:      true,
 		Content:       content,
 		ContentLength: len(content),
+		Timestamp:     ts,
 	})
 	b.ordinal++
 }
 
 func (b *zencoderSessionBuilder) handleUserMessage(
-	line string,
+	line string, ts time.Time,
 ) {
 	userContent, systemContent := extractZencoderUserContent(
 		gjson.Get(line, "content"),
@@ -147,6 +150,7 @@ func (b *zencoderSessionBuilder) handleUserMessage(
 			Role:          RoleUser,
 			Content:       userContent,
 			ContentLength: len(userContent),
+			Timestamp:     ts,
 		})
 		b.ordinal++
 	}
@@ -158,13 +162,14 @@ func (b *zencoderSessionBuilder) handleUserMessage(
 			IsSystem:      true,
 			Content:       systemContent,
 			ContentLength: len(systemContent),
+			Timestamp:     ts,
 		})
 		b.ordinal++
 	}
 }
 
 func (b *zencoderSessionBuilder) handleAssistantMessage(
-	line string,
+	line string, ts time.Time,
 ) {
 	content, hasThinking, hasToolUse, tcs :=
 		extractZencoderAssistantContent(
@@ -183,12 +188,13 @@ func (b *zencoderSessionBuilder) handleAssistantMessage(
 		HasToolUse:    hasToolUse,
 		ContentLength: len(content),
 		ToolCalls:     tcs,
+		Timestamp:     ts,
 	})
 	b.ordinal++
 }
 
 func (b *zencoderSessionBuilder) handleToolMessage(
-	line string,
+	line string, ts time.Time,
 ) {
 	var toolResults []ParsedToolResult
 	var systemParts []string
@@ -248,6 +254,7 @@ func (b *zencoderSessionBuilder) handleToolMessage(
 		Role:          RoleUser,
 		ContentLength: totalLen,
 		ToolResults:   toolResults,
+		Timestamp:     ts,
 	})
 	b.ordinal++
 
@@ -259,6 +266,7 @@ func (b *zencoderSessionBuilder) handleToolMessage(
 			IsSystem:      true,
 			Content:       sysContent,
 			ContentLength: len(sysContent),
+			Timestamp:     ts,
 		})
 		b.ordinal++
 	}

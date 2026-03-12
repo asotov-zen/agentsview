@@ -29,15 +29,15 @@ type TerminalConfig struct {
 
 // Config holds all application configuration.
 type Config struct {
-	Host         string        `json:"host"`
-	Port         int           `json:"port"`
-	NoBrowser    bool          `json:"no_browser"`
-	DataDir      string        `json:"data_dir"`
-	DBPath       string        `json:"-"`
-	CursorSecret string        `json:"cursor_secret"`
-	GithubToken  string        `json:"github_token,omitempty"`
+	Host         string         `json:"host"`
+	Port         int            `json:"port"`
+	NoBrowser    bool           `json:"no_browser"`
+	DataDir      string         `json:"data_dir"`
+	DBPath       string         `json:"-"`
+	CursorSecret string         `json:"cursor_secret"`
+	GithubToken  string         `json:"github_token,omitempty"`
 	Terminal     TerminalConfig `json:"terminal,omitempty"`
-	WriteTimeout time.Duration `json:"-"`
+	WriteTimeout time.Duration  `json:"-"`
 
 	// AgentDirs maps each AgentType to its configured
 	// directories. Single-dir agents store a one-element
