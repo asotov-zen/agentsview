@@ -150,7 +150,7 @@ func TestParseClaudeSession_SkippedMessages(t *testing.T) {
 		assert.Equal(t, 8, sess.MessageCount)
 		assert.Equal(t, 1, sess.UserMessageCount)
 		// First 7 messages are system, last is regular.
-		for i := 0; i < 7; i++ {
+		for i := range 7 {
 			assert.True(t, msgs[i].IsSystem, "msgs[%d] should be system", i)
 		}
 		assert.False(t, msgs[7].IsSystem)
