@@ -11,10 +11,12 @@ import (
 
 const (
 	selectMessageCols = `id, session_id, ordinal, role, content,
-		timestamp, has_thinking, has_tool_use, is_system, content_length`
+		timestamp, has_thinking, has_tool_use, is_system, content_length,
+		model_id, provider_id`
 
 	insertMessageCols = `session_id, ordinal, role, content,
-		timestamp, has_thinking, has_tool_use, is_system, content_length`
+		timestamp, has_thinking, has_tool_use, is_system, content_length,
+		model_id, provider_id`
 
 	// DefaultMessageLimit is the default number of messages returned.
 	DefaultMessageLimit = 100
@@ -60,6 +62,8 @@ type Message struct {
 	HasToolUse    bool         `json:"has_tool_use"`
 	IsSystem      bool         `json:"is_system"`
 	ContentLength int          `json:"content_length"`
+	ModelID       string       `json:"model_id,omitempty"`
+	ProviderID    string       `json:"provider_id,omitempty"`
 	ToolCalls     []ToolCall   `json:"tool_calls,omitempty"`
 	ToolResults   []ToolResult `json:"-"` // transient, for pairing
 }
@@ -206,7 +210,7 @@ func (db *DB) insertMessagesTx(
 ) ([]int64, error) {
 	stmt, err := tx.Prepare(fmt.Sprintf(`
 		INSERT INTO messages (%s)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, insertMessageCols))
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, insertMessageCols))
 	if err != nil {
 		return nil, fmt.Errorf("preparing insert: %w", err)
 	}
@@ -218,6 +222,7 @@ func (db *DB) insertMessagesTx(
 			m.SessionID, m.Ordinal, m.Role, m.Content,
 			m.Timestamp, m.HasThinking, m.HasToolUse,
 			m.IsSystem, m.ContentLength,
+			nilIfEmpty(m.ModelID), nilIfEmpty(m.ProviderID),
 		)
 		if err != nil {
 			return nil, fmt.Errorf(
@@ -496,14 +501,22 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 	var msgs []Message
 	for rows.Next() {
 		var m Message
+		var modelID, providerID sql.NullString
 		err := rows.Scan(
 			&m.ID, &m.SessionID, &m.Ordinal, &m.Role,
 			&m.Content, &m.Timestamp,
 			&m.HasThinking, &m.HasToolUse, &m.IsSystem,
 			&m.ContentLength,
+			&modelID, &providerID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning message: %w", err)
+		}
+		if modelID.Valid {
+			m.ModelID = modelID.String
+		}
+		if providerID.Valid {
+			m.ProviderID = providerID.String
 		}
 		msgs = append(msgs, m)
 	}
@@ -531,17 +544,25 @@ func (db *DB) GetMessageByOrdinal(
 		sessionID, ordinal)
 
 	var m Message
+	var modelID, providerID sql.NullString
 	err := row.Scan(
 		&m.ID, &m.SessionID, &m.Ordinal, &m.Role,
 		&m.Content, &m.Timestamp,
 		&m.HasThinking, &m.HasToolUse, &m.IsSystem,
 		&m.ContentLength,
+		&modelID, &providerID,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
+	}
+	if modelID.Valid {
+		m.ModelID = modelID.String
+	}
+	if providerID.Valid {
+		m.ProviderID = providerID.String
 	}
 	return &m, nil
 }

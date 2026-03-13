@@ -180,6 +180,9 @@ func (b *zencoderSessionBuilder) handleAssistantMessage(
 		return
 	}
 
+	modelID := gjson.Get(line, "modelDetails.model.id").Str
+	providerID := gjson.Get(line, "modelDetails.provider.id").Str
+
 	b.messages = append(b.messages, ParsedMessage{
 		Ordinal:       b.ordinal,
 		Role:          RoleAssistant,
@@ -187,6 +190,8 @@ func (b *zencoderSessionBuilder) handleAssistantMessage(
 		HasThinking:   hasThinking,
 		HasToolUse:    hasToolUse,
 		ContentLength: len(content),
+		ModelID:       modelID,
+		ProviderID:    providerID,
 		ToolCalls:     tcs,
 		Timestamp:     ts,
 	})

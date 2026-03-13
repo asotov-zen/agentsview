@@ -1795,6 +1795,8 @@ func toDBMessages(pw pendingWrite, blocked map[string]bool) []db.Message {
 			HasToolUse:    m.HasToolUse,
 			IsSystem:      m.IsSystem,
 			ContentLength: m.ContentLength,
+			ModelID:       m.ModelID,
+			ProviderID:    m.ProviderID,
 			ToolCalls: convertToolCalls(
 				pw.sess.ID, m.ToolCalls,
 			),
