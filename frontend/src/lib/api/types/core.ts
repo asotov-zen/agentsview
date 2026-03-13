@@ -64,6 +64,8 @@ export interface Message {
   has_tool_use: boolean;
   is_system: boolean;
   content_length: number;
+  model_id?: string;
+  provider_id?: string;
   tool_calls?: ToolCall[];
 }
 

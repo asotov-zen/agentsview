@@ -23,7 +23,7 @@ import (
 // formatting changes). Old databases with a lower user_version
 // trigger a non-destructive re-sync (mtime reset + skip cache
 // clear) so existing session data is preserved.
-const dataVersion = 2
+const dataVersion = 3
 
 //go:embed schema.sql
 var schemaSQL string
@@ -273,6 +273,14 @@ func (db *DB) migrateColumns() error {
 		{
 			"sessions", "deleted_at",
 			"ALTER TABLE sessions ADD COLUMN deleted_at TEXT",
+		},
+		{
+			"messages", "model_id",
+			"ALTER TABLE messages ADD COLUMN model_id TEXT",
+		},
+		{
+			"messages", "provider_id",
+			"ALTER TABLE messages ADD COLUMN provider_id TEXT",
 		},
 	}
 

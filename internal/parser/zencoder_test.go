@@ -156,6 +156,58 @@ func TestParseZencoderSession_ToolCallAndReasoning(t *testing.T) {
 	assert.Equal(t, "tc1", msgs[1].ToolCalls[0].ToolUseID)
 }
 
+func TestParseZencoderSession_ModelDetails(t *testing.T) {
+	header := `{"id":"model-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:05:00Z"}`
+	user1 := `{"role":"user","content":[{"type":"text","text":"Hello."}]}`
+	assistant1 := `{"role":"assistant","content":[{"type":"text","text":"Hi there."}],"modelDetails":{"model":{"id":"gemini-3-flash-preview"},"provider":{"id":"gemini"}}}`
+	user2 := `{"role":"user","content":[{"type":"text","text":"Now use Claude."}]}`
+	assistant2 := `{"role":"assistant","content":[{"type":"text","text":"Switching model."}],"modelDetails":{"model":{"id":"claude-sonnet-4-20250514"},"provider":{"id":"anthropic"}}}`
+	user3 := `{"role":"user","content":[{"type":"text","text":"Back to Gemini."}]}`
+	assistant3 := `{"role":"assistant","content":[{"type":"text","text":"OK."}],"modelDetails":{"model":{"id":"gemini-3-flash-preview"},"provider":{"id":"gemini"}}}`
+
+	content := strings.Join([]string{
+		header, user1, assistant1, user2, assistant2, user3, assistant3,
+	}, "\n")
+
+	_, msgs, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+	require.Equal(t, 6, len(msgs))
+
+	// assistant1 (index 1): gemini
+	assert.Equal(t, "gemini-3-flash-preview", msgs[1].ModelID)
+	assert.Equal(t, "gemini", msgs[1].ProviderID)
+
+	// assistant2 (index 3): anthropic
+	assert.Equal(t, "claude-sonnet-4-20250514", msgs[3].ModelID)
+	assert.Equal(t, "anthropic", msgs[3].ProviderID)
+
+	// assistant3 (index 5): gemini again
+	assert.Equal(t, "gemini-3-flash-preview", msgs[5].ModelID)
+	assert.Equal(t, "gemini", msgs[5].ProviderID)
+
+	// User messages should have empty model fields.
+	assert.Empty(t, msgs[0].ModelID)
+	assert.Empty(t, msgs[0].ProviderID)
+}
+
+func TestParseZencoderSession_ModelDetailsAbsent(t *testing.T) {
+	header := `{"id":"nomodel-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
+	user := `{"role":"user","content":[{"type":"text","text":"Hello."}]}`
+	assistant := `{"role":"assistant","content":[{"type":"text","text":"Hi."}]}`
+
+	content := strings.Join([]string{
+		header, user, assistant,
+	}, "\n")
+
+	_, msgs, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+	require.Equal(t, 2, len(msgs))
+
+	// Assistant without modelDetails has empty fields.
+	assert.Empty(t, msgs[1].ModelID)
+	assert.Empty(t, msgs[1].ProviderID)
+}
+
 func TestParseZencoderSession_ToolResults(t *testing.T) {
 	header := `{"id":"tr-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
 	user := `{"role":"user","content":[{"type":"text","text":"Read it."}]}`
