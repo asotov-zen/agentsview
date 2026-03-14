@@ -3446,6 +3446,121 @@ func TestCopyOrphanedDataFrom_AtomicOnFailure(t *testing.T) {
 	}
 }
 
+func TestCopyOrphanedDataFrom_IsSystem(t *testing.T) {
+	dir := t.TempDir()
+
+	// Source DB with a session containing a system message.
+	srcPath := filepath.Join(dir, "old.db")
+	srcDB, err := Open(srcPath)
+	requireNoError(t, err, "Open src")
+	insertSession(t, srcDB, "s1", "proj")
+	m := userMsg("s1", 0, "system init")
+	m.IsSystem = true
+	insertMessages(t, srcDB, m, asstMsg("s1", 1, "reply"))
+	srcDB.Close()
+
+	// Empty destination.
+	dstPath := filepath.Join(dir, "new.db")
+	dstDB, err := Open(dstPath)
+	requireNoError(t, err, "Open dst")
+	defer dstDB.Close()
+
+	count, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	requireNoError(t, err, "CopyOrphanedDataFrom")
+	if count != 1 {
+		t.Fatalf("expected 1 orphaned, got %d", count)
+	}
+
+	// Verify is_system was preserved.
+	msgs, err := dstDB.GetMessages(
+		context.Background(), "s1", 0, 100, true,
+	)
+	requireNoError(t, err, "GetMessages")
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(msgs))
+	}
+	if !msgs[0].IsSystem {
+		t.Error("ordinal 0: is_system should be true")
+	}
+	if msgs[1].IsSystem {
+		t.Error("ordinal 1: is_system should be false")
+	}
+}
+
+func TestCopyOrphanedDataFrom_LegacyNoIsSystem(t *testing.T) {
+	dir := t.TempDir()
+
+	// Source DB with is_system column removed to simulate
+	// a legacy database.
+	srcPath := filepath.Join(dir, "old.db")
+	srcDB, err := Open(srcPath)
+	requireNoError(t, err, "Open src")
+	insertSession(t, srcDB, "s1", "proj")
+	insertMessages(t, srcDB, userMsg("s1", 0, "hello"))
+	srcDB.Close()
+
+	// Drop is_system via raw SQL to simulate legacy schema.
+	raw, err := sql.Open("sqlite3", srcPath)
+	requireNoError(t, err, "raw open")
+	// SQLite doesn't support DROP COLUMN before 3.35;
+	// recreate the table without is_system.
+	_, err = raw.Exec(`
+		CREATE TABLE messages_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL,
+			ordinal INTEGER NOT NULL,
+			role TEXT NOT NULL,
+			content TEXT NOT NULL DEFAULT '',
+			timestamp TEXT NOT NULL DEFAULT '',
+			has_thinking INTEGER NOT NULL DEFAULT 0,
+			has_tool_use INTEGER NOT NULL DEFAULT 0,
+			content_length INTEGER NOT NULL DEFAULT 0
+		)`)
+	requireNoError(t, err, "create messages_new")
+	_, err = raw.Exec(`
+		INSERT INTO messages_new
+			(id, session_id, ordinal, role, content,
+			 timestamp, has_thinking, has_tool_use,
+			 content_length)
+		SELECT id, session_id, ordinal, role, content,
+			timestamp, has_thinking, has_tool_use,
+			content_length
+		FROM messages`)
+	requireNoError(t, err, "copy to messages_new")
+	_, err = raw.Exec("DROP TABLE messages")
+	requireNoError(t, err, "drop messages")
+	_, err = raw.Exec(
+		"ALTER TABLE messages_new RENAME TO messages",
+	)
+	requireNoError(t, err, "rename messages_new")
+	raw.Close()
+
+	// Empty destination (has is_system column).
+	dstPath := filepath.Join(dir, "new.db")
+	dstDB, err := Open(dstPath)
+	requireNoError(t, err, "Open dst")
+	defer dstDB.Close()
+
+	count, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	requireNoError(t, err, "CopyOrphanedDataFrom")
+	if count != 1 {
+		t.Fatalf("expected 1 orphaned, got %d", count)
+	}
+
+	// Message should be copied with is_system defaulting to
+	// false.
+	msgs, err := dstDB.GetMessages(
+		context.Background(), "s1", 0, 100, true,
+	)
+	requireNoError(t, err, "GetMessages")
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
+	}
+	if msgs[0].IsSystem {
+		t.Error("is_system should default to false")
+	}
+}
+
 func TestGetAgentsExcludesEmptyAgent(t *testing.T) {
 	d := testDB(t)
 
