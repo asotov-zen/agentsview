@@ -4,6 +4,7 @@
   import type { Message, Session } from "../../api/types.js";
   import { getMessages, getSession } from "../../api/client.js";
   import { sessions } from "../../stores/sessions.svelte.js";
+  import { router } from "../../stores/router.svelte.js";
   import MessageContent from "./MessageContent.svelte";
 
   interface Props {
@@ -40,7 +41,8 @@
   function openAsSession(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
-    sessions.navigateToSession(sessionId);
+    sessions.pendingNavTarget = sessionId;
+    router.navigate("sessions");
   }
 
   let agentLabel = $derived(sessionMeta?.agent ?? null);

@@ -757,6 +757,14 @@ func (e *Engine) ResyncAll(
 	}
 	stats.OrphanedCopied = orphaned
 
+	// Re-link subagent sessions after orphan copy so copied
+	// tool_calls.subagent_session_id references are resolved.
+	if orphaned > 0 {
+		if err := newDB.LinkSubagentSessions(); err != nil {
+			log.Printf("resync: relink subagent sessions: %v", err)
+		}
+	}
+
 	// Merge user-managed data (display_name, deleted_at,
 	// starred_sessions, pinned_messages) from the old DB
 	// so renames, soft-deletes, stars, and pins survive.
