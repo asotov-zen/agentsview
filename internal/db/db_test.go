@@ -1082,6 +1082,100 @@ func TestReplaceSessionMessages(t *testing.T) {
 	}
 }
 
+func TestGetSessionFilePath(t *testing.T) {
+	d := testDB(t)
+
+	fp := "/tmp/sessions/abc.jsonl"
+	insertSession(t, d, "zencoder:abc", "p", func(s *Session) {
+		s.FilePath = &fp
+	})
+
+	got := d.GetSessionFilePath("zencoder:abc")
+	if got != fp {
+		t.Errorf("GetSessionFilePath = %q, want %q", got, fp)
+	}
+
+	// Non-existent session returns empty.
+	got = d.GetSessionFilePath("zencoder:nonexistent")
+	if got != "" {
+		t.Errorf("GetSessionFilePath(missing) = %q, want empty",
+			got)
+	}
+}
+
+func TestLinkSubagentSessionsOverridesContinuation(t *testing.T) {
+	d := testDB(t)
+
+	// Parent session with a tool call referencing a child.
+	insertSession(t, d, "parent", "p", func(s *Session) {
+		s.MessageCount = 1
+	})
+	// Child session initially classified as continuation
+	// (e.g. Zencoder header parentId).
+	insertSession(t, d, "child", "p", func(s *Session) {
+		s.MessageCount = 1
+		parentID := "header-parent"
+		s.ParentSessionID = &parentID
+		s.RelationshipType = "continuation"
+	})
+
+	// Insert a message with a tool call that references the child.
+	m := Message{
+		SessionID: "parent", Ordinal: 0,
+		Role: "assistant", Content: "spawning subagent",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			ToolName:          "subagent",
+			Category:          "Task",
+			SubagentSessionID: "child",
+		}},
+	}
+	insertMessages(t, d, m)
+
+	// Link should override continuation -> subagent.
+	if err := d.LinkSubagentSessions(); err != nil {
+		t.Fatalf("LinkSubagentSessions: %v", err)
+	}
+
+	sess, err := d.GetSession(context.Background(), "child")
+	requireNoError(t, err, "GetSession")
+	if sess.RelationshipType != "subagent" {
+		t.Errorf("relationship_type = %q, want 'subagent'",
+			sess.RelationshipType)
+	}
+	if sess.ParentSessionID == nil ||
+		*sess.ParentSessionID != "parent" {
+		t.Errorf("parent_session_id = %v, want 'parent'",
+			sess.ParentSessionID)
+	}
+}
+
+func TestIsSystemPersisted(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "s1", "p", func(s *Session) {
+		s.MessageCount = 2
+	})
+
+	m1 := userMsg("s1", 0, "normal user message")
+	m2 := userMsg("s1", 1, "system injected notice")
+	m2.IsSystem = true
+
+	insertMessages(t, d, m1, m2)
+
+	msgs, err := d.GetAllMessages(context.Background(), "s1")
+	requireNoError(t, err, "GetAllMessages")
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2", len(msgs))
+	}
+	if msgs[0].IsSystem {
+		t.Error("msgs[0].IsSystem = true, want false")
+	}
+	if !msgs[1].IsSystem {
+		t.Error("msgs[1].IsSystem = false, want true")
+	}
+}
+
 func TestSearch(t *testing.T) {
 	d := testDB(t)
 	requireFTS(t, d)
@@ -1106,6 +1200,36 @@ func TestSearch(t *testing.T) {
 	}
 	if page.Results[0].SessionID != "s1" {
 		t.Errorf("session_id = %q", page.Results[0].SessionID)
+	}
+}
+
+func TestSearchExcludesSystemMessages(t *testing.T) {
+	d := testDB(t)
+	requireFTS(t, d)
+
+	insertSession(t, d, "s1", "p", func(s *Session) {
+		s.MessageCount = 3
+	})
+
+	m1 := userMsg("s1", 0, "unique searchterm here")
+	m2 := userMsg("s1", 1, "system unique searchterm notice")
+	m2.IsSystem = true
+	m3 := asstMsg("s1", 2, "response to user")
+
+	insertMessages(t, d, m1, m2, m3)
+
+	page, err := d.Search(context.Background(), SearchFilter{
+		Query: "searchterm",
+		Limit: 10,
+	})
+	requireNoError(t, err, "Search")
+	// Only the non-system message should appear
+	if len(page.Results) != 1 {
+		t.Fatalf("got %d results, want 1 (system msg excluded)",
+			len(page.Results))
+	}
+	if page.Results[0].Ordinal != 0 {
+		t.Errorf("ordinal = %d, want 0", page.Results[0].Ordinal)
 	}
 }
 
