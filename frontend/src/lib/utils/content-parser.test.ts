@@ -1182,4 +1182,25 @@ describe("hasVisibleSegments", () => {
     );
     expect(hasVisibleSegments(m, noUser)).toBe(false);
   });
+
+  it("assistant skill visible when role is on but tool filter is off", () => {
+    const m = makeMsg({
+      content: "[Skill: commit]\nRunning commit skill\n[/Skill]",
+    });
+    const noTool = visibilityFrom(
+      new Set(["user", "assistant", "thinking", "code"]),
+    );
+    expect(hasVisibleSegments(m, noTool)).toBe(true);
+  });
+
+  it("user skill visible when role is on but tool filter is off", () => {
+    const m = makeMsg({
+      role: "user",
+      content: "[Skill: commit]\nRunning commit skill\n[/Skill]",
+    });
+    const noTool = visibilityFrom(
+      new Set(["user", "assistant", "thinking", "code"]),
+    );
+    expect(hasVisibleSegments(m, noTool)).toBe(true);
+  });
 });
