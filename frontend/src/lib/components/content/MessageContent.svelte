@@ -218,7 +218,9 @@
           <CodeBlock content={segment.content} language={segment.label} />
         {/if}
       {:else if segment.type === "skill"}
-        <SkillBlock content={segment.content} name={segment.label} />
+        {#if showText}
+          <SkillBlock content={segment.content} name={segment.label} />
+        {/if}
       {:else}
         {#if showText}
           <div class="text-content markdown">

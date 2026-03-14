@@ -495,7 +495,7 @@ export function hasVisibleSegments(
   if (segs.length === 0) return isVisible(role);
   return segs.some((s) => {
     if (s.type === "text") return isVisible(role);
-    if (s.type === "skill") return true; // always visible
+    if (s.type === "skill") return isVisible(role);
     return isVisible(s.type);
   });
 }
