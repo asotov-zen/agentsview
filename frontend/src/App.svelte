@@ -73,10 +73,16 @@
       }
       if (id) {
         messages.loadSession(id);
-        sync.watchSession(id, () => messages.reload());
+        sessions.loadChildSessions(id);
+        sync.watchSession(id, () => {
+          messages.reload();
+          sessions.refreshActiveSession();
+          sessions.loadChildSessions(id);
+        });
         pins.loadForSession(id);
       } else {
         messages.clear();
+        sessions.childSessions = new Map();
         sync.unwatchSession();
         pins.clearSession();
       }

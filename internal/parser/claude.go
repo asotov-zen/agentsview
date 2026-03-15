@@ -3,6 +3,7 @@
 package parser
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -333,7 +334,7 @@ func extractMessagesFrom(
 			continue
 		}
 
-		messages = append(messages, ParsedMessage{
+		msg := ParsedMessage{
 			Ordinal:       ordinal,
 			Role:          RoleType(e.entryType),
 			Content:       text,
@@ -343,7 +344,13 @@ func extractMessagesFrom(
 			ContentLength: len(text),
 			ToolCalls:     tcs,
 			ToolResults:   trs,
-		})
+		}
+
+		if e.entryType == "assistant" {
+			extractClaudeTokenFields(&msg, e.line)
+		}
+
+		messages = append(messages, msg)
 		ordinal++
 	}
 
@@ -389,6 +396,7 @@ func parseLinear(
 		UserMessageCount: userCount,
 		File:             fileInfo,
 	}
+	sumTokenUsage(&sess, messages)
 
 	return []ParseResult{{Session: sess, Messages: messages}}, nil
 }
@@ -564,6 +572,7 @@ func parseDAG(
 			UserMessageCount: userCount,
 			File:             fileInfo,
 		}
+		sumTokenUsage(&sess, messages)
 
 		results = append(results, ParseResult{
 			Session:  sess,
@@ -638,7 +647,7 @@ func extractMessages(entries []dagEntry) (
 			continue
 		}
 
-		messages = append(messages, ParsedMessage{
+		msg := ParsedMessage{
 			Ordinal:       ordinal,
 			Role:          RoleType(e.entryType),
 			Content:       text,
@@ -648,11 +657,53 @@ func extractMessages(entries []dagEntry) (
 			ContentLength: len(text),
 			ToolCalls:     tcs,
 			ToolResults:   trs,
-		})
+		}
+
+		if e.entryType == "assistant" {
+			extractClaudeTokenFields(&msg, e.line)
+		}
+
+		messages = append(messages, msg)
 		ordinal++
 	}
 
 	return messages, startedAt, endedAt
+}
+
+// extractClaudeTokenFields populates Model, TokenUsage,
+// ContextTokens, and OutputTokens on a ParsedMessage from
+// a Claude JSONL line. Used by both full and incremental
+// parsing paths.
+func extractClaudeTokenFields(msg *ParsedMessage, line string) {
+	msg.Model = gjson.Get(line, "message.model").String()
+
+	usageResult := gjson.Get(line, "message.usage")
+	if usageResult.Exists() {
+		msg.TokenUsage = json.RawMessage(usageResult.Raw)
+
+		input := int(usageResult.Get("input_tokens").Int())
+		cacheCreation := int(usageResult.Get(
+			"cache_creation_input_tokens",
+		).Int())
+		cacheRead := int(usageResult.Get(
+			"cache_read_input_tokens",
+		).Int())
+		msg.OutputTokens = int(usageResult.Get(
+			"output_tokens",
+		).Int())
+		msg.ContextTokens = input + cacheCreation + cacheRead
+	}
+}
+
+// sumTokenUsage accumulates per-message token counts into session
+// totals on the given ParsedSession.
+func sumTokenUsage(sess *ParsedSession, messages []ParsedMessage) {
+	for _, m := range messages {
+		sess.TotalOutputTokens += m.OutputTokens
+		if m.ContextTokens > sess.PeakContextTokens {
+			sess.PeakContextTokens = m.ContextTokens
+		}
+	}
 }
 
 // annotateSubagentSessions sets SubagentSessionID on tool calls

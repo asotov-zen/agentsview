@@ -1214,13 +1214,15 @@ func drainResults(results <-chan syncJob, remaining int) {
 // incremental JSONL parse, used to partially update the
 // session row without overwriting unrelated columns.
 type incrementalUpdate struct {
-	sessionID    string
-	msgs         []parser.ParsedMessage
-	endedAt      time.Time
-	msgCount     int // total (old + new)
-	userMsgCount int // total (old + new)
-	fileSize     int64
-	fileMtime    int64
+	sessionID         string
+	msgs              []parser.ParsedMessage
+	endedAt           time.Time
+	msgCount          int // total (old + new)
+	userMsgCount      int // total (old + new)
+	fileSize          int64
+	fileMtime         int64
+	totalOutputTokens int // absolute (old + new)
+	peakContextTokens int // absolute max(old, new)
 }
 
 type processResult struct {
@@ -1477,12 +1479,14 @@ func (e *Engine) tryIncrementalJSONL(
 		if consumed > 0 {
 			return processResult{
 				incremental: &incrementalUpdate{
-					sessionID:    inc.ID,
-					endedAt:      endedAt,
-					msgCount:     inc.MsgCount,
-					userMsgCount: inc.UserMsgCount,
-					fileSize:     newOffset,
-					fileMtime:    info.ModTime().UnixNano(),
+					sessionID:         inc.ID,
+					endedAt:           endedAt,
+					msgCount:          inc.MsgCount,
+					userMsgCount:      inc.UserMsgCount,
+					fileSize:          newOffset,
+					fileMtime:         info.ModTime().UnixNano(),
+					totalOutputTokens: inc.TotalOutputTokens,
+					peakContextTokens: inc.PeakContextTokens,
 				},
 			}, true
 		}
@@ -1497,15 +1501,26 @@ func (e *Engine) tryIncrementalJSONL(
 		agent, inc.ID, len(newMsgs), inc.FileSize,
 	)
 
+	totalOut := inc.TotalOutputTokens
+	peakCtx := inc.PeakContextTokens
+	for _, m := range newMsgs {
+		totalOut += m.OutputTokens
+		if m.ContextTokens > peakCtx {
+			peakCtx = m.ContextTokens
+		}
+	}
+
 	return processResult{
 		incremental: &incrementalUpdate{
-			sessionID:    inc.ID,
-			msgs:         newMsgs,
-			endedAt:      endedAt,
-			msgCount:     inc.MsgCount + len(newMsgs),
-			userMsgCount: inc.UserMsgCount + newUserCount,
-			fileSize:     newOffset,
-			fileMtime:    info.ModTime().UnixNano(),
+			sessionID:         inc.ID,
+			msgs:              newMsgs,
+			endedAt:           endedAt,
+			msgCount:          inc.MsgCount + len(newMsgs),
+			userMsgCount:      inc.UserMsgCount + newUserCount,
+			fileSize:          newOffset,
+			fileMtime:         info.ModTime().UnixNano(),
+			totalOutputTokens: totalOut,
+			peakContextTokens: peakCtx,
 		},
 	}, true
 }
@@ -1979,6 +1994,7 @@ func (e *Engine) writeIncremental(
 		inc.sessionID, endedAt,
 		msgCount, userMsgCount,
 		inc.fileSize, inc.fileMtime,
+		inc.totalOutputTokens, inc.peakContextTokens,
 	); err != nil {
 		return fmt.Errorf(
 			"incremental update %s: %w",
@@ -2069,18 +2085,20 @@ func (e *Engine) writeSessionFull(pw pendingWrite) error {
 // toDBSession converts a pendingWrite to a db.Session.
 func toDBSession(pw pendingWrite) db.Session {
 	s := db.Session{
-		ID:               pw.sess.ID,
-		Project:          pw.sess.Project,
-		Machine:          pw.sess.Machine,
-		Agent:            string(pw.sess.Agent),
-		MessageCount:     pw.sess.MessageCount,
-		UserMessageCount: pw.sess.UserMessageCount,
-		ParentSessionID:  strPtr(pw.sess.ParentSessionID),
-		RelationshipType: string(pw.sess.RelationshipType),
-		FilePath:         strPtr(pw.sess.File.Path),
-		FileSize:         int64Ptr(pw.sess.File.Size),
-		FileMtime:        int64Ptr(pw.sess.File.Mtime),
-		FileHash:         strPtr(pw.sess.File.Hash),
+		ID:                pw.sess.ID,
+		Project:           pw.sess.Project,
+		Machine:           pw.sess.Machine,
+		Agent:             string(pw.sess.Agent),
+		MessageCount:      pw.sess.MessageCount,
+		UserMessageCount:  pw.sess.UserMessageCount,
+		ParentSessionID:   strPtr(pw.sess.ParentSessionID),
+		RelationshipType:  string(pw.sess.RelationshipType),
+		TotalOutputTokens: pw.sess.TotalOutputTokens,
+		PeakContextTokens: pw.sess.PeakContextTokens,
+		FilePath:          strPtr(pw.sess.File.Path),
+		FileSize:          int64Ptr(pw.sess.File.Size),
+		FileMtime:         int64Ptr(pw.sess.File.Mtime),
+		FileHash:          strPtr(pw.sess.File.Hash),
 	}
 	if pw.sess.FirstMessage != "" {
 		s.FirstMessage = &pw.sess.FirstMessage
@@ -2109,6 +2127,10 @@ func toDBMessages(pw pendingWrite, blocked map[string]bool) []db.Message {
 			HasToolUse:    m.HasToolUse,
 			ContentLength: m.ContentLength,
 			IsSystem:      m.IsSystem,
+			Model:         m.Model,
+			TokenUsage:    m.TokenUsage,
+			ContextTokens: m.ContextTokens,
+			OutputTokens:  m.OutputTokens,
 			ToolCalls: convertToolCalls(
 				pw.sess.ID, m.ToolCalls,
 			),

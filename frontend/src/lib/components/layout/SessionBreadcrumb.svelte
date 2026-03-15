@@ -10,6 +10,7 @@
   } from "../../api/client.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { agentColor } from "../../utils/agents.js";
+  import { formatTokenCount } from "../../utils/format.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import {
     supportsResume,
@@ -53,6 +54,8 @@
       })
       .catch(() => {});
   });
+
+  let sessionContextTokens = $derived(session?.peak_context_tokens ?? 0);
 
   function sessionDisplayId(id: string): string {
     const idx = id.indexOf(":");
@@ -439,6 +442,11 @@
             : rawId.slice(0, 8)}
         </button>
       {/if}
+      {#if sessionContextTokens + (session?.total_output_tokens ?? 0) > 0}
+        <span class="token-badge">
+          {formatTokenCount(sessionContextTokens)} ctx / {formatTokenCount(session?.total_output_tokens ?? 0)} out
+        </span>
+      {/if}
       <div class="actions-wrapper">
         <button
           class="find-btn"
@@ -683,6 +691,18 @@
     color: var(--text-secondary);
     background: var(--bg-surface-hover);
   }
+
+  .token-badge {
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
 
   .actions-wrapper {
     position: relative;

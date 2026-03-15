@@ -23,7 +23,7 @@ import (
 // formatting changes). Old databases with a lower user_version
 // trigger a non-destructive re-sync (mtime reset + skip cache
 // clear) so existing session data is preserved.
-const dataVersion = 3
+const dataVersion = 4
 
 //go:embed schema.sql
 var schemaSQL string
@@ -275,6 +275,30 @@ func (db *DB) migrateColumns() error {
 		{
 			"messages", "is_system",
 			"ALTER TABLE messages ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"messages", "model",
+			"ALTER TABLE messages ADD COLUMN model TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"messages", "token_usage",
+			"ALTER TABLE messages ADD COLUMN token_usage TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"messages", "context_tokens",
+			"ALTER TABLE messages ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"messages", "output_tokens",
+			"ALTER TABLE messages ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "total_output_tokens",
+			"ALTER TABLE sessions ADD COLUMN total_output_tokens INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "peak_context_tokens",
+			"ALTER TABLE sessions ADD COLUMN peak_context_tokens INTEGER NOT NULL DEFAULT 0",
 		},
 	}
 
