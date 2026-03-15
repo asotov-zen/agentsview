@@ -1757,6 +1757,43 @@ func TestFindPruneCandidatesMaxMessagesSentinel(t *testing.T) {
 	}
 }
 
+func TestFindPruneCandidatesIgnoresSystemMessages(t *testing.T) {
+	d := testDB(t)
+
+	// Session with 1 real user message and 2 system user
+	// messages (Zencoder skill/finish). Only the real one
+	// should count toward MaxMessages.
+	insertSession(t, d, "zen1", "proj")
+	realMsg := userMsg("zen1", 0, "real user msg")
+	sysMsg1 := userMsg("zen1", 1, "system init")
+	sysMsg1.IsSystem = true
+	sysMsg2 := userMsg("zen1", 2, "skill finish")
+	sysMsg2.IsSystem = true
+	insertMessages(t, d, realMsg, sysMsg1, sysMsg2)
+
+	// MaxMessages=1 should include zen1 (1 real user msg).
+	got, err := d.FindPruneCandidates(
+		PruneFilter{MaxMessages: Ptr(1)},
+	)
+	requireNoError(t, err, "FindPruneCandidates")
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(got))
+	}
+	if got[0].ID != "zen1" {
+		t.Errorf("got %q, want zen1", got[0].ID)
+	}
+
+	// MaxMessages=0 should NOT include zen1 (it has 1 real
+	// user message).
+	got, err = d.FindPruneCandidates(
+		PruneFilter{MaxMessages: Ptr(0)},
+	)
+	requireNoError(t, err, "FindPruneCandidates")
+	if len(got) != 0 {
+		t.Fatalf("expected 0 results, got %d", len(got))
+	}
+}
+
 func TestDeleteSessions(t *testing.T) {
 	d := testDB(t)
 
