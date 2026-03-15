@@ -38,11 +38,15 @@
     }
   }
 
-  function openAsSession(e: MouseEvent) {
+  async function openAsSession(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
-    sessions.pendingNavTarget = sessionId;
-    router.navigate("sessions");
+    if (router.route === "sessions") {
+      await sessions.navigateToSession(sessionId);
+    } else {
+      sessions.pendingNavTarget = sessionId;
+      router.navigate("sessions");
+    }
   }
 
   let agentLabel = $derived(sessionMeta?.agent ?? null);

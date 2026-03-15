@@ -991,7 +991,8 @@ func (db *DB) FindPruneCandidates(
 	if f.MaxMessages != nil {
 		where += ` AND (SELECT COUNT(*) FROM messages
 			WHERE messages.session_id = sessions.id
-			AND messages.role = 'user') <= ?`
+			AND messages.role = 'user'
+			AND messages.is_system = 0) <= ?`
 		args = append(args, *f.MaxMessages)
 	}
 	if f.Before != "" {
