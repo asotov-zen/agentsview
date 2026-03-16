@@ -174,44 +174,24 @@ func TestCollectStreamLines_LargeLine(t *testing.T) {
 	}
 }
 
-func TestCleanEnv(t *testing.T) {
+func TestAgentEnv(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "sk-secret")
-	t.Setenv("CLAUDECODE", "1")
-	t.Setenv("HOME", "/home/test")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "s3cret")
-	t.Setenv("PATH", "/usr/bin")
-	t.Setenv("LANG", "en_US.UTF-8")
-	t.Setenv("UNKNOWN_VAR", "should-be-dropped")
+	t.Setenv("CUSTOM_VAR", "custom-val")
 
-	env := cleanEnv()
-
-	// Normalize keys to uppercase for cross-platform assertions
-	// (Windows may return Path instead of PATH).
+	env := agentEnv()
 	envMap := make(map[string]string, len(env))
 	for _, e := range env {
 		k, v, _ := strings.Cut(e, "=")
 		envMap[strings.ToUpper(k)] = v
 	}
 
-	// Secrets and unknown vars must not pass through.
-	for _, blocked := range []string{
-		"ANTHROPIC_API_KEY", "CLAUDECODE",
-		"AWS_SECRET_ACCESS_KEY", "UNKNOWN_VAR",
-	} {
-		if _, ok := envMap[blocked]; ok {
-			t.Errorf("%s should not be in env", blocked)
-		}
+	// Full env is passed through — no filtering.
+	if envMap["ANTHROPIC_API_KEY"] != "sk-secret" {
+		t.Error("ANTHROPIC_API_KEY should be preserved")
 	}
-
-	// Allowed system vars must pass through.
-	for _, allowed := range []string{
-		"HOME", "PATH", "LANG",
-	} {
-		if _, ok := envMap[allowed]; !ok {
-			t.Errorf("%s should be preserved", allowed)
-		}
+	if envMap["CUSTOM_VAR"] != "custom-val" {
+		t.Error("CUSTOM_VAR should be preserved")
 	}
-
 	if v, ok := envMap["CLAUDE_NO_SOUND"]; !ok || v != "1" {
 		t.Errorf(
 			"CLAUDE_NO_SOUND should be 1, got %q", v,
@@ -219,51 +199,9 @@ func TestCleanEnv(t *testing.T) {
 	}
 }
 
-func TestEnvKeyAllowed(t *testing.T) {
-	tests := []struct {
-		key  string
-		want bool
-	}{
-		{"PATH", true},
-		{"Path", true}, // Windows-style
-		{"path", true}, // lowercase
-		{"HOME", true},
-		{"Home", true},
-		{"COMSPEC", true},
-		{"ComSpec", true}, // Windows-style
-		{"LC_ALL", true},  // prefix match
-		{"XDG_CONFIG_HOME", true},
-		{"SSL_CERT_FILE", true},
-		{"HTTP_PROXY", true},
-		{"APPDATA", true},
-		{"AppData", true},
-		{"LOCALAPPDATA", true},
-		{"PROGRAMDATA", true},
-		{"PATHEXT", true},
-		{"PathExt", true},
-		{"WINDIR", true},
-		{"HOMEDRIVE", true},
-		{"HOMEPATH", true},
-		{"ANTHROPIC_API_KEY", false},
-		{"AWS_SECRET_ACCESS_KEY", false},
-		{"DATABASE_URL", false},
-		{"", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.key, func(t *testing.T) {
-			if got := envKeyAllowed(tt.key); got != tt.want {
-				t.Errorf(
-					"envKeyAllowed(%q) = %v, want %v",
-					tt.key, got, tt.want,
-				)
-			}
-		})
-	}
-}
-
 func TestValidAgents(t *testing.T) {
 	for _, agent := range []string{
-		"claude", "codex", "gemini",
+		"claude", "codex", "copilot", "gemini",
 	} {
 		if !ValidAgents[agent] {
 			t.Errorf("%s should be valid", agent)
@@ -327,6 +265,196 @@ func fakeClaudeBin(
 
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+func TestGenerateClaude_CLIFlags(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test not supported on windows")
+	}
+
+	stdout := `{"result":"OK","model":"m1"}`
+	bin, argsFile := createMockBinary(
+		t, stdout, 0, true, "claude",
+	)
+
+	result, err := generateClaude(
+		context.Background(), bin, "test prompt", nil,
+	)
+	if err != nil {
+		t.Fatalf("generateClaude: %v", err)
+	}
+	if result.Content != "OK" {
+		t.Errorf("Content = %q, want OK", result.Content)
+	}
+
+	argsData, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("reading args: %v", err)
+	}
+	args := strings.Split(
+		strings.TrimSpace(string(argsData)), "\n",
+	)
+
+	// The empty string value for --tools is lost by the
+	// shell printf, so verify args as a joined string.
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"-p",
+		"--output-format json",
+		"--no-session-persistence",
+		"--tools",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf(
+				"args %q missing %q", joined, want,
+			)
+		}
+	}
+}
+
+func TestGenerateCodex_CLIFlags(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test not supported on windows")
+	}
+
+	stdout := `{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":"OK"}}
+`
+	bin, argsFile := createMockBinary(
+		t, stdout, 0, true, "codex",
+	)
+
+	result, err := generateCodex(
+		context.Background(), bin, "test prompt", nil,
+	)
+	if err != nil {
+		t.Fatalf("generateCodex: %v", err)
+	}
+	if result.Content != "OK" {
+		t.Errorf("Content = %q, want OK", result.Content)
+	}
+
+	argsData, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("reading args: %v", err)
+	}
+	args := strings.Split(
+		strings.TrimSpace(string(argsData)), "\n",
+	)
+
+	wantArgs := []string{
+		"exec", "--json",
+		"--sandbox", "read-only",
+		"--skip-git-repo-check",
+		"--ephemeral",
+		"-",
+	}
+	if len(args) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", args, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if args[i] != want {
+			t.Errorf(
+				"arg[%d] = %q, want %q",
+				i, args[i], want,
+			)
+		}
+	}
+}
+
+func TestGenerateCopilot_CLIFlags(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test not supported on windows")
+	}
+
+	bin, argsFile := createMockBinary(
+		t, "Hello from copilot", 0, true, "copilot",
+	)
+
+	result, err := generateCopilot(
+		context.Background(), bin, "test prompt", nil,
+	)
+	if err != nil {
+		t.Fatalf("generateCopilot: %v", err)
+	}
+	if result.Content != "Hello from copilot" {
+		t.Errorf(
+			"Content = %q, want %q",
+			result.Content, "Hello from copilot",
+		)
+	}
+	if result.Agent != "copilot" {
+		t.Errorf("Agent = %q, want copilot", result.Agent)
+	}
+
+	argsData, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("reading args: %v", err)
+	}
+	args := strings.Split(
+		strings.TrimSpace(string(argsData)), "\n",
+	)
+
+	wantArgs := []string{
+		"-p", "test prompt",
+		"--silent",
+		"--no-custom-instructions",
+		"--no-ask-user",
+		"--disable-builtin-mcps",
+	}
+	if len(args) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", args, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if args[i] != want {
+			t.Errorf(
+				"arg[%d] = %q, want %q",
+				i, args[i], want,
+			)
+		}
+	}
+}
+
+func TestGenerateCopilot_EmptyResult(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test not supported on windows")
+	}
+
+	bin, _ := createMockBinary(
+		t, "", 0, false, "copilot",
+	)
+
+	_, err := generateCopilot(
+		context.Background(), bin, "test", nil,
+	)
+	if err == nil {
+		t.Fatal("expected error for empty result")
+	}
+	if !strings.Contains(err.Error(), "empty result") {
+		t.Errorf("error = %q, want empty result", err)
+	}
+}
+
+func TestGenerateCopilot_PreservesBlankLines(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test not supported on windows")
+	}
+
+	multiParagraph := "# Summary\n\nParagraph one.\n\nParagraph two.\n"
+	bin, _ := createMockBinary(
+		t, multiParagraph, 0, false, "copilot",
+	)
+
+	result, err := generateCopilot(
+		context.Background(), bin, "test", nil,
+	)
+	if err != nil {
+		t.Fatalf("generateCopilot: %v", err)
+	}
+	if !strings.Contains(result.Content, "\n\n") {
+		t.Errorf(
+			"blank lines lost: %q", result.Content,
+		)
+	}
 }
 
 func TestGenerateClaude_SalvageOnNonZeroExit(t *testing.T) {
@@ -460,6 +588,7 @@ func TestGenerateGemini_ModelFlag(t *testing.T) {
 	wantArgs := []string{
 		"--model", geminiInsightModel,
 		"--output-format", "stream-json",
+		"--sandbox",
 	}
 	if len(args) != len(wantArgs) {
 		t.Fatalf("args = %v, want %v", args, wantArgs)

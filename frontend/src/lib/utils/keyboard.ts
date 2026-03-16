@@ -2,6 +2,8 @@ import { ui } from "../stores/ui.svelte.js";
 import { sessions } from "../stores/sessions.svelte.js";
 import { starred } from "../stores/starred.svelte.js";
 import { sync } from "../stores/sync.svelte.js";
+import { router } from "../stores/router.svelte.js";
+import { inSessionSearch } from "../stores/inSessionSearch.svelte.js";
 import {
   getExportUrl,
   resumeSession,
@@ -21,11 +23,23 @@ function isInputFocused(): boolean {
   );
 }
 
+function isFindInput(): boolean {
+  const el = document.activeElement;
+  return (
+    el instanceof HTMLInputElement &&
+    el.getAttribute("aria-label") === "Search query"
+  );
+}
+
 interface ShortcutOptions {
   navigateMessage: (delta: number) => void;
 }
 
 function handleEscape(): void {
+  if (inSessionSearch.isOpen) {
+    inSessionSearch.close();
+    return;
+  }
   if (ui.activeModal !== null) {
     ui.activeModal = null;
     return;
@@ -52,6 +66,43 @@ export function registerShortcuts(
         ui.activeModal === "commandPalette"
           ? null
           : "commandPalette";
+      return;
+    }
+
+    // Cmd+F — open in-session find when the session view is
+    // active with a selected session. Allow from the find
+    // input itself but not from other inputs (e.g. sidebar
+    // typeahead) where native find should work normally.
+    if (
+      meta &&
+      e.key === "f" &&
+      router.route === "sessions" &&
+      sessions.activeSessionId &&
+      ui.activeModal === null &&
+      (!isInputFocused() || isFindInput())
+    ) {
+      e.preventDefault();
+      inSessionSearch.open();
+      return;
+    }
+
+    // Cmd+G / Cmd+Shift+G — next/prev match while find is
+    // open on the session view. Skip when a modal is open or
+    // an unrelated input has focus.
+    if (
+      meta &&
+      e.key === "g" &&
+      router.route === "sessions" &&
+      inSessionSearch.isOpen &&
+      ui.activeModal === null &&
+      (!isInputFocused() || isFindInput())
+    ) {
+      e.preventDefault();
+      if (e.shiftKey) {
+        inSessionSearch.prev();
+      } else {
+        inSessionSearch.next();
+      }
       return;
     }
 
@@ -143,6 +194,11 @@ export function registerShortcuts(
             );
             if (cmd) copyToClipboard(cmd);
           });
+        }
+      },
+      "/": () => {
+        if (sessions.activeSessionId) {
+          inSessionSearch.open();
         }
       },
       "?": () => {

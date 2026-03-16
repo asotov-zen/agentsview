@@ -355,7 +355,7 @@ func TestSyncEngineProgress(t *testing.T) {
 	}
 
 	var progressCalls int
-	env.engine.SyncAll(func(p sync.Progress) {
+	env.engine.SyncAll(context.Background(), func(p sync.Progress) {
 		progressCalls++
 	})
 
@@ -472,7 +472,7 @@ func TestSyncSingleSessionReplacesContent(
 		t, "test-proj", "replace-test.jsonl", original,
 	)
 
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 	assertMessageContent(
 		t, env.db, "replace-test",
 		"original question", "original answer",
@@ -511,7 +511,7 @@ func TestSyncSingleSessionHash(t *testing.T) {
 		t, "test-proj", "single-hash.jsonl", content,
 	)
 
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 	env.assertResyncRoundTrip(t, "single-hash")
 }
 
@@ -532,7 +532,7 @@ func TestSyncSingleSessionHashCodex(t *testing.T) {
 
 	sessionID := "codex:" + uuid
 
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 	env.assertResyncRoundTrip(t, sessionID)
 }
 
@@ -559,7 +559,7 @@ func TestSyncSingleSessionCodexExecBypassesCache(
 	)
 
 	// SyncAll skips exec-originated sessions (nil result).
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 	sess, _ := env.db.GetSession(
 		context.Background(), "codex:"+uuid,
 	)
@@ -594,7 +594,7 @@ func TestSyncEngineTombstoneClearOnMtimeChange(t *testing.T) {
 	)
 
 	// First sync
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 
 	// Replace with valid content
 	valid := testjsonl.NewSessionBuilder().
@@ -623,7 +623,7 @@ func TestSyncSingleSessionProjectFallback(t *testing.T) {
 	)
 
 	// 2. Initial sync - should get "default-proj"
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 
 	assertSessionProject(t, env.db, "fallback-test", "default_proj")
 
@@ -1310,7 +1310,7 @@ func TestSyncEngineOpenCodeBulkSync(t *testing.T) {
 	)
 
 	// First SyncAll should discover and store the session.
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 
 	agentviewID := "opencode:" + sessionID
 	assertSessionState(t, env.db, agentviewID,
@@ -1338,7 +1338,7 @@ func TestSyncEngineOpenCodeBulkSync(t *testing.T) {
 	oc.updateSessionTime(t, sessionID, timeUpdated+1000)
 
 	// Second SyncAll should fully replace messages.
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 
 	assertMessageContent(
 		t, env.db, agentviewID,
@@ -1347,7 +1347,7 @@ func TestSyncEngineOpenCodeBulkSync(t *testing.T) {
 
 	// Third SyncAll with no changes should be a no-op
 	// (time_updated unchanged, so session is skipped).
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 
 	assertMessageContent(
 		t, env.db, agentviewID,
@@ -1390,7 +1390,7 @@ func TestSyncEngineOpenCodeToolCallReplace(t *testing.T) {
 		"bash", "call-1", timeCreated+1,
 	)
 
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 
 	agentviewID := "opencode:" + sessionID
 	assertToolCallCount(t, env.db, agentviewID, 1)
@@ -1415,7 +1415,7 @@ func TestSyncEngineOpenCodeToolCallReplace(t *testing.T) {
 	)
 	oc.updateSessionTime(t, sessionID, timeUpdated+1000)
 
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 
 	assertMessageContent(
 		t, env.db, agentviewID,
@@ -1475,7 +1475,7 @@ func TestSyncEngineConcurrentSerialization(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
-		env.engine.SyncAll(syncProgress)
+		env.engine.SyncAll(context.Background(), syncProgress)
 	}()
 
 	// Wait until SyncAll is inside the locked section.
@@ -1483,7 +1483,7 @@ func TestSyncEngineConcurrentSerialization(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
-		env.engine.ResyncAll(resyncProgress)
+		env.engine.ResyncAll(context.Background(), resyncProgress)
 	}()
 
 	// ResyncAll should be blocked on the mutex. Give it
@@ -1590,7 +1590,7 @@ func TestSyncSingleSessionPostFilterCounts(t *testing.T) {
 	)
 
 	// SyncAll to populate the session in the DB.
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 
 	// Corrupt stored counts and clear mtime so
 	// SyncSingleSession re-parses via writeSessionFull.
@@ -1867,7 +1867,7 @@ func TestResyncAllReplacesMessageContent(t *testing.T) {
 	}
 
 	// Normal SyncAll should skip (file unchanged on disk).
-	stats := env.engine.SyncAll(nil)
+	stats := env.engine.SyncAll(context.Background(), nil)
 	if stats.Skipped != 1 {
 		t.Fatalf("expected 1 skip, got %d", stats.Skipped)
 	}
@@ -1882,7 +1882,7 @@ func TestResyncAllReplacesMessageContent(t *testing.T) {
 	hadFTS := env.db.HasFTS()
 
 	// ResyncAll should re-parse and replace message content.
-	env.engine.ResyncAll(nil)
+	env.engine.ResyncAll(context.Background(), nil)
 	msgs = fetchMessages(t, env.db, fullID)
 	if len(msgs) != 2 {
 		t.Fatalf("got %d messages after resync, want 2",
@@ -1937,7 +1937,7 @@ func TestResyncAllPreservesInsights(t *testing.T) {
 		t, "test-proj", "insight-test.jsonl", content,
 	)
 
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 	assertSessionMessageCount(t, env.db, "insight-test", 2)
 
 	// Insert an insight into the DB.
@@ -1954,7 +1954,7 @@ func TestResyncAllPreservesInsights(t *testing.T) {
 
 	// ResyncAll should rebuild sessions and preserve
 	// insights.
-	stats := env.engine.ResyncAll(nil)
+	stats := env.engine.ResyncAll(context.Background(), nil)
 	if stats.Synced == 0 {
 		t.Fatal("expected at least 1 synced session")
 	}
@@ -1993,7 +1993,7 @@ func TestResyncAllAbortsOnFailures(t *testing.T) {
 		t, "test-proj", "abort-test.jsonl", content,
 	)
 
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 	assertSessionMessageCount(t, env.db, "abort-test", 2)
 
 	if runtime.GOOS == "windows" {
@@ -2016,7 +2016,7 @@ func TestResyncAllAbortsOnFailures(t *testing.T) {
 		os.Chmod(sessionPath, 0o644)
 	})
 
-	stats := env.engine.ResyncAll(nil)
+	stats := env.engine.ResyncAll(context.Background(), nil)
 
 	if stats.Failed == 0 {
 		t.Fatalf("expected failures, got 0")
@@ -2121,7 +2121,7 @@ func TestResyncAllAbortsWithForkAndFailures(t *testing.T) {
 	// Initial sync: all 3 files parse fine.
 	// Fork file produces 2 sessions: "forked" (10 msgs)
 	// and "forked-i" (2 msgs).
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 	assertSessionMessageCount(t, env.db, "forked", 10)
 	assertSessionMessageCount(t, env.db, "forked-i", 2)
 
@@ -2134,7 +2134,7 @@ func TestResyncAllAbortsWithForkAndFailures(t *testing.T) {
 		t.Cleanup(func() { os.Chmod(p, 0o644) })
 	}
 
-	stats := env.engine.ResyncAll(nil)
+	stats := env.engine.ResyncAll(context.Background(), nil)
 
 	// Expect: filesOK=1, Failed=2, Synced=2.
 	// Abort should fire because Failed(2) > filesOK(1).
@@ -2184,7 +2184,7 @@ func TestResyncAllPostReopenAvailability(t *testing.T) {
 	})
 
 	// Resync triggers the full close-rename-reopen cycle.
-	stats := env.engine.ResyncAll(nil)
+	stats := env.engine.ResyncAll(context.Background(), nil)
 	if stats.Synced != 1 {
 		t.Fatalf("resync: synced = %d, want 1", stats.Synced)
 	}
@@ -2234,7 +2234,7 @@ func TestResyncAllPostReopenAvailability(t *testing.T) {
 
 	// Verify a subsequent SyncAll still works (engine state
 	// is consistent with the reopened DB).
-	stats2 := env.engine.SyncAll(nil)
+	stats2 := env.engine.SyncAll(context.Background(), nil)
 	if stats2.Synced != 0 || stats2.Skipped != 1 {
 		t.Errorf(
 			"post-resync SyncAll: synced=%d skipped=%d",
@@ -2258,7 +2258,7 @@ func TestResyncAllConcurrentReads(t *testing.T) {
 		t, "conc-proj", "conc.jsonl", content,
 	)
 
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2306,7 +2306,7 @@ func TestResyncAllConcurrentReads(t *testing.T) {
 	<-readersReady
 
 	// Run resync while readers are active.
-	stats := env.engine.ResyncAll(nil)
+	stats := env.engine.ResyncAll(context.Background(), nil)
 	cancel()
 	wg.Wait()
 
@@ -2339,7 +2339,7 @@ func TestResyncAllAbortsOnEmptyDiscovery(t *testing.T) {
 		AddClaudeAssistant(tsEarlyS5, "ok").
 		String()
 	env.writeClaudeSession(t, "proj", "keep.jsonl", content)
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 	assertSessionMessageCount(t, env.db, "keep", 2)
 
 	// Remove all session files to simulate empty discovery.
@@ -2354,7 +2354,7 @@ func TestResyncAllAbortsOnEmptyDiscovery(t *testing.T) {
 		os.Remove(p)
 	}
 
-	stats := env.engine.ResyncAll(nil)
+	stats := env.engine.ResyncAll(context.Background(), nil)
 
 	// Swap must be aborted.
 	hasAbortWarning := false
@@ -2409,13 +2409,13 @@ func TestResyncAllOpenCodeOnly(t *testing.T) {
 	)
 
 	// Initial sync populates the DB with OpenCode sessions.
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 	agentviewID := "opencode:" + sessionID
 	assertSessionMessageCount(t, env.db, agentviewID, 2)
 
 	// ResyncAll must not abort — OpenCode sessions should
 	// survive even though file discovery returns zero.
-	stats := env.engine.ResyncAll(nil)
+	stats := env.engine.ResyncAll(context.Background(), nil)
 
 	for _, w := range stats.Warnings {
 		if strings.Contains(w, "resync aborted") {
@@ -2482,7 +2482,7 @@ func TestResyncAllAbortsMixedSourceEmptyFiles(t *testing.T) {
 	)
 
 	// Initial sync: both sources.
-	env.engine.SyncAll(nil)
+	env.engine.SyncAll(context.Background(), nil)
 	assertSessionMessageCount(t, env.db, "mixed-file", 2)
 	assertSessionMessageCount(
 		t, env.db, "opencode:"+sessionID, 2,
@@ -2501,7 +2501,7 @@ func TestResyncAllAbortsMixedSourceEmptyFiles(t *testing.T) {
 		os.Remove(p)
 	}
 
-	stats := env.engine.ResyncAll(nil)
+	stats := env.engine.ResyncAll(context.Background(), nil)
 
 	// Must abort: file-backed sessions would be lost.
 	hasAbortWarning := false
@@ -2558,7 +2558,7 @@ func TestNewEngineDefensiveCopy(t *testing.T) {
 	dirs[parser.AgentCodex] = []string{"/bogus"}
 
 	// Engine should still find the session via its own copy.
-	stats := engine.SyncAll(nil)
+	stats := engine.SyncAll(context.Background(), nil)
 	if stats.Synced != 1 {
 		t.Fatalf(
 			"Synced = %d, want 1 (engine used mutated map)",
@@ -2592,7 +2592,7 @@ func TestNewEngineDefensiveCopy(t *testing.T) {
 	// Mutate the element inside the original slice.
 	sliceDirs[0] = "/nonexistent"
 
-	stats2 := engine2.SyncAll(nil)
+	stats2 := engine2.SyncAll(context.Background(), nil)
 	if stats2.Synced != 1 {
 		t.Fatalf(
 			"Synced = %d, want 1 (engine used aliased slice)",
@@ -2805,7 +2805,7 @@ func TestPiSessionIntegration(t *testing.T) {
 		Machine: "local",
 	})
 
-	stats := engine.SyncAll(nil)
+	stats := engine.SyncAll(context.Background(), nil)
 	if stats.Synced != 1 {
 		t.Fatalf("expected 1 synced session, got %d (failed=%d)",
 			stats.Synced, stats.Failed)
@@ -2842,4 +2842,363 @@ func TestPiSessionIntegration(t *testing.T) {
 			}
 		},
 	)
+}
+
+func TestIncrementalSync_ClaudeAppend(t *testing.T) {
+	env := setupTestEnv(t)
+
+	// Initial sync: one user message.
+	initial := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON("hello", tsZero),
+	)
+	path := env.writeClaudeSession(
+		t, "proj", "inc-test.jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	assertSessionMessageCount(t, env.db, "inc-test", 1)
+	assertMessageRoles(t, env.db, "inc-test", "user")
+	msgs := fetchMessages(t, env.db, "inc-test")
+	if msgs[0].SessionID != "inc-test" {
+		t.Fatalf(
+			"msgs[0].SessionID = %q, want inc-test",
+			msgs[0].SessionID,
+		)
+	}
+
+	// Verify metadata is set from full parse.
+	full, err := env.db.GetSessionFull(
+		context.Background(), "inc-test",
+	)
+	if err != nil {
+		t.Fatalf("GetSessionFull: %v", err)
+	}
+	if full.FileHash == nil || *full.FileHash == "" {
+		t.Fatal("file_hash not set after full parse")
+	}
+	origHash := *full.FileHash
+
+	// Append an assistant response.
+	appended := testjsonl.ClaudeAssistantJSON(
+		"world", tsZeroS5,
+	) + "\n"
+	f, err := os.OpenFile(
+		path, os.O_APPEND|os.O_WRONLY, 0o644,
+	)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	_, err = f.WriteString(appended)
+	f.Close()
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	// SyncPaths triggers incremental parse.
+	env.engine.SyncPaths([]string{path})
+
+	// Session count updated.
+	assertSessionMessageCount(t, env.db, "inc-test", 2)
+	assertMessageRoles(
+		t, env.db, "inc-test", "user", "assistant",
+	)
+
+	// New message has correct session_id.
+	msgs = fetchMessages(t, env.db, "inc-test")
+	for i, m := range msgs {
+		if m.SessionID != "inc-test" {
+			t.Errorf(
+				"msgs[%d].SessionID = %q, want inc-test",
+				i, m.SessionID,
+			)
+		}
+	}
+
+	// Metadata preserved (file_hash not cleared).
+	updated, err := env.db.GetSessionFull(
+		context.Background(), "inc-test",
+	)
+	if err != nil {
+		t.Fatalf("GetSessionFull after incremental: %v", err)
+	}
+	if updated.FileHash == nil ||
+		*updated.FileHash != origHash {
+		t.Errorf(
+			"file_hash = %v, want %q (preserved)",
+			updated.FileHash, origHash,
+		)
+	}
+}
+
+func TestIncrementalSync_CodexAppend(t *testing.T) {
+	env := setupTestEnv(t)
+
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			"inc-cx", "/tmp/proj",
+			"codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+	)
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-20240101-inc-cx.jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	assertSessionMessageCount(
+		t, env.db, "codex:inc-cx", 1,
+	)
+
+	// Append new messages.
+	appended := testjsonl.JoinJSONL(
+		testjsonl.CodexMsgJSON(
+			"assistant", "world", tsEarlyS5,
+		),
+	)
+	f, err := os.OpenFile(
+		path, os.O_APPEND|os.O_WRONLY, 0o644,
+	)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	_, err = f.WriteString(appended)
+	f.Close()
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	env.engine.SyncPaths([]string{path})
+
+	assertSessionMessageCount(
+		t, env.db, "codex:inc-cx", 2,
+	)
+	assertMessageRoles(
+		t, env.db, "codex:inc-cx", "user", "assistant",
+	)
+
+	// Verify session_id on all messages.
+	msgs := fetchMessages(t, env.db, "codex:inc-cx")
+	for i, m := range msgs {
+		if m.SessionID != "codex:inc-cx" {
+			t.Errorf(
+				"msgs[%d].SessionID = %q, want codex:inc-cx",
+				i, m.SessionID,
+			)
+		}
+	}
+}
+
+func TestResyncAllCancelledPreservesOriginalDB(t *testing.T) {
+	env := setupTestEnv(t)
+
+	// Seed the DB with a session via Claude JSONL.
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "hello").
+		AddClaudeAssistant(tsEarlyS5, "world").
+		String()
+	env.writeClaudeSession(
+		t, "cancel-project", "cancel-sess.jsonl", content,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	// Verify session exists with messages.
+	sess, err := env.db.GetSession(
+		context.Background(), "cancel-sess",
+	)
+	if err != nil || sess == nil {
+		t.Fatalf("session not found: %v", err)
+	}
+	origCount := sess.MessageCount
+	if origCount == 0 {
+		t.Fatal("expected messages after initial sync")
+	}
+
+	// Cancel the context before starting ResyncAll so
+	// collectAndBatch aborts immediately.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	stats := env.engine.ResyncAll(ctx, nil)
+
+	if !stats.Aborted {
+		t.Fatal("expected ResyncAll to report Aborted")
+	}
+
+	// Original DB should be preserved — session still
+	// has the original data.
+	sess, err = env.db.GetSession(
+		context.Background(), "cancel-sess",
+	)
+	if err != nil || sess == nil {
+		t.Fatal("session lost after cancelled resync")
+	}
+	if sess.MessageCount != origCount {
+		t.Errorf(
+			"message count = %d, want %d",
+			sess.MessageCount, origCount,
+		)
+	}
+}
+
+func TestSyncAllCancelledDoesNotUpdateLastSync(t *testing.T) {
+	env := setupTestEnv(t)
+
+	// Seed the DB with a session.
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "hello").
+		String()
+	env.writeClaudeSession(
+		t, "ls-project", "ls-sess.jsonl", content,
+	)
+
+	// Run a successful sync to set lastSync.
+	env.engine.SyncAll(context.Background(), nil)
+	lastSync := env.engine.LastSync()
+	if lastSync.IsZero() {
+		t.Fatal("expected lastSync to be set")
+	}
+	lastStats := env.engine.LastSyncStats()
+	if lastStats.Synced == 0 {
+		t.Fatal("expected synced > 0")
+	}
+
+	// Run a cancelled sync.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stats := env.engine.SyncAll(ctx, nil)
+	if !stats.Aborted {
+		t.Fatal("expected SyncAll to report Aborted")
+	}
+
+	// lastSync and lastSyncStats should be unchanged.
+	if env.engine.LastSync() != lastSync {
+		t.Error("lastSync was updated by cancelled sync")
+	}
+	if env.engine.LastSyncStats().Synced != lastStats.Synced {
+		t.Error("lastSyncStats was updated by cancelled sync")
+	}
+}
+
+func TestSyncAllOpenCodeExcludedNotCountedAsFailed(
+	t *testing.T,
+) {
+	env := setupTestEnv(t)
+
+	// Create an OpenCode DB with a session.
+	oc := createOpenCodeDB(t, env.opencodeDir)
+	oc.addProject(t, "proj1", "/tmp/proj1")
+	oc.addSession(t, "oc-excl-1", "proj1", 1000, 1000)
+	oc.addMessage(t, "msg1", "oc-excl-1", "user", 1000)
+	oc.addTextPart(
+		t, "part1", "oc-excl-1", "msg1", "hi", 1000,
+	)
+
+	// Initial sync to get the session into the DB.
+	env.engine.SyncAll(context.Background(), nil)
+
+	sess, err := env.db.GetSession(
+		context.Background(), "opencode:oc-excl-1",
+	)
+	if err != nil || sess == nil {
+		t.Fatal("opencode session not found after sync")
+	}
+
+	// Permanently delete the session (marks it excluded).
+	if err := env.db.DeleteSession(
+		"opencode:oc-excl-1",
+	); err != nil {
+		t.Fatalf("delete session: %v", err)
+	}
+
+	// Bump the time_updated so the next sync picks it up.
+	oc.updateSessionTime(t, "oc-excl-1", 2000)
+
+	// Sync again — the excluded session should not be
+	// counted as a failure.
+	stats := env.engine.SyncAll(context.Background(), nil)
+	if stats.Failed > 0 {
+		t.Errorf(
+			"Failed = %d, want 0 (excluded session "+
+				"should not count as failure)",
+			stats.Failed,
+		)
+	}
+}
+
+// TestSyncSingleSessionExcludedIsNoOp verifies that
+// calling SyncSingleSession on a permanently deleted
+// (excluded) session returns nil, not an error.
+func TestSyncSingleSessionExcludedIsNoOp(t *testing.T) {
+	env := setupTestEnv(t)
+
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsZero, "hello").
+		AddClaudeAssistant(tsZeroS5, "hi").
+		String()
+
+	env.writeClaudeSession(
+		t, "test-proj", "excl-single.jsonl", content,
+	)
+
+	env.engine.SyncAll(context.Background(), nil)
+	assertSessionMessageCount(t, env.db, "excl-single", 2)
+
+	// Permanently delete → marks it excluded.
+	if err := env.db.DeleteSession(
+		"excl-single",
+	); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+
+	// SyncSingleSession should silently skip, not error.
+	if err := env.engine.SyncSingleSession(
+		"excl-single",
+	); err != nil {
+		t.Fatalf(
+			"SyncSingleSession on excluded session "+
+				"returned error: %v", err,
+		)
+	}
+}
+
+// TestSyncSingleSessionOpenCodeExcludedIsNoOp verifies that
+// calling SyncSingleSession on an excluded OpenCode session
+// returns nil.
+func TestSyncSingleSessionOpenCodeExcludedIsNoOp(
+	t *testing.T,
+) {
+	env := setupTestEnv(t)
+
+	oc := createOpenCodeDB(t, env.opencodeDir)
+	oc.addProject(t, "proj1", "/tmp/proj1")
+	oc.addSession(t, "oc-excl-single", "proj1", 1000, 1000)
+	oc.addMessage(
+		t, "msg1", "oc-excl-single", "user", 1000,
+	)
+	oc.addTextPart(
+		t, "p1", "oc-excl-single", "msg1",
+		"hello", 1000,
+	)
+
+	env.engine.SyncAll(context.Background(), nil)
+
+	sessionID := "opencode:oc-excl-single"
+	assertSessionMessageCount(t, env.db, sessionID, 1)
+
+	if err := env.db.DeleteSession(sessionID); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+
+	// Bump time so parser would normally pick it up.
+	oc.updateSessionTime(t, "oc-excl-single", 2000)
+
+	if err := env.engine.SyncSingleSession(
+		sessionID,
+	); err != nil {
+		t.Fatalf(
+			"SyncSingleSession on excluded OpenCode "+
+				"session returned error: %v", err,
+		)
+	}
 }

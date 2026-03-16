@@ -3,7 +3,9 @@
 <script lang="ts">
   import type { Message, Session } from "../../api/types.js";
   import { getMessages, getSession } from "../../api/client.js";
+  import { formatTokenCount } from "../../utils/format.js";
   import { sessions } from "../../stores/sessions.svelte.js";
+  import { router } from "../../stores/router.svelte.js";
   import MessageContent from "./MessageContent.svelte";
 
   interface Props {
@@ -16,6 +18,8 @@
   let sessionMeta = $state<Session | null>(null);
   let loading = $state(false);
   let error = $state<string | null>(null);
+
+  let subagentSession = $derived(sessions.childSessions.get(sessionId) ?? null);
 
   async function toggleExpand() {
     expanded = !expanded;
@@ -37,10 +41,15 @@
     }
   }
 
-  function openAsSession(e: MouseEvent) {
+  async function openAsSession(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
-    sessions.navigateToSession(sessionId);
+    if (router.route === "sessions") {
+      await sessions.navigateToSession(sessionId);
+    } else {
+      sessions.pendingNavTarget = sessionId;
+      router.navigate("sessions");
+    }
   }
 
   let agentLabel = $derived(sessionMeta?.agent ?? null);
@@ -61,6 +70,12 @@
         <span class="toggle-meta">{messageCountLabel}</span>
       {/if}
       <span class="toggle-session-id">{sessionId.slice(0, 12)}</span>
+      {#if subagentSession}
+        {@const ctxTokens = subagentSession.peak_context_tokens}
+        {#if ctxTokens + subagentSession.total_output_tokens > 0}
+          <span class="toggle-tokens">({formatTokenCount(ctxTokens)} ctx / {formatTokenCount(subagentSession.total_output_tokens)} out)</span>
+        {/if}
+      {/if}
     </button>
     <a
       href="#{sessionId}"
@@ -80,7 +95,7 @@
         <div class="subagent-status subagent-error">{error}</div>
       {:else if messages && messages.length > 0}
         {#each messages as message}
-          <MessageContent {message} />
+          <MessageContent {message} isSubagentContext={true} />
         {/each}
       {:else if messages}
         <div class="subagent-status">No messages</div>
@@ -167,6 +182,14 @@
   .open-session-link:hover {
     color: var(--accent-green);
     background: var(--bg-surface-hover);
+  }
+
+  .toggle-tokens {
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    color: color-mix(in srgb, var(--accent-green) 60%, var(--text-muted));
+    white-space: nowrap;
+    flex-shrink: 0;
   }
 
   .subagent-messages {

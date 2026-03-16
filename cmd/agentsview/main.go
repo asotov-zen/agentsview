@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"flag"
@@ -8,9 +9,9 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
+	"os/signal"
 	"path/filepath"
-	"runtime"
+	"syscall"
 	"time"
 	_ "time/tzdata"
 
@@ -31,8 +32,6 @@ const (
 	periodicSyncInterval  = 15 * time.Minute
 	unwatchedPollInterval = 2 * time.Minute
 	watcherDebounce       = 500 * time.Millisecond
-	browserPollInterval   = 100 * time.Millisecond
-	browserPollAttempts   = 60
 )
 
 func main() {
@@ -82,7 +81,15 @@ Usage:
 Server flags:
   -host string        Host to bind to (default "127.0.0.1")
   -port int           Port to listen on (default 8080)
-  -no-browser         Don't open browser on startup
+  -public-url str     Public URL to trust and open for hostname/proxy access
+  -public-origin str  Trusted browser origin to allow for remote/proxied access
+  -proxy string       Managed reverse proxy mode (currently: caddy)
+  -caddy-bin string   Caddy binary to use when -proxy=caddy
+  -proxy-bind-host    Local interface/IP for managed Caddy to bind
+  -public-port int    External port for managed Caddy/public URL (default 8443)
+  -tls-cert string    TLS certificate path for managed Caddy HTTPS mode
+  -tls-key string     TLS key path for managed Caddy HTTPS mode
+  -allowed-subnet str Client CIDR allowed to connect to the managed proxy
 
 Sync flags:
   -full              Force a full resync regardless of data version
@@ -110,6 +117,14 @@ Environment variables:
   IFLOW_DIR               iFlow projects directory
   AMP_DIR                 Amp threads directory
   AGENT_VIEWER_DATA_DIR   Data directory (database, config)
+
+Watcher excludes:
+  Add "watch_exclude_patterns" to ~/.agentsview/config.json to skip
+  directory names/patterns while recursively watching roots.
+  Example:
+  {
+    "watch_exclude_patterns": [".git", "node_modules", ".next", "dist"]
+  }
 
 Multiple directories:
   Add arrays to ~/.agentsview/config.json to scan multiple locations:
@@ -151,6 +166,9 @@ func runServe(args []string) {
 	start := time.Now()
 	cfg := mustLoadConfig(args)
 	setupLogFile(cfg.DataDir)
+	if err := validateServeConfig(cfg); err != nil {
+		fatal("invalid serve config: %v", err)
+	}
 	database := mustOpenDB(cfg)
 	defer database.Close()
 
@@ -167,6 +185,11 @@ func runServe(args []string) {
 	// Remove stale temp DB from a prior crashed resync.
 	cleanResyncTemp(cfg.DBPath)
 
+	ctx, stop := signal.NotifyContext(
+		context.Background(), os.Interrupt, syscall.SIGTERM,
+	)
+	defer stop()
+
 	engine := sync.NewEngine(database, sync.EngineConfig{
 		AgentDirs:               cfg.AgentDirs,
 		Machine:                 "local",
@@ -174,9 +197,12 @@ func runServe(args []string) {
 	})
 
 	if database.NeedsResync() {
-		runInitialResync(engine)
+		runInitialResync(ctx, engine)
 	} else {
-		runInitialSync(engine)
+		runInitialSync(ctx, engine)
+	}
+	if ctx.Err() != nil {
+		return
 	}
 
 	stopWatcher, unwatchedDirs := startFileWatcher(cfg, engine)
@@ -187,11 +213,45 @@ func runServe(args []string) {
 		go startUnwatchedPoll(engine)
 	}
 
+	// Auto-bind to 0.0.0.0 when remote access is enabled so the
+	// server is reachable from the network. Only override if the
+	// user hasn't explicitly set --host via the CLI flag.
+	if cfg.RemoteAccess && !cfg.HostExplicit && cfg.Host == "127.0.0.1" {
+		cfg.Host = "0.0.0.0"
+	}
+
+	// When remote access is enabled, ensure an auth token exists so
+	// the API is never exposed on the network without authentication.
+	if cfg.RemoteAccess {
+		if err := cfg.EnsureAuthToken(); err != nil {
+			log.Fatalf("Failed to generate auth token: %v", err)
+		}
+		if cfg.AuthToken != "" {
+			fmt.Printf("Remote access enabled. Auth token: %s\n", cfg.AuthToken)
+		}
+	}
+
+	requestedPort := cfg.Port
 	port := server.FindAvailablePort(cfg.Host, cfg.Port)
 	if port != cfg.Port {
 		fmt.Printf("Port %d in use, using %d\n", cfg.Port, port)
 	}
 	cfg.Port = port
+	if cfg.Proxy.Mode == "" && cfg.PublicURL != "" {
+		updatedURL, updatedOrigins, changed, err := rewriteConfiguredPublicURLPort(
+			cfg.PublicURL,
+			cfg.PublicOrigins,
+			requestedPort,
+			cfg.Port,
+		)
+		if err != nil {
+			fatal("invalid public url: %v", err)
+		}
+		if changed {
+			cfg.PublicURL = updatedURL
+			cfg.PublicOrigins = updatedOrigins
+		}
+	}
 
 	srv := server.New(cfg, database, engine,
 		server.WithVersion(server.VersionInfo{
@@ -200,22 +260,129 @@ func runServe(args []string) {
 			BuildDate: buildDate,
 		}),
 		server.WithDataDir(cfg.DataDir),
+		server.WithBaseContext(ctx),
 	)
 
-	url := fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
-	fmt.Printf(
-		"agentsview %s listening at %s (started in %s)\n",
-		version, url,
-		time.Since(start).Round(time.Millisecond),
-	)
-
-	if !cfg.NoBrowser {
-		go openBrowser(url)
+	serveErrCh := make(chan error, 1)
+	go func() {
+		serveErrCh <- srv.ListenAndServe()
+	}()
+	if err := waitForLocalPort(
+		ctx, cfg.Host, cfg.Port, 5*time.Second, serveErrCh,
+	); err != nil {
+		shutdownCtx, cancel := context.WithTimeout(
+			context.Background(), 5*time.Second,
+		)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		fatal("server failed to start: %v", err)
 	}
 
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
-		fatal("server error: %v", err)
+	var caddy *managedCaddy
+	if cfg.Proxy.Mode == "caddy" {
+		var err error
+		caddy, err = startManagedCaddy(ctx, cfg)
+		if err != nil {
+			shutdownCtx, cancel := context.WithTimeout(
+				context.Background(), 5*time.Second,
+			)
+			defer cancel()
+			_ = srv.Shutdown(shutdownCtx)
+			fatal("managed caddy error: %v", err)
+		}
+		defer caddy.Stop()
+
+		publicPort, err := publicURLPort(cfg.PublicURL)
+		if err != nil {
+			shutdownCtx, cancel := context.WithTimeout(
+				context.Background(), 5*time.Second,
+			)
+			defer cancel()
+			caddy.Stop()
+			_ = srv.Shutdown(shutdownCtx)
+			fatal("invalid public url: %v", err)
+		}
+		if err := waitForLocalPort(
+			ctx,
+			cfg.Proxy.BindHost,
+			publicPort,
+			5*time.Second,
+			caddy.Err(),
+		); err != nil {
+			shutdownCtx, cancel := context.WithTimeout(
+				context.Background(), 5*time.Second,
+			)
+			defer cancel()
+			caddy.Stop()
+			_ = srv.Shutdown(shutdownCtx)
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			fatal("managed caddy error: %v", err)
+		}
+	}
+
+	localURL := fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
+	publicURL := browserURL(cfg)
+	if publicURL == localURL {
+		fmt.Printf(
+			"agentsview %s listening at %s (started in %s)\n",
+			version, localURL,
+			time.Since(start).Round(time.Millisecond),
+		)
+	} else {
+		fmt.Printf(
+			"agentsview %s backend at %s, public at %s (started in %s)\n",
+			version, localURL, publicURL,
+			time.Since(start).Round(time.Millisecond),
+		)
+	}
+
+	var caddyErrCh <-chan error
+	if caddy != nil {
+		caddyErrCh = caddy.Err()
+	}
+
+	select {
+	case err := <-serveErrCh:
+		if err != nil && err != http.ErrServerClosed {
+			caddy.Stop()
+			fatal("server error: %v", err)
+		}
+	case err := <-caddyErrCh:
+		shutdownCtx, cancel := context.WithTimeout(
+			context.Background(), 5*time.Second,
+		)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+		if ctx.Err() != nil {
+			if serveErr := <-serveErrCh; serveErr != nil &&
+				serveErr != http.ErrServerClosed {
+				fatal("server error: %v", serveErr)
+			}
+			return
+		}
+		if err != nil {
+			fatal("managed caddy error: %v", err)
+		}
+		fatal("managed caddy exited unexpectedly")
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(
+			context.Background(), 5*time.Second,
+		)
+		defer cancel()
+		caddy.Stop()
+		if err := srv.Shutdown(shutdownCtx); err != nil &&
+			err != http.ErrServerClosed {
+			fatal("server shutdown error: %v", err)
+		}
+		if err := <-serveErrCh; err != nil &&
+			err != http.ErrServerClosed {
+			fatal("server error: %v", err)
+		}
 	}
 }
 
@@ -308,26 +475,30 @@ func cleanResyncTemp(dbPath string) {
 	}
 }
 
-func runInitialSync(engine *sync.Engine) {
+func runInitialSync(
+	ctx context.Context, engine *sync.Engine,
+) {
 	fmt.Println("Running initial sync...")
 	t := time.Now()
-	stats := engine.SyncAll(printSyncProgress)
+	stats := engine.SyncAll(ctx, printSyncProgress)
 	printSyncSummary(stats, t)
 }
 
-func runInitialResync(engine *sync.Engine) {
+func runInitialResync(
+	ctx context.Context, engine *sync.Engine,
+) {
 	fmt.Println("Data version changed, running full resync...")
 	t := time.Now()
-	stats := engine.ResyncAll(printSyncProgress)
+	stats := engine.ResyncAll(ctx, printSyncProgress)
 	printSyncSummary(stats, t)
 
-	// If resync was aborted (swap didn't happen), fall back
-	// to a normal incremental sync so the server starts with
-	// current file data rather than a potentially stale DB.
-	if stats.Aborted {
+	// If resync was aborted due to data issues (not
+	// cancellation), fall back to an incremental sync so
+	// the server starts with current data.
+	if stats.Aborted && ctx.Err() == nil {
 		fmt.Println("Resync incomplete, running incremental sync...")
 		t = time.Now()
-		fallback := engine.SyncAll(printSyncProgress)
+		fallback := engine.SyncAll(ctx, printSyncProgress)
 		printSyncSummary(fallback, t)
 	}
 }
@@ -372,7 +543,7 @@ func startFileWatcher(
 	onChange := func(paths []string) {
 		engine.SyncPaths(paths)
 	}
-	watcher, err := sync.NewWatcher(watcherDebounce, onChange)
+	watcher, err := sync.NewWatcher(watcherDebounce, onChange, cfg.WatchExcludePatterns)
 	if err != nil {
 		log.Printf(
 			"warning: file watcher unavailable: %v"+
@@ -438,7 +609,7 @@ func startPeriodicSync(engine *sync.Engine) {
 	defer ticker.Stop()
 	for range ticker.C {
 		log.Println("Running scheduled sync...")
-		engine.SyncAll(nil)
+		engine.SyncAll(context.Background(), nil)
 	}
 }
 
@@ -447,31 +618,6 @@ func startUnwatchedPoll(engine *sync.Engine) {
 	defer ticker.Stop()
 	for range ticker.C {
 		log.Println("Polling unwatched directories...")
-		engine.SyncAll(nil)
+		engine.SyncAll(context.Background(), nil)
 	}
-}
-
-func openBrowser(url string) {
-	for range browserPollAttempts {
-		time.Sleep(browserPollInterval)
-		resp, err := http.Get(url + "/api/v1/stats")
-		if err == nil {
-			resp.Body.Close()
-			break
-		}
-	}
-
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", url)
-	case "linux":
-		cmd = exec.Command("xdg-open", url)
-	case "windows":
-		cmd = exec.Command("rundll32",
-			"url.dll,FileProtocolHandler", url)
-	default:
-		return
-	}
-	_ = cmd.Run()
 }

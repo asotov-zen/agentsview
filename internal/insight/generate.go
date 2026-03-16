@@ -29,9 +29,10 @@ type Result struct {
 
 // ValidAgents lists the supported agent names.
 var ValidAgents = map[string]bool{
-	"claude": true,
-	"codex":  true,
-	"gemini": true,
+	"claude":  true,
+	"codex":   true,
+	"copilot": true,
+	"gemini":  true,
 }
 
 // GenerateFunc is the signature for insight generation,
@@ -87,6 +88,8 @@ func GenerateStream(
 	switch agent {
 	case "codex":
 		return generateCodex(ctx, path, prompt, onLog)
+	case "copilot":
+		return generateCopilot(ctx, path, prompt, onLog)
 	case "gemini":
 		return generateGemini(ctx, path, prompt, onLog)
 	default:
@@ -94,58 +97,19 @@ func GenerateStream(
 	}
 }
 
-// allowedKeyPrefixes lists uppercase key prefixes that are
-// safe to pass to agent CLI subprocesses. Matched
-// case-insensitively so Windows-style casing (Path, ComSpec)
-// is handled correctly. Using an allowlist prevents leaking
-// secrets to child processes.
-var allowedKeyPrefixes = []string{
-	"PATH",
-	"HOME", "USERPROFILE",
-	"USER", "USERNAME", "LOGNAME",
-	"LANG", "LC_",
-	"TERM", "COLORTERM",
-	"TMPDIR", "TEMP", "TMP",
-	"XDG_",
-	"SHELL",
-	"SSL_CERT_", "CURL_CA_BUNDLE",
-	"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-	"SYSTEMROOT", "COMSPEC", "PATHEXT", "WINDIR",
-	"HOMEDRIVE", "HOMEPATH",
-	"APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
-}
-
-// envKeyAllowed reports whether key (case-insensitive) is
-// on the allowlist. Prefix entries ending with _ (LC_,
-// XDG_, SSL_CERT_) match any key starting with that prefix;
-// all others require an exact match.
-func envKeyAllowed(key string) bool {
-	upper := strings.ToUpper(key)
-	for _, p := range allowedKeyPrefixes {
-		if strings.HasSuffix(p, "_") {
-			if strings.HasPrefix(upper, p) {
-				return true
-			}
-		} else if upper == p {
-			return true
-		}
-	}
-	return false
-}
-
-// cleanEnv returns an allowlisted subset of the current
-// environment for agent CLI subprocesses, plus
-// CLAUDE_NO_SOUND=1.
-func cleanEnv() []string {
-	env := os.Environ()
-	filtered := make([]string, 0, len(env))
-	for _, e := range env {
-		k, _, _ := strings.Cut(e, "=")
-		if envKeyAllowed(k) {
-			filtered = append(filtered, e)
-		}
-	}
-	return append(filtered, "CLAUDE_NO_SOUND=1")
+// agentEnv returns the current environment with
+// CLAUDE_NO_SOUND=1 appended.
+//
+// The full environment is passed through intentionally.
+// Agent CLIs need provider auth (API keys, tokens, config
+// paths) that vary across providers, users, and deployment
+// methods (env vars, desktop.env, persisted login). An
+// allowlist is brittle here: every new provider or config
+// var requires a code change, and missing one breaks auth.
+// Sandboxing is handled by CLI flags (--tools, --sandbox,
+// --config-dir, etc.), not by env filtering.
+func agentEnv() []string {
+	return append(os.Environ(), "CLAUDE_NO_SOUND=1")
 }
 
 func emitLog(onLog LogFunc, stream, line string) {
@@ -213,8 +177,10 @@ func generateClaude(
 	cmd := exec.CommandContext(
 		ctx, path,
 		"-p", "--output-format", "json",
+		"--no-session-persistence",
+		"--tools", "",
 	)
-	cmd.Env = append(os.Environ(), "CLAUDE_NO_SOUND=1")
+	cmd.Env = agentEnv()
 	cmd.Stdin = strings.NewReader(prompt)
 
 	stdoutPipe, err := cmd.StdoutPipe()
@@ -299,8 +265,12 @@ func generateCodex(
 	cmd := exec.CommandContext(
 		ctx, path,
 		"exec", "--json",
-		"--sandbox", "read-only", "-",
+		"--sandbox", "read-only",
+		"--skip-git-repo-check",
+		"--ephemeral",
+		"-",
 	)
+	cmd.Env = agentEnv()
 	cmd.Stdin = strings.NewReader(prompt)
 
 	stdoutPipe, err := cmd.StdoutPipe()
@@ -433,6 +403,83 @@ func parseCodexStream(
 	return strings.Join(messages, "\n"), nil
 }
 
+// generateCopilot invokes `copilot -p <prompt> --silent`.
+// The prompt is passed as the -p argument (copilot does not
+// read prompts from stdin). Output is plain text on stdout.
+func generateCopilot(
+	ctx context.Context, path, prompt string, onLog LogFunc,
+) (Result, error) {
+	cmd := exec.CommandContext(
+		ctx, path,
+		"-p", prompt,
+		"--silent",
+		"--no-custom-instructions",
+		"--no-ask-user",
+		"--disable-builtin-mcps",
+	)
+	cmd.Env = agentEnv()
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return Result{}, fmt.Errorf(
+			"create stdout pipe: %w", err,
+		)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return Result{}, fmt.Errorf(
+			"create stderr pipe: %w", err,
+		)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return Result{}, fmt.Errorf(
+			"start copilot: %w", err,
+		)
+	}
+
+	stderrDone := collectStreamLines(
+		stderrPipe, "stderr", onLog,
+	)
+	// Read stdout raw to preserve blank lines in plain
+	// text output (collectStreamLines drops empty lines).
+	stdoutBytes, readErr := io.ReadAll(stdoutPipe)
+	stderrText := <-stderrDone
+	runErr := cmd.Wait()
+
+	if readErr != nil {
+		return Result{}, fmt.Errorf(
+			"read copilot stdout: %w", readErr,
+		)
+	}
+
+	emitLog(onLog, "stdout", string(stdoutBytes))
+
+	if runErr != nil && ctx.Err() != nil {
+		return Result{}, fmt.Errorf(
+			"copilot CLI cancelled: %w", ctx.Err(),
+		)
+	}
+	if runErr != nil {
+		return Result{}, fmt.Errorf(
+			"copilot CLI failed: %w\nstderr: %s",
+			runErr, stderrText,
+		)
+	}
+
+	content := strings.TrimSpace(string(stdoutBytes))
+	if content == "" {
+		return Result{}, fmt.Errorf(
+			"copilot returned empty result",
+		)
+	}
+
+	return Result{
+		Content: content,
+		Agent:   "copilot",
+	}, nil
+}
+
 // generateGemini invokes `gemini --output-format stream-json`
 // and parses the JSONL stream for result/assistant messages.
 func generateGemini(
@@ -442,7 +489,9 @@ func generateGemini(
 		ctx, path,
 		"--model", geminiInsightModel,
 		"--output-format", "stream-json",
+		"--sandbox",
 	)
+	cmd.Env = agentEnv()
 	cmd.Stdin = strings.NewReader(prompt)
 
 	stdoutPipe, err := cmd.StdoutPipe()

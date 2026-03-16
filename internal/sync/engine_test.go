@@ -205,11 +205,12 @@ func TestPostFilterCounts(t *testing.T) {
 			name: "system messages excluded from user count",
 			msgs: []db.Message{
 				{Role: "user", Content: "system prompt", IsSystem: true},
-				{Role: "user", Content: "hello"},
+				{Role: "user", Content: "hello", IsSystem: false},
+				{Role: "user", Content: "system notice", IsSystem: true},
 				{Role: "assistant", Content: "hi"},
 				{Role: "user", Content: "[Turn finished: endTurn]", IsSystem: true},
 			},
-			want: counts{Total: 4, User: 1},
+			want: counts{Total: 5, User: 1},
 		},
 	}
 

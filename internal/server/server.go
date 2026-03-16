@@ -38,6 +38,11 @@ type Server struct {
 	version VersionInfo
 	dataDir string
 
+	// baseCtx, when set, is used as the base context for all
+	// incoming requests. Cancelling it causes SSE handlers to
+	// exit promptly, which unblocks graceful shutdown.
+	baseCtx context.Context
+
 	generateStreamFunc insight.GenerateStreamFunc
 	spaFS              fs.FS
 	spaHandler         http.Handler
@@ -90,6 +95,14 @@ func WithVersion(v VersionInfo) Option {
 // WithDataDir sets the data directory used for update caching.
 func WithDataDir(dir string) Option {
 	return func(s *Server) { s.dataDir = dir }
+}
+
+// WithBaseContext sets the base context for all incoming HTTP
+// requests. When this context is cancelled, request contexts
+// are also cancelled, causing long-lived handlers (SSE) to
+// exit and unblocking graceful shutdown.
+func WithBaseContext(ctx context.Context) Option {
+	return func(s *Server) { s.baseCtx = ctx }
 }
 
 // WithUpdateChecker overrides the update check function,
@@ -156,6 +169,7 @@ func (s *Server) routes() {
 	)
 	s.mux.Handle("GET /api/v1/openers", s.withTimeout(s.handleListOpeners))
 	s.mux.Handle("GET /api/v1/sessions/{id}/directory", s.withTimeout(s.handleGetSessionDir))
+	s.mux.Handle("GET /api/v1/sessions/{id}/search", s.withTimeout(s.handleSearchSession))
 	s.mux.Handle("POST /api/v1/sessions/{id}/open", s.withTimeout(s.handleOpenSession))
 	s.mux.Handle(
 		"POST /api/v1/sessions/upload", s.withTimeout(s.handleUploadSession),
@@ -193,6 +207,9 @@ func (s *Server) routes() {
 		"POST /api/v1/config/terminal", s.withTimeout(s.handleSetTerminalConfig),
 	)
 	s.mux.Handle("GET /api/v1/update/check", s.withTimeout(s.handleCheckUpdate))
+
+	s.mux.Handle("GET /api/v1/settings", s.withTimeout(s.handleGetSettings))
+	s.mux.Handle("PUT /api/v1/settings", s.withTimeout(s.handleUpdateSettings))
 
 	s.mux.Handle("GET /api/v1/starred", s.withTimeout(s.handleListStarred))
 	s.mux.Handle("PUT /api/v1/sessions/{id}/star", s.withTimeout(s.handleStarSession))
@@ -265,17 +282,23 @@ func (s *Server) githubToken() string {
 
 // Handler returns the http.Handler with middleware applied.
 func (s *Server) Handler() http.Handler {
-	allowedOrigins := buildAllowedOrigins(s.cfg.Host, s.cfg.Port)
-	allowedHosts := buildAllowedHosts(s.cfg.Host, s.cfg.Port)
+	allowedOrigins := buildAllowedOrigins(
+		s.cfg.Host, s.cfg.Port, s.cfg.PublicOrigins,
+	)
+	allowedHosts := buildAllowedHosts(
+		s.cfg.Host, s.cfg.Port, s.cfg.PublicURL,
+	)
 	bindAll := isBindAll(s.cfg.Host)
 	bindAllIPs := map[string]bool(nil)
 	if bindAll {
 		bindAllIPs = localInterfaceIPs()
 	}
-	return hostCheckMiddleware(
-		allowedHosts, bindAll, s.cfg.Port, bindAllIPs,
-		corsMiddleware(
-			allowedOrigins, bindAll, s.cfg.Port, bindAllIPs, logMiddleware(s.mux),
+	return s.authMiddleware(
+		hostCheckMiddleware(
+			allowedHosts, bindAll, s.cfg.Port, bindAllIPs,
+			corsMiddleware(
+				allowedOrigins, bindAll, s.cfg.Port, bindAllIPs, logMiddleware(s.mux),
+			),
 		),
 	)
 }
@@ -285,7 +308,7 @@ func (s *Server) Handler() http.Handler {
 // rebinding attacks where an attacker's domain resolves to
 // 127.0.0.1 — the browser sends the attacker's domain as the
 // Host header, which we reject.
-func buildAllowedHosts(host string, port int) map[string]bool {
+func buildAllowedHosts(host string, port int, publicURL string) map[string]bool {
 	hosts := make(map[string]bool)
 	add := func(h string) {
 		hosts[net.JoinHostPort(h, strconv.Itoa(port))] = true
@@ -313,6 +336,9 @@ func buildAllowedHosts(host string, port int) map[string]bool {
 		add("127.0.0.1")
 		add("localhost")
 	}
+	if publicURL != "" {
+		addHostHeadersFromOrigin(hosts, publicURL)
+	}
 	return hosts
 }
 
@@ -324,6 +350,11 @@ func hostCheckMiddleware(
 ) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
+			// Authenticated remote requests bypass host checks.
+			if isRemoteAuth(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
 			hostAllowed := allowedHosts[r.Host]
 			// In bind-all mode, also allow local-interface IP-literal
 			// hosts on the configured port so LAN clients can reach the
@@ -368,7 +399,7 @@ func httpOrigin(host string, port int) []string {
 // permitted by CORS. For loopback addresses, both "127.0.0.1"
 // and "localhost" are allowed because browsers treat them as
 // distinct origins.
-func buildAllowedOrigins(host string, port int) map[string]bool {
+func buildAllowedOrigins(host string, port int, publicOrigins []string) map[string]bool {
 	origins := make(map[string]bool)
 	add := func(h string) {
 		for _, o := range httpOrigin(h, port) {
@@ -394,7 +425,26 @@ func buildAllowedOrigins(host string, port int) map[string]bool {
 		add("127.0.0.1")
 		add("localhost")
 	}
+	for _, origin := range publicOrigins {
+		origins[origin] = true
+	}
 	return origins
+}
+
+func addHostHeadersFromOrigin(hosts map[string]bool, origin string) {
+	u, err := url.Parse(origin)
+	if err != nil || u == nil || u.Host == "" {
+		return
+	}
+	hosts[u.Host] = true
+	if u.Port() != "" {
+		return
+	}
+	defaultPort := "80"
+	if u.Scheme == "https" {
+		defaultPort = "443"
+	}
+	hosts[net.JoinHostPort(u.Hostname(), defaultPort)] = true
 }
 
 // isBindAll returns true when the server is listening on all
@@ -489,6 +539,12 @@ func (s *Server) ListenAndServe() error {
 		ReadTimeout: 10 * time.Second,
 		IdleTimeout: 120 * time.Second,
 	}
+	if s.baseCtx != nil {
+		ctx := s.baseCtx
+		srv.BaseContext = func(_ net.Listener) context.Context {
+			return ctx
+		}
+	}
 	s.mu.Lock()
 	s.httpSrv = srv
 	s.mu.Unlock()
@@ -535,6 +591,31 @@ func corsMiddleware(
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			origin := r.Header.Get("Origin")
+
+			// Authenticated remote requests: allow any origin.
+			if isRemoteAuth(r) {
+				if origin != "" {
+					w.Header().Set(
+						"Access-Control-Allow-Origin", origin,
+					)
+				}
+				ensureVaryHeader(w.Header(), "Origin")
+				w.Header().Set(
+					"Access-Control-Allow-Methods",
+					"GET, POST, PUT, PATCH, DELETE, OPTIONS",
+				)
+				w.Header().Set(
+					"Access-Control-Allow-Headers",
+					"Content-Type, Authorization",
+				)
+				if r.Method == http.MethodOptions {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			// For reads (GET/HEAD), allow empty Origin (same-origin
 			// requests often omit it). For mutating methods and
 			// preflights, require Origin to be present and allowed.
@@ -562,7 +643,7 @@ func corsMiddleware(
 			)
 			w.Header().Set(
 				"Access-Control-Allow-Headers",
-				"Content-Type",
+				"Content-Type, Authorization",
 			)
 			if r.Method == http.MethodOptions {
 				if !safeForReads {

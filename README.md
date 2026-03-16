@@ -63,14 +63,87 @@ patterns over time.
 ## Usage
 
 ```bash
-agentsview              # start server, open browser
+agentsview              # start server
 agentsview -port 9090   # custom port
-agentsview -no-browser  # headless mode
 ```
 
 On startup, agentsview discovers sessions from all supported
 agents, syncs them into a local SQLite database with FTS5
 full-text search, and opens a web UI at `http://127.0.0.1:8080`.
+
+For hostname or reverse-proxy access, set a `public_url`. This
+preserves the default DNS-rebinding and CSRF protections while
+explicitly trusting the external browser origin you expect.
+
+```bash
+# Direct HTTP on a custom hostname/port
+agentsview -host 0.0.0.0 -port 8004 \
+  -public-url http://viewer.example.test:8004
+
+# HTTPS behind your own reverse proxy
+agentsview -host 127.0.0.1 -port 8004 \
+  -public-url https://viewer.example.test
+```
+
+agentsview can also manage a Caddy frontend for you. In managed-Caddy
+mode, keep the backend on loopback and let Caddy terminate TLS and
+optionally restrict client IP ranges. By default, managed Caddy binds
+to `127.0.0.1` and exposes the public URL on port `8443`. To expose it
+on a non-loopback interface, set `-proxy-bind-host` explicitly and
+provide at least one `-allowed-subnet`.
+
+Managed Caddy mode requires the `caddy` CLI to already be installed.
+This patch does not automate Caddy installation. Use your normal OS
+package manager or ask your coding agent to install Caddy for your
+platform first. Caddy supports Linux, macOS, and Windows.
+
+For privileged ports such as `443` or `80`, prefer leaving
+`agentsview` itself unprivileged and granting the Caddy binary
+permission to bind low ports. On Linux, that typically means:
+
+```bash
+sudo setcap cap_net_bind_service=+ep "$(command -v caddy)"
+```
+
+Then run `agentsview` normally as your user with `-public-port 443`
+or `-public-port 80`. This avoids running the session viewer as root,
+which would otherwise change which home directory and agent session
+data it can see. If you do not need a privileged port, the default
+`8443` is the simpler option.
+
+```bash
+agentsview -host 127.0.0.1 -port 8080 \
+  -public-url https://viewer.example.test \
+  -proxy caddy \
+  -proxy-bind-host 0.0.0.0 \
+  -public-port 8443 \
+  -tls-cert ~/.certs/viewer.crt \
+  -tls-key ~/.certs/viewer.key \
+  -allowed-subnet 10.0/16 \
+  -allowed-subnet 192.168.1.0/24
+```
+
+You can persist the same settings in `~/.agentsview/config.json`:
+
+```json
+{
+  "public_url": "https://viewer.example.test",
+  "proxy": {
+    "mode": "caddy",
+    "bind_host": "0.0.0.0",
+    "public_port": 8443,
+    "tls_cert": "/home/user/.certs/viewer.crt",
+    "tls_key": "/home/user/.certs/viewer.key",
+    "allowed_subnets": [
+      "10.0/16",
+      "192.168.1.0/24"
+    ]
+  }
+}
+```
+
+`public_origins` remains available as an advanced override when you
+need to allow additional browser origins beyond the main `public_url`.
 
 ## Screenshots
 

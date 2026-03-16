@@ -7,19 +7,63 @@
     extractToolParamMeta,
     generateFallbackContent,
   } from "../../utils/tool-params.js";
-
-
+  import { applyHighlight, escapeHTML } from "../../utils/highlight.js";
 
 
   interface Props {
     content: string;
     label?: string;
     toolCall?: ToolCall;
+    highlightQuery?: string;
+    isCurrentHighlight?: boolean;
   }
 
-  let { content, label, toolCall }: Props = $props();
-  let collapsed: boolean = $state(true);
-  let outputCollapsed: boolean = $state(true);
+  let { content, label, toolCall, highlightQuery = "", isCurrentHighlight = false }: Props = $props();
+  let userCollapsed: boolean = $state(true);
+  let userOutputCollapsed: boolean = $state(true);
+  let userOverride: boolean = $state(false);
+  let userOutputOverride: boolean = $state(false);
+  let searchExpandedInput: boolean = $state(false);
+  let searchExpandedOutput: boolean = $state(false);
+  let prevQuery: string = "";
+
+  // Auto-expand when a search match exists in input or output
+  // content. Only reset user overrides when the query itself
+  // changes, not when content updates (e.g. during streaming).
+  $effect(() => {
+    const hq = highlightQuery;
+    if (!hq.trim()) {
+      searchExpandedInput = false;
+      searchExpandedOutput = false;
+      prevQuery = hq;
+      return;
+    }
+    const q = hq.toLowerCase();
+    const inputText = (
+      taskPrompt ?? content ?? fallbackContent ?? ""
+    ).toLowerCase();
+    const outputText = (
+      toolCall?.result_content ?? ""
+    ).toLowerCase();
+    searchExpandedInput = inputText.includes(q);
+    searchExpandedOutput = outputText.includes(q);
+    if (hq !== prevQuery) {
+      userOverride = false;
+      userOutputOverride = false;
+      prevQuery = hq;
+    }
+  });
+
+  let collapsed = $derived(
+    userOverride ? userCollapsed
+      : (searchExpandedInput || searchExpandedOutput) ? false
+      : userCollapsed,
+  );
+  let outputCollapsed = $derived(
+    userOutputOverride ? userOutputCollapsed
+      : searchExpandedOutput ? false
+      : userOutputCollapsed,
+  );
 
   let outputPreviewLine = $derived.by(() => {
     const rc = toolCall?.result_content;
@@ -149,7 +193,8 @@
     onclick={() => {
       const sel = window.getSelection();
       if (sel && sel.toString().length > 0) return;
-      collapsed = !collapsed;
+      userCollapsed = !userCollapsed;
+      userOverride = true;
     }}
   >
     <span class="tool-chevron" class:open={!collapsed}>
@@ -174,11 +219,11 @@
       </div>
     {/if}
     {#if taskPrompt}
-      <pre class="tool-content">{taskPrompt}</pre>
+      <pre class="tool-content" use:applyHighlight={{ q: highlightQuery, current: isCurrentHighlight, content: taskPrompt }}>{@html escapeHTML(taskPrompt)}</pre>
     {:else if content}
-      <pre class="tool-content">{content}</pre>
+      <pre class="tool-content" use:applyHighlight={{ q: highlightQuery, current: isCurrentHighlight, content }}>{@html escapeHTML(content)}</pre>
     {:else if fallbackContent}
-      <pre class="tool-content">{fallbackContent}</pre>
+      <pre class="tool-content" use:applyHighlight={{ q: highlightQuery, current: isCurrentHighlight, content: fallbackContent }}>{@html escapeHTML(fallbackContent)}</pre>
     {/if}
     {#if toolCall?.result_content}
       <button
@@ -187,7 +232,8 @@
           e.stopPropagation();
           const sel = window.getSelection();
           if (sel && sel.toString().length > 0) return;
-          outputCollapsed = !outputCollapsed;
+          userOutputCollapsed = !userOutputCollapsed;
+          userOutputOverride = true;
         }}
       >
         <span class="tool-chevron" class:open={!outputCollapsed}>
@@ -199,7 +245,7 @@
         {/if}
       </button>
       {#if !outputCollapsed}
-        <pre class="tool-content output-content">{toolCall.result_content}</pre>
+        <pre class="tool-content output-content" use:applyHighlight={{ q: highlightQuery, current: isCurrentHighlight, content: toolCall.result_content }}>{@html escapeHTML(toolCall.result_content)}</pre>
       {/if}
     {/if}
   {/if}

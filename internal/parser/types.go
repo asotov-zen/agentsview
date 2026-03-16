@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"encoding/json"
 	"strings"
 	"time"
 )
@@ -268,6 +269,9 @@ type ParsedSession struct {
 	MessageCount     int
 	UserMessageCount int
 	File             FileInfo
+
+	TotalOutputTokens int
+	PeakContextTokens int
 }
 
 // ParsedToolCall holds a single tool invocation extracted from
@@ -303,6 +307,11 @@ type ParsedMessage struct {
 	ProviderID    string // provider identifier (e.g. "gemini")
 	ToolCalls     []ParsedToolCall
 	ToolResults   []ParsedToolResult
+
+	Model         string
+	TokenUsage    json.RawMessage
+	ContextTokens int
+	OutputTokens  int
 }
 
 // ParseResult pairs a parsed session with its messages.

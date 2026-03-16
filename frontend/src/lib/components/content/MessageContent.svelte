@@ -12,13 +12,19 @@
   import CodeBlock from "./CodeBlock.svelte";
   import { ui } from "../../stores/ui.svelte.js";
   import { pins } from "../../stores/pins.svelte.js";
+  import { sessions } from "../../stores/sessions.svelte.js";
+  import { applyHighlight } from "../../utils/highlight.js";
   import { renderMarkdown } from "../../utils/markdown.js";
+  import type { Session } from "../../api/types.js";
 
   interface Props {
     message: Message;
+    isSubagentContext?: boolean;
+    highlightQuery?: string;
+    isCurrentHighlight?: boolean;
   }
 
-  let { message }: Props = $props();
+  let { message, isSubagentContext = false, highlightQuery = "", isCurrentHighlight = false }: Props = $props();
 
   let copied = $state(false);
 
@@ -32,9 +38,76 @@
   let isUser = $derived(message.role === "user");
   let isSystem = $derived(message.is_system);
 
+  /** Resolve the session that owns this message, falling back to activeSession. */
+  let owningSession = $derived(
+    sessions.sessions.find((s) => s.id === message.session_id) ??
+      sessions.activeSession,
+  );
+
+  /** Walk the parent chain to check if any ancestor has the teammate tag. */
+  function isTeammateAncestry(s: Session, all: Session[]): boolean {
+    if ((s.first_message ?? "").includes("<teammate-message")) return true;
+    if (!s.parent_session_id) return false;
+    const visited = new Set<string>();
+    let cur: Session | undefined = s;
+    while (cur?.parent_session_id && !visited.has(cur.id)) {
+      visited.add(cur.id);
+      const parent = all.find((p) => p.id === cur!.parent_session_id);
+      if (!parent) break;
+      if ((parent.first_message ?? "").includes("<teammate-message")) return true;
+      cur = parent;
+    }
+    return false;
+  }
+
+  /** Walk the parent chain to check if any ancestor is a subagent. */
+  function isSubagentAncestry(s: Session, all: Session[]): boolean {
+    if (s.relationship_type === "subagent") return true;
+    if (!s.parent_session_id) return false;
+    const visited = new Set<string>();
+    let cur: Session | undefined = s;
+    while (cur?.parent_session_id && !visited.has(cur.id)) {
+      visited.add(cur.id);
+      const parent = all.find((p) => p.id === cur!.parent_session_id);
+      if (!parent) break;
+      if (parent.relationship_type === "subagent") return true;
+      cur = parent;
+    }
+    return false;
+  }
+
+  /** Classify the session kind, walking the parent chain. */
+  let sessionKind = $derived.by((): "teammate" | "subagent" | "user" => {
+    const s = owningSession;
+    if (!s) return "user";
+    const all = sessions.sessions;
+    if (isSubagentAncestry(s, all)) return "subagent";
+    if (isTeammateAncestry(s, all)) return "teammate";
+    return "user";
+  });
+
+  /** Context-aware role labels based on session type. */
+  let roleLabel = $derived.by(() => {
+    if (!isUser) return "Assistant";
+    if (isSubagentContext) return "Agent";
+    if (sessionKind === "teammate") return "Teammate";
+    if (sessionKind === "subagent") return "Agent";
+    return "User";
+  });
+
+  let roleIcon = $derived.by(() => {
+    if (!isUser) return "A";
+    if (isSubagentContext) return "S";
+    if (sessionKind === "teammate") return "T";
+    if (sessionKind === "subagent") return "S";
+    return "U";
+  });
+
+  let hasSearchQuery = $derived(highlightQuery.trim() !== "");
+
   /** Whether the text (prose) segments for this role should render. */
   let showText = $derived(
-    ui.isBlockVisible(isUser ? "user" : "assistant"),
+    hasSearchQuery || ui.isBlockVisible(isUser ? "user" : "assistant"),
   );
 
   let accentColor = $derived(
@@ -97,13 +170,13 @@
       class="role-icon"
       style:background={accentColor}
     >
-      {isSystem ? "S" : isUser ? "U" : "A"}
+      {roleIcon}
     </span>
     <span
       class="role-label"
       style:color={accentColor}
     >
-      {isSystem ? "System" : isUser ? "User" : "Assistant"}
+      {roleLabel}
     </span>
     {#if message.provider_id}
       <span class="model-badge">{message.provider_id}</span>
@@ -150,26 +223,44 @@
   <div class="message-body">
     {#each segments as segment}
       {#if segment.type === "thinking"}
-        {#if ui.isBlockVisible("thinking")}
-          <ThinkingBlock content={segment.content} />
+        {#if hasSearchQuery || ui.isBlockVisible("thinking")}
+          <ThinkingBlock
+            content={segment.content}
+            highlightQuery={highlightQuery}
+            isCurrentHighlight={isCurrentHighlight}
+          />
         {/if}
       {:else if segment.type === "tool"}
-        {#if ui.isBlockVisible("tool")}
+        {#if hasSearchQuery || ui.isBlockVisible("tool")}
           <ToolBlock
             content={segment.content}
             label={segment.label}
             toolCall={segment.toolCall}
+            highlightQuery={highlightQuery}
+            isCurrentHighlight={isCurrentHighlight}
           />
         {/if}
       {:else if segment.type === "skill"}
         <SkillBlock content={segment.content} name={segment.label} />
       {:else if segment.type === "code"}
-        {#if ui.isBlockVisible("code")}
-          <CodeBlock content={segment.content} language={segment.label} />
+        {#if hasSearchQuery || ui.isBlockVisible("code")}
+          <CodeBlock
+            content={segment.content}
+            language={segment.label}
+            highlightQuery={highlightQuery}
+            isCurrentHighlight={isCurrentHighlight}
+          />
         {/if}
       {:else}
         {#if showText}
-          <div class="text-content markdown">
+          <div
+            class="text-content markdown"
+            use:applyHighlight={{
+              q: highlightQuery,
+              current: isCurrentHighlight,
+              content: segment.content,
+            }}
+          >
             {@html renderMarkdown(segment.content)}
           </div>
         {/if}

@@ -15,6 +15,8 @@
   import {
     hasVisibleSegments,
   } from "../../utils/content-parser.js";
+  import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+  import SessionFindBar from "./SessionFindBar.svelte";
 
   let containerRef: HTMLDivElement | undefined = $state(undefined);
   let scrollRaf: number | null = $state(null);
@@ -209,6 +211,12 @@
   export function getDisplayItems(): DisplayItem[] {
     return displayItemsAsc;
   }
+
+  let highlightQuery = $derived(
+    inSessionSearch.isOpen && inSessionSearch.query.trim().length > 0
+      ? inSessionSearch.query
+      : "",
+  );
 </script>
 
 {#if !sessions.activeSessionId}
@@ -225,6 +233,7 @@
     <p class="empty-text">Loading messages...</p>
   </div>
 {:else}
+  <SessionFindBar />
   <div
     class="message-list-scroll layout-{ui.messageLayout}"
     bind:this={containerRef}
@@ -258,9 +267,15 @@
               <ToolCallGroup
                 messages={item.messages}
                 timestamp={item.timestamp}
+                highlightQuery={highlightQuery}
+                isCurrentHighlight={item.ordinals.includes(inSessionSearch.currentOrdinal ?? -1)}
               />
             {:else}
-              <MessageContent message={item.message} />
+              <MessageContent
+                message={item.message}
+                highlightQuery={highlightQuery}
+                isCurrentHighlight={inSessionSearch.currentOrdinal === item.message.ordinal}
+              />
             {/if}
           </div>
         {/if}
