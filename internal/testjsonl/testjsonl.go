@@ -98,6 +98,35 @@ func ClaudeAssistantJSON(content any, timestamp string) string {
 	return mustMarshal(m)
 }
 
+// ClaudeAssistantWithModelJSON returns a Claude assistant message
+// with a model field as a JSON string.
+func ClaudeAssistantWithModelJSON(
+	content any, timestamp, model string,
+) string {
+	m := map[string]any{
+		"type":      "assistant",
+		"timestamp": timestamp,
+		"message": map[string]any{
+			"model":   model,
+			"content": content,
+		},
+	}
+	return mustMarshal(m)
+}
+
+// CodexTurnContextJSON returns a Codex turn_context message
+// with a model field as a JSON string.
+func CodexTurnContextJSON(model, timestamp string) string {
+	m := map[string]any{
+		"type":      "turn_context",
+		"timestamp": timestamp,
+		"payload": map[string]any{
+			"model": model,
+		},
+	}
+	return mustMarshal(m)
+}
+
 // ClaudeSnapshotJSON returns a Claude snapshot message as a
 // JSON string.
 func ClaudeSnapshotJSON(timestamp string) string {

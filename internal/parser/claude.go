@@ -490,6 +490,11 @@ func extractMessages(entries []dagEntry) (
 			isSystem = true
 		}
 
+		var modelID string
+		if e.entryType == "assistant" {
+			modelID = gjson.Get(e.line, "message.model").Str
+		}
+
 		messages = append(messages, ParsedMessage{
 			Ordinal:       ordinal,
 			Role:          RoleType(e.entryType),
@@ -499,6 +504,8 @@ func extractMessages(entries []dagEntry) (
 			HasToolUse:    hasToolUse,
 			IsSystem:      isSystem,
 			ContentLength: len(text),
+			ModelID:       modelID,
+			ProviderID:    claudeProviderID(modelID),
 			ToolCalls:     tcs,
 			ToolResults:   trs,
 		})
@@ -637,6 +644,16 @@ func truncate(s string, maxLen int) string {
 
 // isClaudeSystemMessage returns true if the content matches
 // a known system-injected user message pattern.
+// claudeProviderID returns the provider for a Claude model ID.
+// Claude Code always uses Anthropic models, so any non-empty
+// model ID maps to "anthropic".
+func claudeProviderID(modelID string) string {
+	if modelID == "" {
+		return ""
+	}
+	return "anthropic"
+}
+
 func isClaudeSystemMessage(content string) bool {
 	trimmed := strings.TrimSpace(content)
 	prefixes := [...]string{

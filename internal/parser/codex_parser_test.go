@@ -333,3 +333,55 @@ func TestParseCodexSession_EdgeCases(t *testing.T) {
 		assert.Equal(t, "unknown", sess.Project)
 	})
 }
+
+func TestParseCodexSession_ModelDetails(t *testing.T) {
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON("model-1", "/tmp", "user", tsEarly),
+		testjsonl.CodexTurnContextJSON("gpt-5.3-codex", tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", "Hello", tsEarlyS5),
+		testjsonl.CodexMsgJSON("assistant", "Hi there.", tsLate),
+	)
+
+	sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+	require.NotNil(t, sess)
+	require.Equal(t, 2, len(msgs))
+
+	// User message has no model info.
+	assert.Empty(t, msgs[0].ModelID)
+	assert.Empty(t, msgs[0].ProviderID)
+
+	// Assistant message gets model from turn_context.
+	assert.Equal(t, "gpt-5.3-codex", msgs[1].ModelID)
+	assert.Equal(t, "openai", msgs[1].ProviderID)
+}
+
+func TestParseCodexSession_ModelDetailsFunctionCall(t *testing.T) {
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON("model-fc", "/tmp", "user", tsEarly),
+		testjsonl.CodexTurnContextJSON("gpt-5.3-codex", tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", "Run it", tsEarlyS5),
+		testjsonl.CodexFunctionCallJSON("exec_command", "Running tests", tsLate),
+	)
+
+	_, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+	require.Equal(t, 2, len(msgs))
+
+	// Function call (assistant role) gets model from turn_context.
+	assert.Equal(t, "gpt-5.3-codex", msgs[1].ModelID)
+	assert.Equal(t, "openai", msgs[1].ProviderID)
+}
+
+func TestParseCodexSession_ModelDetailsAbsent(t *testing.T) {
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON("no-model", "/tmp", "user", tsEarly),
+		testjsonl.CodexMsgJSON("user", "Hello", tsEarlyS1),
+		testjsonl.CodexMsgJSON("assistant", "Hi.", tsEarlyS5),
+	)
+
+	_, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+	require.Equal(t, 2, len(msgs))
+
+	// No turn_context → empty model fields.
+	assert.Empty(t, msgs[1].ModelID)
+	assert.Empty(t, msgs[1].ProviderID)
+}

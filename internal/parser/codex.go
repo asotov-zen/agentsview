@@ -28,6 +28,7 @@ type codexSessionBuilder struct {
 	sessionID    string
 	project      string
 	cwd          string
+	modelID      string // latest model from turn_context
 	ordinal      int
 	includeExec  bool
 }
@@ -65,6 +66,10 @@ func (b *codexSessionBuilder) processLine(
 	switch gjson.Get(line, "type").Str {
 	case codexTypeSessionMeta:
 		return b.handleSessionMeta(payload)
+	case "turn_context":
+		if m := payload.Get("model").Str; m != "" {
+			b.modelID = m
+		}
 	case codexTypeResponseItem:
 		b.handleResponseItem(payload, ts)
 	}
@@ -119,6 +124,12 @@ func (b *codexSessionBuilder) handleResponseItem(
 		)
 	}
 
+	var modelID, providerID string
+	if role == "assistant" && b.modelID != "" {
+		modelID = b.modelID
+		providerID = "openai"
+	}
+
 	b.messages = append(b.messages, ParsedMessage{
 		Ordinal:       b.ordinal,
 		Role:          RoleType(role),
@@ -126,6 +137,8 @@ func (b *codexSessionBuilder) handleResponseItem(
 		Timestamp:     ts,
 		IsSystem:      isSystem,
 		ContentLength: len(content),
+		ModelID:       modelID,
+		ProviderID:    providerID,
 	})
 	b.ordinal++
 }
@@ -141,6 +154,12 @@ func (b *codexSessionBuilder) handleFunctionCall(
 	content := formatCodexFunctionCall(name, payload)
 	inputJSON := extractCodexInputJSON(payload)
 
+	var modelID, providerID string
+	if b.modelID != "" {
+		modelID = b.modelID
+		providerID = "openai"
+	}
+
 	b.messages = append(b.messages, ParsedMessage{
 		Ordinal:       b.ordinal,
 		Role:          RoleAssistant,
@@ -148,6 +167,8 @@ func (b *codexSessionBuilder) handleFunctionCall(
 		Timestamp:     ts,
 		HasToolUse:    true,
 		ContentLength: len(content),
+		ModelID:       modelID,
+		ProviderID:    providerID,
 		ToolCalls: []ParsedToolCall{{
 			ToolName:  name,
 			Category:  NormalizeToolCategory(name),
