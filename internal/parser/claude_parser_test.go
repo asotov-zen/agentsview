@@ -216,6 +216,53 @@ func TestParseClaudeSession_ParentSessionID(t *testing.T) {
 	})
 }
 
+func TestParseClaudeSession_ModelDetails(t *testing.T) {
+	content := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON("Hello", tsZero),
+		testjsonl.ClaudeAssistantWithModelJSON(
+			[]map[string]string{{"type": "text", "text": "Hi there."}},
+			tsZeroS1, "claude-opus-4-6",
+		),
+		testjsonl.ClaudeUserJSON("Follow up", tsZeroS2),
+		testjsonl.ClaudeAssistantWithModelJSON(
+			[]map[string]string{{"type": "text", "text": "Sure."}},
+			tsEarly, "claude-sonnet-4-6",
+		),
+	)
+
+	_, msgs := runClaudeParserTest(t, "test.jsonl", content)
+	require.Equal(t, 4, len(msgs))
+
+	// User messages have no model info.
+	assert.Empty(t, msgs[0].ModelID)
+	assert.Empty(t, msgs[0].ProviderID)
+
+	// First assistant: claude-opus-4-6
+	assert.Equal(t, "claude-opus-4-6", msgs[1].ModelID)
+	assert.Equal(t, "anthropic", msgs[1].ProviderID)
+
+	// Second assistant: claude-sonnet-4-6
+	assert.Equal(t, "claude-sonnet-4-6", msgs[3].ModelID)
+	assert.Equal(t, "anthropic", msgs[3].ProviderID)
+}
+
+func TestParseClaudeSession_ModelDetailsAbsent(t *testing.T) {
+	content := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON("Hello", tsZero),
+		testjsonl.ClaudeAssistantJSON(
+			[]map[string]string{{"type": "text", "text": "Hi."}},
+			tsZeroS1,
+		),
+	)
+
+	_, msgs := runClaudeParserTest(t, "test.jsonl", content)
+	require.Equal(t, 2, len(msgs))
+
+	// Assistant without model field has empty fields.
+	assert.Empty(t, msgs[1].ModelID)
+	assert.Empty(t, msgs[1].ProviderID)
+}
+
 func loadFixture(t *testing.T, name string) string {
 	t.Helper()
 	path := filepath.Join("testdata", name)
