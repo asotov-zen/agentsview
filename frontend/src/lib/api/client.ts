@@ -486,7 +486,7 @@ export function resumeSession(
 
 /** Get the raw file download URL for a session */
 export function getRawUrl(sessionId: string): string {
-  return `${BASE}/sessions/${sessionId}/raw`;
+  return `${getBase()}/sessions/${sessionId}/raw`;
 }
 
 /* Publish / GitHub config */

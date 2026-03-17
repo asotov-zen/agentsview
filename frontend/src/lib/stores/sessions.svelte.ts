@@ -349,23 +349,6 @@ class SessionsStore {
     this.setActiveSession(id);
   }
 
-  /**
-   * Navigate to a session by ID, loading it into the sessions list if
-   * not already present (e.g. subagent sessions filtered from groups).
-   */
-  async navigateToSession(id: string) {
-    const existing = this.sessions.find((s) => s.id === id);
-    if (!existing) {
-      try {
-        const session = await api.getSession(id);
-        this.sessions = [...this.sessions, session];
-      } catch {
-        // Session not found - still attempt to select
-      }
-    }
-    this.activeSessionId = id;
-  }
-
   deselectSession() {
     this.setActiveSession(null);
     this.childSessions = new Map();
