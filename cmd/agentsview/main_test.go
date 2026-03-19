@@ -18,28 +18,32 @@ func TestMustLoadConfig(t *testing.T) {
 		args          []string
 		wantHost      string
 		wantPort      int
-		wantNoBrowser bool
+		wantPublicURL string
+		wantProxyMode string
 	}{
 		{
 			name:          "DefaultArgs",
 			args:          []string{},
 			wantHost:      "127.0.0.1",
 			wantPort:      8080,
-			wantNoBrowser: false,
+			wantPublicURL: "",
+			wantProxyMode: "",
 		},
 		{
 			name:          "ExplicitFlags",
-			args:          []string{"-host", "0.0.0.0", "-port", "9090", "-no-browser"},
+			args:          []string{"-host", "0.0.0.0", "-port", "9090", "-public-url", "https://viewer.example.test", "-proxy", "caddy", "-proxy-bind-host", "10.0.60.2", "-public-port", "9443", "-no-browser"},
 			wantHost:      "0.0.0.0",
 			wantPort:      9090,
-			wantNoBrowser: true,
+			wantPublicURL: "https://viewer.example.test:9443",
+			wantProxyMode: "caddy",
 		},
 		{
 			name:          "PartialFlags",
 			args:          []string{"-port", "3000"},
 			wantHost:      "127.0.0.1",
 			wantPort:      3000,
-			wantNoBrowser: false,
+			wantPublicURL: "",
+			wantProxyMode: "",
 		},
 	}
 
@@ -54,8 +58,11 @@ func TestMustLoadConfig(t *testing.T) {
 			if cfg.Port != tt.wantPort {
 				t.Errorf("Port = %d, want %d", cfg.Port, tt.wantPort)
 			}
-			if cfg.NoBrowser != tt.wantNoBrowser {
-				t.Errorf("NoBrowser = %v, want %v", cfg.NoBrowser, tt.wantNoBrowser)
+			if cfg.PublicURL != tt.wantPublicURL {
+				t.Errorf("PublicURL = %q, want %q", cfg.PublicURL, tt.wantPublicURL)
+			}
+			if cfg.Proxy.Mode != tt.wantProxyMode {
+				t.Errorf("Proxy.Mode = %q, want %q", cfg.Proxy.Mode, tt.wantProxyMode)
 			}
 
 			if cfg.DataDir == "" {

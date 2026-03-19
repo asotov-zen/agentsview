@@ -52,12 +52,40 @@ func TestResumeSession(t *testing.T) {
 		assertStatus(t, w, http.StatusNotFound)
 	})
 
-	t.Run("unsupported agent", func(t *testing.T) {
-		te.seedSession(t, "copilot-1", "/tmp", 3, func(s *db.Session) {
+	t.Run("copilot command only", func(t *testing.T) {
+		projectDir := t.TempDir()
+		// Use a prefixed ID to exercise the agent-prefix stripping
+		// logic (e.g. "copilot:abc123" → raw ID "abc123").
+		te.seedSession(t, "copilot:abc123", projectDir, 3, func(s *db.Session) {
 			s.Agent = "copilot"
 		})
 		w := te.post(t,
-			"/api/v1/sessions/copilot-1/resume",
+			"/api/v1/sessions/copilot:abc123/resume",
+			`{"command_only":true}`,
+		)
+		assertStatus(t, w, http.StatusOK)
+		var resp struct {
+			Launched bool   `json:"launched"`
+			Command  string `json:"command"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp.Launched {
+			t.Error("expected launched=false for command_only")
+		}
+		wantCmd := "copilot --resume=abc123"
+		if resp.Command != wantCmd {
+			t.Errorf("command = %q, want %q", resp.Command, wantCmd)
+		}
+	})
+
+	t.Run("unsupported agent", func(t *testing.T) {
+		te.seedSession(t, "cursor-1", "/tmp", 3, func(s *db.Session) {
+			s.Agent = "cursor"
+		})
+		w := te.post(t,
+			"/api/v1/sessions/cursor-1/resume",
 			`{"command_only":true}`,
 		)
 		assertStatus(t, w, http.StatusBadRequest)

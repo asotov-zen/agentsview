@@ -106,6 +106,9 @@ func TestLoad_DefaultsWithoutFlags(t *testing.T) {
 			"Port = %d, want default %d", cfg.Port, 8080,
 		)
 	}
+	if len(cfg.PublicOrigins) != 0 {
+		t.Errorf("PublicOrigins = %v, want none", cfg.PublicOrigins)
+	}
 }
 
 func TestLoad_NilFlagSet(t *testing.T) {
@@ -116,6 +119,249 @@ func TestLoad_NilFlagSet(t *testing.T) {
 
 	if cfg.Host != "127.0.0.1" {
 		t.Errorf("Host = %q, want %q", cfg.Host, "127.0.0.1")
+	}
+}
+
+func TestLoad_PublicOriginFlagOverridesConfigFile(t *testing.T) {
+	tmp := setupTestEnv(t)
+	writeConfig(t, tmp, map[string]any{
+		"public_origins": []string{"https://old.example.test"},
+	})
+
+	cfg, err := loadConfigFromFlags(
+		t,
+		"-public-origin", "https://viewer.example.test/",
+		"-public-origin", "http://viewer.example.test:8004",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := strings.Join(cfg.PublicOrigins, ",")
+	want := "https://viewer.example.test,http://viewer.example.test:8004"
+	if got != want {
+		t.Fatalf("PublicOrigins = %q, want %q", got, want)
+	}
+}
+
+func TestLoad_PublicOriginsFromConfigFile(t *testing.T) {
+	tmp := setupTestEnv(t)
+	writeConfig(t, tmp, map[string]any{
+		"public_origins": []string{
+			"https://Viewer.Example.Test:443/",
+			"http://viewer.example.test:8004",
+		},
+	})
+
+	cfg, err := LoadMinimal()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := strings.Join(cfg.PublicOrigins, ",")
+	want := "https://viewer.example.test,http://viewer.example.test:8004"
+	if got != want {
+		t.Fatalf("PublicOrigins = %q, want %q", got, want)
+	}
+}
+
+func TestLoad_PublicOriginsRejectInvalid(t *testing.T) {
+	tmp := setupTestEnv(t)
+	writeConfig(t, tmp, map[string]any{
+		"public_origins": []string{"ftp://viewer.example.test"},
+	})
+
+	_, err := LoadMinimal()
+	if err == nil {
+		t.Fatal("expected invalid public origin error")
+	}
+	if !strings.Contains(err.Error(), "invalid public origins") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoad_PublicURLMergedIntoOrigins(t *testing.T) {
+	tmp := setupTestEnv(t)
+	writeConfig(t, tmp, map[string]any{
+		"public_url": "https://viewer.example.test/",
+	})
+
+	cfg, err := LoadMinimal()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.PublicURL != "https://viewer.example.test" {
+		t.Fatalf("PublicURL = %q, want %q", cfg.PublicURL, "https://viewer.example.test")
+	}
+	if got := strings.Join(cfg.PublicOrigins, ","); got != "https://viewer.example.test" {
+		t.Fatalf("PublicOrigins = %q, want %q", got, "https://viewer.example.test")
+	}
+}
+
+func TestLoad_ProxyConfigFromFile(t *testing.T) {
+	tmp := setupTestEnv(t)
+	writeConfig(t, tmp, map[string]any{
+		"public_url": "https://viewer.example.test",
+		"proxy": map[string]any{
+			"mode":            "caddy",
+			"bind_host":       "10.0.60.2",
+			"public_port":     9443,
+			"tls_cert":        "/tmp/viewer.crt",
+			"tls_key":         "/tmp/viewer.key",
+			"allowed_subnets": []string{"10.1.2.3/16", "192.168.1.0/24"},
+		},
+	})
+
+	cfg, err := LoadMinimal()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.Proxy.Mode != "caddy" {
+		t.Fatalf("Proxy.Mode = %q, want %q", cfg.Proxy.Mode, "caddy")
+	}
+	if cfg.Proxy.Bin != "caddy" {
+		t.Fatalf("Proxy.Bin = %q, want %q", cfg.Proxy.Bin, "caddy")
+	}
+	if cfg.Proxy.BindHost != "10.0.60.2" {
+		t.Fatalf("BindHost = %q, want %q", cfg.Proxy.BindHost, "10.0.60.2")
+	}
+	if cfg.Proxy.PublicPort != 9443 {
+		t.Fatalf("PublicPort = %d, want %d", cfg.Proxy.PublicPort, 9443)
+	}
+	if cfg.PublicURL != "https://viewer.example.test:9443" {
+		t.Fatalf("PublicURL = %q, want %q", cfg.PublicURL, "https://viewer.example.test:9443")
+	}
+	if got := strings.Join(cfg.Proxy.AllowedSubnets, ","); got != "10.1.0.0/16,192.168.1.0/24" {
+		t.Fatalf("AllowedSubnets = %q, want %q", got, "10.1.0.0/16,192.168.1.0/24")
+	}
+}
+
+func TestLoad_ProxyFlags(t *testing.T) {
+	cfg, err := loadConfigFromFlags(
+		t,
+		"-public-url", "https://viewer.example.test",
+		"-proxy", "caddy",
+		"-proxy-bind-host", "0.0.0.0",
+		"-public-port", "9443",
+		"-tls-cert", "/tmp/viewer.crt",
+		"-tls-key", "/tmp/viewer.key",
+		"-allowed-subnet", "10.0/16",
+		"-allowed-subnet", "192.168.0.0/24",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.PublicURL != "https://viewer.example.test:9443" {
+		t.Fatalf("PublicURL = %q, want %q", cfg.PublicURL, "https://viewer.example.test:9443")
+	}
+	if cfg.Proxy.Mode != "caddy" {
+		t.Fatalf("Proxy.Mode = %q, want %q", cfg.Proxy.Mode, "caddy")
+	}
+	if cfg.Proxy.BindHost != "0.0.0.0" {
+		t.Fatalf("BindHost = %q, want %q", cfg.Proxy.BindHost, "0.0.0.0")
+	}
+	if cfg.Proxy.PublicPort != 9443 {
+		t.Fatalf("PublicPort = %d, want %d", cfg.Proxy.PublicPort, 9443)
+	}
+	if got := strings.Join(cfg.Proxy.AllowedSubnets, ","); got != "10.0.0.0/16,192.168.0.0/24" {
+		t.Fatalf("AllowedSubnets = %q, want %q", got, "10.0.0.0/16,192.168.0.0/24")
+	}
+}
+
+func TestLoad_ManagedCaddyDefaultsPublicPortAndBindHost(t *testing.T) {
+	cfg, err := loadConfigFromFlags(
+		t,
+		"-public-url", "https://viewer.example.test",
+		"-proxy", "caddy",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.PublicURL != "https://viewer.example.test:8443" {
+		t.Fatalf("PublicURL = %q, want %q", cfg.PublicURL, "https://viewer.example.test:8443")
+	}
+	if cfg.Proxy.BindHost != "127.0.0.1" {
+		t.Fatalf("BindHost = %q, want %q", cfg.Proxy.BindHost, "127.0.0.1")
+	}
+	if cfg.Proxy.PublicPort != 0 {
+		t.Fatalf("PublicPort = %d, want %d", cfg.Proxy.PublicPort, 0)
+	}
+}
+
+func TestLoad_ManagedCaddyRejectsConflictingPublicPort(t *testing.T) {
+	_, err := loadConfigFromFlags(
+		t,
+		"-public-url", "https://viewer.example.test:9443",
+		"-proxy", "caddy",
+		"-public-port", "8443",
+	)
+	if err == nil {
+		t.Fatal("expected public port conflict error")
+	}
+	if !strings.Contains(err.Error(), "conflicts with configured public port") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoad_ManagedCaddyRejectsPublicURLPath(t *testing.T) {
+	_, err := loadConfigFromFlags(
+		t,
+		"-public-url", "https://viewer.example.test/path",
+		"-proxy", "caddy",
+	)
+	if err == nil {
+		t.Fatal("expected public URL path error")
+	}
+	if !strings.Contains(err.Error(), "must not include a path") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoad_ManagedCaddyNormalizesExplicitDefaultPorts(t *testing.T) {
+	cfg, err := loadConfigFromFlags(
+		t,
+		"-public-url", "https://viewer.example.test:443",
+		"-proxy", "caddy",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PublicURL != "https://viewer.example.test" {
+		t.Fatalf("PublicURL = %q, want %q", cfg.PublicURL, "https://viewer.example.test")
+	}
+
+	cfg, err = loadConfigFromFlags(
+		t,
+		"-public-url", "http://viewer.example.test:80",
+		"-proxy", "caddy",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PublicURL != "http://viewer.example.test" {
+		t.Fatalf("PublicURL = %q, want %q", cfg.PublicURL, "http://viewer.example.test")
+	}
+}
+
+func TestLoad_AllowedSubnetsRejectInvalid(t *testing.T) {
+	tmp := setupTestEnv(t)
+	writeConfig(t, tmp, map[string]any{
+		"proxy": map[string]any{
+			"mode":            "caddy",
+			"allowed_subnets": []string{"10.0.0.0/not-a-mask"},
+		},
+	})
+
+	_, err := LoadMinimal()
+	if err == nil {
+		t.Fatal("expected invalid allowed subnets error")
+	}
+	if !strings.Contains(err.Error(), "invalid allowed subnets") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

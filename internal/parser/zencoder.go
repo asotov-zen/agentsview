@@ -28,7 +28,7 @@ var zencoderSessionIDRe = regexp.MustCompile(
 // Zencoder JSONL session file line by line.
 type zencoderSessionBuilder struct {
 	messages        []ParsedMessage
-	subagentMap     map[string]string // toolCallId → "zencoder:<session-id>"
+	subagentMap     map[string]string // toolCallId -> "zencoder:<session-id>"
 	firstMessage    string
 	startedAt       time.Time
 	endedAt         time.Time
@@ -71,6 +71,18 @@ func (b *zencoderSessionBuilder) processMessage(line string) {
 	role := gjson.Get(line, "role").Str
 	ts := parseTimestamp(gjson.Get(line, "createdAt").Str)
 
+	// Update session-level time bounds from per-message
+	// timestamps. This covers cases where header timestamps
+	// are missing or stale.
+	if !ts.IsZero() {
+		if b.startedAt.IsZero() || ts.Before(b.startedAt) {
+			b.startedAt = ts
+		}
+		if ts.After(b.endedAt) {
+			b.endedAt = ts
+		}
+	}
+
 	switch role {
 	case "system":
 		b.handleSystemMessage(line, ts)
@@ -95,7 +107,7 @@ func (b *zencoderSessionBuilder) processMessage(line string) {
 			Timestamp:     ts,
 		})
 		b.ordinal++
-		// "permission" — skip entirely.
+		// "permission" -- skip entirely.
 	}
 }
 
@@ -212,17 +224,15 @@ func (b *zencoderSessionBuilder) handleToolMessage(
 			if toolCallID == "" {
 				return true
 			}
-			cl := zencoderToolResultContentLength(
-				block.Get("content"),
-			)
-			toolResults = append(toolResults, ParsedToolResult{
-				ToolUseID:     toolCallID,
-				ContentLength: cl,
-			})
+
+			// Track which content blocks are tagged (system)
+			// so we can strip them from ContentRaw.
+			var taggedIndices []int
 
 			// Extract <session-id> from tool-result content
 			// to map subagent tool calls to their sessions.
 			// Also collect system-tagged text blocks.
+			idx := 0
 			block.Get("content").ForEach(
 				func(_, cb gjson.Result) bool {
 					if m := zencoderSessionIDRe.FindStringSubmatch(
@@ -235,11 +245,33 @@ func (b *zencoderSessionBuilder) handleToolMessage(
 						cb.Get("type").Str == "text" {
 						if text := cb.Get("text").Str; text != "" {
 							systemParts = append(systemParts, text)
+							taggedIndices = append(taggedIndices, idx)
 						}
 					}
+					idx++
 					return true
 				},
 			)
+
+			// Build filtered content that excludes tagged
+			// blocks to avoid rendering them twice (once in
+			// tool output via ContentRaw, once as a separate
+			// system message).
+			contentRaw := block.Get("content").Raw
+			if len(taggedIndices) > 0 {
+				contentRaw = filterJSONArrayIndices(
+					block.Get("content"), taggedIndices,
+				)
+			}
+
+			cl := zencoderToolResultContentLength(
+				gjson.Parse(contentRaw),
+			)
+			toolResults = append(toolResults, ParsedToolResult{
+				ToolUseID:     toolCallID,
+				ContentLength: cl,
+				ContentRaw:    contentRaw,
+			})
 
 			return true
 		},
@@ -375,6 +407,31 @@ func extractZencoderAssistantContent(
 		hasThinking, hasToolUse, toolCalls
 }
 
+// filterJSONArrayIndices returns a JSON array string with
+// elements at the given indices removed. The indices must be
+// sorted ascending (as produced by iteration order).
+func filterJSONArrayIndices(
+	arr gjson.Result, exclude []int,
+) string {
+	if !arr.IsArray() {
+		return arr.Raw
+	}
+	excludeSet := make(map[int]struct{}, len(exclude))
+	for _, i := range exclude {
+		excludeSet[i] = struct{}{}
+	}
+	var parts []string
+	idx := 0
+	arr.ForEach(func(_, el gjson.Result) bool {
+		if _, skip := excludeSet[idx]; !skip {
+			parts = append(parts, el.Raw)
+		}
+		idx++
+		return true
+	})
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
 // zencoderToolResultContentLength computes the total text
 // length from a tool-result's content array.
 func zencoderToolResultContentLength(
@@ -440,10 +497,12 @@ func ParseZencoderSession(
 			fmt.Errorf("reading zencoder %s: %w", path, err)
 	}
 
-	// Filter: require at least one user or assistant message.
+	// Filter: require at least one non-system user or assistant
+	// message. Files with only headers and system blocks (e.g.
+	// environment banners) are not real conversations.
 	hasContent := false
 	for _, m := range b.messages {
-		if m.Content != "" {
+		if m.Content != "" && !m.IsSystem {
 			hasContent = true
 			break
 		}
@@ -471,7 +530,7 @@ func ParseZencoderSession(
 			relType = RelContinuation
 			parentSessionID = "zencoder:" + b.parentID
 		default:
-			// "newChat" or unknown → no relationship.
+			// "newChat" or unknown -- no relationship.
 		}
 	}
 

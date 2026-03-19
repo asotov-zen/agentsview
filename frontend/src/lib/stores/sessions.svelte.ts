@@ -8,6 +8,9 @@ export interface SessionGroup {
   key: string;
   project: string;
   sessions: Session[];
+  /** Unfiltered session list for ancestry classification.
+   *  Set when a filter (e.g. starred) removes sessions from the group. */
+  allSessions?: Session[];
   primarySessionId: string;
   totalMessages: number;
   firstMessage: string | null;
@@ -50,6 +53,7 @@ class SessionsStore {
   projects: ProjectInfo[] = $state([]);
   agents: AgentInfo[] = $state([]);
   activeSessionId: string | null = $state(null);
+  childSessions: Map<string, Session> = $state(new Map());
   nextCursor: string | null = $state(null);
   total: number = $state(0);
   loading: boolean = $state(false);
@@ -65,6 +69,8 @@ class SessionsStore {
   private agentsLoaded: boolean = false;
   private agentsPromise: Promise<void> | null = null;
   private agentsVersion: number = 0;
+  private refreshVersion: number = 0;
+  private childSessionsVersion: number = 0;
 
   get activeSession(): Session | undefined {
     return this.sessions.find((s) => s.id === this.activeSessionId);
@@ -100,6 +106,7 @@ class SessionsStore {
       min_user_messages:
         f.minUserMessages > 0 ? f.minUserMessages : undefined,
       include_one_shot: f.includeOneShot || undefined,
+      include_children: true,
     };
   }
 
@@ -153,22 +160,24 @@ class SessionsStore {
       this.invalidateFilterCaches();
     }
     if (this.pendingNavTarget) {
-      this.activeSessionId = this.pendingNavTarget;
+      this.setActiveSession(this.pendingNavTarget);
       this.pendingNavTarget = null;
     } else {
-      this.activeSessionId = null;
+      this.setActiveSession(null);
     }
   }
 
   async load() {
     const version = ++this.loadVersion;
     this.loading = true;
+    // Preserve old data during reload — clearing eagerly
+    // causes a flash because the sidebar and content area
+    // briefly see an empty session list.
     const prev = {
       sessions: this.sessions,
       nextCursor: this.nextCursor,
       total: this.total,
     };
-    this.resetPagination();
     try {
       let cursor: string | undefined = undefined;
       let loaded: Session[] = [];
@@ -312,8 +321,15 @@ class SessionsStore {
     return this.agentsPromise;
   }
 
-  selectSession(id: string) {
+  private setActiveSession(id: string | null) {
+    if (id === this.activeSessionId) return;
     this.activeSessionId = id;
+    this.refreshVersion++;
+    this.childSessionsVersion++;
+  }
+
+  selectSession(id: string) {
+    this.setActiveSession(id);
   }
 
   /**
@@ -330,11 +346,59 @@ class SessionsStore {
         // Session not found - still attempt to select
       }
     }
-    this.activeSessionId = id;
+    this.setActiveSession(id);
   }
 
   deselectSession() {
-    this.activeSessionId = null;
+    this.setActiveSession(null);
+    this.childSessions = new Map();
+  }
+
+  async refreshActiveSession() {
+    const id = this.activeSessionId;
+    if (!id) return;
+    const version = ++this.refreshVersion;
+    try {
+      const session = await api.getSession(id);
+      if (
+        this.refreshVersion !== version ||
+        this.activeSessionId !== id
+      ) {
+        return;
+      }
+      const idx = this.sessions.findIndex((s) => s.id === id);
+      if (idx >= 0) {
+        this.sessions[idx] = session;
+      }
+    } catch {
+      // Session may have been deleted
+    }
+  }
+
+  async loadChildSessions(parentId: string) {
+    const version = ++this.childSessionsVersion;
+    try {
+      const children = await api.getChildSessions(parentId);
+      if (
+        this.childSessionsVersion !== version ||
+        this.activeSessionId !== parentId
+      ) {
+        return;
+      }
+      const map = new Map<string, Session>();
+      for (const child of children) {
+        map.set(child.id, child);
+      }
+      this.childSessions = map;
+    } catch {
+      if (
+        this.childSessionsVersion !== version ||
+        this.activeSessionId !== parentId
+      ) {
+        return;
+      }
+      this.childSessions = new Map();
+    }
   }
 
   navigateSession(delta: number, filter?: (s: Session) => boolean) {
@@ -350,19 +414,19 @@ class SessionsStore {
       // an unstarred session while starred-only filter is on) — jump to
       // an edge so the keyboard shortcut doesn't silently fail.
       const edge = delta > 0 ? 0 : list.length - 1;
-      this.activeSessionId = list[edge]!.id;
+      this.setActiveSession(list[edge]!.id);
       return;
     }
     const next = idx + delta;
     if (next >= 0 && next < list.length) {
-      this.activeSessionId = list[next]!.id;
+      this.setActiveSession(list[next]!.id);
     }
   }
 
   setProjectFilter(project: string) {
     const wasOneShot = this.filters.includeOneShot;
     this.filters = { ...defaultFilters(), project, agent: this.filters.agent };
-    this.activeSessionId = null;
+    this.setActiveSession(null);
     if (wasOneShot) this.invalidateFilterCaches();
     this.load();
   }
@@ -373,7 +437,7 @@ class SessionsStore {
     } else {
       this.filters.agent = agent;
     }
-    this.activeSessionId = null;
+    this.setActiveSession(null);
     this.load();
   }
 
@@ -388,7 +452,7 @@ class SessionsStore {
       current.push(agent);
     }
     this.filters.agent = current.join(",");
-    this.activeSessionId = null;
+    this.setActiveSession(null);
     this.load();
   }
 
@@ -404,13 +468,13 @@ class SessionsStore {
 
   setRecentlyActiveFilter(active: boolean) {
     this.filters.recentlyActive = active;
-    this.activeSessionId = null;
+    this.setActiveSession(null);
     this.load();
   }
 
   setMinUserMessagesFilter(n: number) {
     this.filters.minUserMessages = n;
-    this.activeSessionId = null;
+    this.setActiveSession(null);
     this.load();
   }
 
@@ -419,13 +483,13 @@ class SessionsStore {
     if (hide && this.filters.project === "unknown") {
       this.filters.project = "";
     }
-    this.activeSessionId = null;
+    this.setActiveSession(null);
     this.load();
   }
 
   setIncludeOneShotFilter(include: boolean) {
     this.filters.includeOneShot = include;
-    this.activeSessionId = null;
+    this.setActiveSession(null);
     this.invalidateFilterCaches();
     this.load();
   }
@@ -448,7 +512,7 @@ class SessionsStore {
     const project = this.filters.project;
     const wasOneShot = this.filters.includeOneShot;
     this.filters = { ...defaultFilters(), project };
-    this.activeSessionId = null;
+    this.setActiveSession(null);
     if (wasOneShot) this.invalidateFilterCaches();
     this.load();
   }
@@ -466,7 +530,7 @@ class SessionsStore {
       this.total = Math.max(0, this.total - removed);
     }
     if (this.activeSessionId === id) {
-      this.activeSessionId = null;
+      this.setActiveSession(null);
     }
     const timer = setTimeout(() => {
       this.recentlyDeleted = this.recentlyDeleted.filter(
@@ -582,7 +646,6 @@ function findRoot(
     visited.add(cur);
     const s = byId.get(cur);
     if (!s?.parent_session_id) break;
-    if (s.relationship_type === "fork") break;
     const parent = s.parent_session_id;
     if (!byId.has(parent)) break; // missing link
     cur = parent;
@@ -606,9 +669,6 @@ export function buildSessionGroups(sessions: Session[]): SessionGroup[] {
   const insertionOrder: string[] = [];
 
   for (const s of sessions) {
-    // Subagent sessions are only visible through their parent.
-    if (s.relationship_type === "subagent") continue;
-
     const root = findRoot(s.id, byId, rootCache);
     // Sessions without a parent_session_id that aren't
     // pointed to by anyone get root == their own id, so
@@ -637,6 +697,108 @@ export function buildSessionGroups(sessions: Session[]): SessionGroup[] {
     group.endedAt = maxString(group.endedAt, s.ended_at);
   }
 
+  // Adopt orphaned teammate sessions so they NEVER appear at root level.
+  // A session with <teammate-message in first_message is always a child;
+  // if parent_session_id is missing, adopt it into the nearest non-teammate
+  // root group in the same project (no time limit).
+  const isTeammateSession = (s: Session) =>
+    s.first_message?.includes("<teammate-message") ?? false;
+
+  const keysToRemove = new Set<string>();
+
+  // Build a per-project index of non-teammate root groups for adoption.
+  const adoptTargets = new Map<string, string[]>(); // project -> group keys
+  for (const [key, group] of groupMap) {
+    // A valid adoption target is any group whose root session is NOT a teammate.
+    const root = group.sessions.find((s) => s.id === key) ?? group.sessions[0]!;
+    if (!isTeammateSession(root)) {
+      let list = adoptTargets.get(group.project);
+      if (!list) {
+        list = [];
+        adoptTargets.set(group.project, list);
+      }
+      list.push(key);
+    }
+  }
+
+  // Collect all orphaned teammate groups (including multi-session ones
+  // where the root itself is a teammate, e.g. a teammate that spawned
+  // subagents).
+  const orphanGroups: Array<{ key: string; group: SessionGroup; time: number }> = [];
+  for (const [key, group] of groupMap) {
+    const root = group.sessions.find((s) => s.id === key) ?? group.sessions[0]!;
+    if (!isTeammateSession(root)) continue;
+    if (root.parent_session_id) continue; // linked but parent not loaded — leave as-is
+    orphanGroups.push({
+      key,
+      group,
+      time: new Date(root.started_at ?? root.created_at ?? "1970-01-01").getTime(),
+    });
+  }
+
+  // Pass 1: adopt orphans into the nearest non-teammate group in same project.
+  for (const orphan of orphanGroups) {
+    const candidates = adoptTargets.get(orphan.group.project);
+    if (!candidates || candidates.length === 0) continue;
+
+    let bestKey: string | null = null;
+    let bestDist = Infinity;
+    for (const ck of candidates) {
+      const cg = groupMap.get(ck)!;
+      const primary = cg.sessions.find((ss) => ss.id === ck) ?? cg.sessions[0]!;
+      const cTime = new Date(primary.started_at ?? primary.created_at ?? "1970-01-01").getTime();
+      const dist = Math.abs(orphan.time - cTime);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestKey = ck;
+      }
+    }
+
+    if (bestKey) {
+      const target = groupMap.get(bestKey)!;
+      for (const s of orphan.group.sessions) {
+        target.sessions.push(s);
+        target.totalMessages += s.message_count;
+        target.startedAt = minString(target.startedAt, s.started_at);
+        target.endedAt = maxString(target.endedAt, s.ended_at);
+      }
+      keysToRemove.add(orphan.key);
+    }
+  }
+
+  // Pass 2: any remaining orphan teammates (project has no non-teammate
+  // root group) — cluster all from same project into one group.
+  const stillOrphaned = new Map<string, string[]>(); // project -> orphan keys
+  for (const orphan of orphanGroups) {
+    if (keysToRemove.has(orphan.key)) continue;
+    let list = stillOrphaned.get(orphan.group.project);
+    if (!list) {
+      list = [];
+      stillOrphaned.set(orphan.group.project, list);
+    }
+    list.push(orphan.key);
+  }
+  for (const [, keys] of stillOrphaned) {
+    if (keys.length < 2) continue;
+    const targetKey = keys[0]!;
+    const target = groupMap.get(targetKey)!;
+    for (let i = 1; i < keys.length; i++) {
+      const src = groupMap.get(keys[i]!)!;
+      for (const s of src.sessions) {
+        target.sessions.push(s);
+        target.totalMessages += s.message_count;
+        target.startedAt = minString(target.startedAt, s.started_at);
+        target.endedAt = maxString(target.endedAt, s.ended_at);
+      }
+      keysToRemove.add(keys[i]!);
+    }
+  }
+
+  // Remove adopted orphan groups from the map and insertion order.
+  for (const key of keysToRemove) {
+    groupMap.delete(key);
+  }
+
   for (const group of groupMap.values()) {
     if (group.sessions.length > 1) {
       group.sessions.sort((a, b) => {
@@ -647,19 +809,35 @@ export function buildSessionGroups(sessions: Session[]): SessionGroup[] {
     }
     group.firstMessage = group.sessions[0]?.first_message ?? null;
 
-    let bestIdx = 0;
-    let bestKey = recencyKey(group.sessions[0]!);
-    for (let i = 1; i < group.sessions.length; i++) {
-      const key = recencyKey(group.sessions[i]!);
-      if (key > bestKey) {
-        bestKey = key;
-        bestIdx = i;
+    // For groups containing subagent children, the root session
+    // should always be the main entry (not the most recent child).
+    const hasSubagents = group.sessions.some(
+      (s) => s.relationship_type === "subagent",
+    );
+    if (hasSubagents) {
+      const rootIdx = group.sessions.findIndex((s) => s.id === group.key);
+      group.primarySessionId =
+        rootIdx >= 0
+          ? group.sessions[rootIdx]!.id
+          : group.sessions[0]!.id;
+    } else {
+      // For continuation chains, use the most recently active session.
+      let bestIdx = 0;
+      let bestKey = recencyKey(group.sessions[0]!);
+      for (let i = 1; i < group.sessions.length; i++) {
+        const k = recencyKey(group.sessions[i]!);
+        if (k > bestKey) {
+          bestKey = k;
+          bestIdx = i;
+        }
       }
+      group.primarySessionId = group.sessions[bestIdx]!.id;
     }
-    group.primarySessionId = group.sessions[bestIdx]!.id;
   }
 
-  return insertionOrder.map((k) => groupMap.get(k)!);
+  return insertionOrder
+    .filter((k) => !keysToRemove.has(k))
+    .map((k) => groupMap.get(k)!);
 }
 
 export const sessions = createSessionsStore();

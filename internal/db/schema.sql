@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     cwd         TEXT,
     parent_session_id TEXT,
     relationship_type TEXT NOT NULL DEFAULT '',
+    total_output_tokens INTEGER NOT NULL DEFAULT 0,
+    peak_context_tokens INTEGER NOT NULL DEFAULT 0,
     deleted_at  TEXT,
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -35,6 +37,10 @@ CREATE TABLE IF NOT EXISTS messages (
     content_length INTEGER NOT NULL DEFAULT 0,
     model_id       TEXT,
     provider_id    TEXT,
+    model TEXT NOT NULL DEFAULT '',
+    token_usage TEXT NOT NULL DEFAULT '',
+    context_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
     UNIQUE(session_id, ordinal)
 );
 
@@ -118,6 +124,9 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_category
 CREATE INDEX IF NOT EXISTS idx_tool_calls_skill
     ON tool_calls(skill_name)
     WHERE skill_name IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tool_calls_subagent
+    ON tool_calls(subagent_session_id)
+    WHERE subagent_session_id IS NOT NULL;
 
 -- Insights table for AI-generated activity insights
 CREATE TABLE IF NOT EXISTS insights (

@@ -128,9 +128,9 @@ func (e *Engine) SyncPaths(paths []string) {
 	e.syncMu.Lock()
 	defer e.syncMu.Unlock()
 
-	results := e.startWorkers(files)
+	results := e.startWorkers(context.Background(), files)
 	stats := e.collectAndBatch(
-		results, len(files), nil,
+		context.Background(), results, len(files), nil,
 	)
 	e.persistSkipCache()
 
@@ -567,7 +567,7 @@ const resyncTempSuffix = "-resync"
 // handle. This avoids the per-row trigger overhead of bulk
 // deleting hundreds of thousands of messages in place.
 func (e *Engine) ResyncAll(
-	onProgress ProgressFunc,
+	ctx context.Context, onProgress ProgressFunc,
 ) SyncStats {
 	e.syncMu.Lock()
 	defer e.syncMu.Unlock()
@@ -581,8 +581,9 @@ func (e *Engine) ResyncAll(
 	// OpenCode) so OpenCode-only datasets don't trigger the
 	// guard. Fail closed: if we can't query, assume old DB
 	// has file-backed data worth protecting.
-	ctx := context.Background()
-	oldFileSessions, err := origDB.FileBackedSessionCount(ctx)
+	oldFileSessions, err := origDB.FileBackedSessionCount(
+		context.Background(),
+	)
 	if err != nil {
 		log.Printf("resync: get old file count: %v", err)
 		oldFileSessions = 1
@@ -632,11 +633,12 @@ func (e *Engine) ResyncAll(
 
 	// 3. Point engine at newDB and sync into it.
 	e.db = newDB
-	stats := e.syncAllLocked(onProgress)
+	stats := e.syncAllLocked(ctx, onProgress)
 	e.db = origDB // restore immediately
 
 	// Abort swap when the fresh DB would be worse than the
 	// original:
+	// - sync was cancelled (partial rebuild)
 	// - nothing synced at all (empty discovery, or all skipped)
 	//   when old DB had data
 	// - more files failed than succeeded (permission errors,
@@ -646,7 +648,8 @@ func (e *Engine) ResyncAll(
 	emptyDiscovery := stats.filesDiscovered == 0 &&
 		stats.filesOK == 0 &&
 		oldFileSessions > 0
-	abortSwap := emptyDiscovery ||
+	abortSwap := stats.Aborted ||
+		emptyDiscovery ||
 		(stats.Synced == 0 && stats.TotalSessions > 0) ||
 		(stats.Failed > 0 && stats.Failed > stats.filesOK)
 	if abortSwap {
@@ -754,6 +757,14 @@ func (e *Engine) ResyncAll(
 	}
 	stats.OrphanedCopied = orphaned
 
+	// Re-link subagent sessions after orphan copy so copied
+	// tool_calls.subagent_session_id references are resolved.
+	if orphaned > 0 {
+		if err := newDB.LinkSubagentSessions(); err != nil {
+			log.Printf("resync: relink subagent sessions: %v", err)
+		}
+	}
+
 	// Merge user-managed data (display_name, deleted_at,
 	// starred_sessions, pinned_messages) from the old DB
 	// so renames, soft-deletes, stars, and pins survive.
@@ -817,15 +828,21 @@ func removeWAL(path string) {
 }
 
 // SyncAll discovers and syncs all session files from all agents.
-func (e *Engine) SyncAll(onProgress ProgressFunc) SyncStats {
+func (e *Engine) SyncAll(
+	ctx context.Context, onProgress ProgressFunc,
+) SyncStats {
 	e.syncMu.Lock()
 	defer e.syncMu.Unlock()
-	return e.syncAllLocked(onProgress)
+	return e.syncAllLocked(ctx, onProgress)
 }
 
 func (e *Engine) syncAllLocked(
-	onProgress ProgressFunc,
+	ctx context.Context, onProgress ProgressFunc,
 ) SyncStats {
+	if ctx.Err() != nil {
+		return SyncStats{Aborted: true}
+	}
+
 	t0 := time.Now()
 
 	var all []parser.DiscoveredFile
@@ -869,9 +886,9 @@ func (e *Engine) syncAllLocked(
 	}
 
 	tWorkers := time.Now()
-	results := e.startWorkers(all)
+	results := e.startWorkers(ctx, all)
 	stats := e.collectAndBatch(
-		results, len(all), onProgress,
+		ctx, results, len(all), onProgress,
 	)
 	if verbose {
 		log.Printf(
@@ -881,18 +898,40 @@ func (e *Engine) syncAllLocked(
 		)
 	}
 
+	// If cancelled (either collectAndBatch set Aborted, or
+	// context was cancelled after the loop with no file-backed
+	// sessions), return partial stats without running further
+	// phases or mutating state. Don't update lastSync or
+	// lastSyncStats so the UI still reflects the last
+	// completed sync.
+	if stats.Aborted || ctx.Err() != nil {
+		stats.Aborted = true
+		return stats
+	}
+
 	// Sync OpenCode sessions (DB-backed, not file-based).
 	// Uses full replace because OpenCode messages can change
 	// in place (streaming updates, tool result pairing).
 	tOC := time.Now()
-	ocPending := e.syncOpenCode()
+	ocPending := e.syncOpenCode(ctx)
 	if len(ocPending) > 0 {
 		stats.TotalSessions += len(ocPending)
-		stats.RecordSynced(len(ocPending))
 		tWrite := time.Now()
+		var ocWritten int
 		for _, pw := range ocPending {
-			e.writeSessionFull(pw)
+			if ctx.Err() != nil {
+				break
+			}
+			switch err := e.writeSessionFull(pw); {
+			case err == nil:
+				ocWritten++
+			case errors.Is(err, db.ErrSessionExcluded):
+				// Intentional skip, not a failure.
+			default:
+				stats.RecordFailed()
+			}
 		}
+		stats.RecordSynced(ocWritten)
 		if verbose {
 			log.Printf(
 				"opencode write: %d sessions in %s",
@@ -906,6 +945,11 @@ func (e *Engine) syncAllLocked(
 			"opencode sync: %s",
 			time.Since(tOC).Round(time.Millisecond),
 		)
+	}
+
+	if ctx.Err() != nil {
+		stats.Aborted = true
+		return stats
 	}
 
 	tPersist := time.Now()
@@ -928,19 +972,28 @@ func (e *Engine) syncAllLocked(
 // syncOpenCode syncs sessions from OpenCode SQLite databases.
 // Uses per-session time_updated to detect changes, so only
 // modified sessions are fully parsed. Returns pending writes.
-func (e *Engine) syncOpenCode() []pendingWrite {
+func (e *Engine) syncOpenCode(
+	ctx context.Context,
+) []pendingWrite {
 	var allPending []pendingWrite
 	for _, dir := range e.agentDirs[parser.AgentOpenCode] {
+		if ctx.Err() != nil {
+			break
+		}
 		if dir == "" {
 			continue
 		}
-		allPending = append(allPending, e.syncOneOpenCode(dir)...)
+		allPending = append(
+			allPending, e.syncOneOpenCode(ctx, dir)...,
+		)
 	}
 	return allPending
 }
 
 // syncOneOpenCode handles a single OpenCode directory.
-func (e *Engine) syncOneOpenCode(dir string) []pendingWrite {
+func (e *Engine) syncOneOpenCode(
+	ctx context.Context, dir string,
+) []pendingWrite {
 	dbPath := filepath.Join(dir, "opencode.db")
 
 	metas, err := parser.ListOpenCodeSessionMeta(dbPath)
@@ -967,6 +1020,9 @@ func (e *Engine) syncOneOpenCode(dir string) []pendingWrite {
 
 	var pending []pendingWrite
 	for _, sid := range changed {
+		if ctx.Err() != nil {
+			break
+		}
 		sess, msgs, err := parser.ParseOpenCodeSession(
 			dbPath, sid, e.machine,
 		)
@@ -989,8 +1045,11 @@ func (e *Engine) syncOneOpenCode(dir string) []pendingWrite {
 }
 
 // startWorkers fans out file processing across a worker pool
-// and returns a channel of results.
+// and returns a channel of results. When ctx is cancelled,
+// workers skip remaining jobs with a context error instead
+// of parsing files.
 func (e *Engine) startWorkers(
+	ctx context.Context,
 	files []parser.DiscoveredFile,
 ) <-chan syncJob {
 	workers := min(max(runtime.NumCPU(), 2), maxWorkers)
@@ -1001,6 +1060,15 @@ func (e *Engine) startWorkers(
 	for range workers {
 		go func() {
 			for file := range jobs {
+				if ctx.Err() != nil {
+					results <- syncJob{
+						processResult: processResult{
+							err: ctx.Err(),
+						},
+						path: file.Path,
+					}
+					continue
+				}
 				results <- syncJob{
 					processResult: e.processFile(file),
 					path:          file.Path,
@@ -1018,7 +1086,10 @@ func (e *Engine) startWorkers(
 
 // collectAndBatch drains the results channel, batches
 // successful parses, and writes them to the database.
+// When ctx is cancelled, it stops processing new results
+// and returns partial stats.
 func (e *Engine) collectAndBatch(
+	ctx context.Context,
 	results <-chan syncJob, total int,
 	onProgress ProgressFunc,
 ) SyncStats {
@@ -1033,10 +1104,25 @@ func (e *Engine) collectAndBatch(
 
 	var pending []pendingWrite
 
-	for range total {
-		r := <-results
+	for i := range total {
+		var r syncJob
+		select {
+		case <-ctx.Done():
+			stats.Aborted = true
+			drainResults(results, total-i)
+			goto flush
+		case r = <-results:
+		}
 
 		if r.err != nil {
+			// Workers emit ctx.Err() for files skipped
+			// after cancellation — treat the same as the
+			// ctx.Done() branch above.
+			if ctx.Err() != nil {
+				stats.Aborted = true
+				drainResults(results, total-i-1)
+				goto flush
+			}
 			stats.RecordFailed()
 			if r.mtime != 0 {
 				e.cacheSkip(r.path, r.mtime)
@@ -1052,7 +1138,7 @@ func (e *Engine) collectAndBatch(
 			}
 			continue
 		}
-		if len(r.results) == 0 {
+		if len(r.results) == 0 && r.incremental == nil {
 			e.cacheSkip(r.path, r.mtime)
 			progress.SessionsDone++
 			if onProgress != nil {
@@ -1063,11 +1149,23 @@ func (e *Engine) collectAndBatch(
 		e.clearSkip(r.path)
 		stats.filesOK++
 
-		for _, pr := range r.results {
-			pending = append(pending, pendingWrite{
-				sess: pr.Session,
-				msgs: pr.Messages,
-			})
+		if r.incremental != nil {
+			if err := e.writeIncremental(r.incremental); err != nil {
+				log.Printf("%v", err)
+				stats.RecordFailed()
+				continue
+			}
+			stats.RecordSynced(1)
+			progress.MessagesIndexed += len(
+				r.incremental.msgs,
+			)
+		} else {
+			for _, pr := range r.results {
+				pending = append(pending, pendingWrite{
+					sess: pr.Session,
+					msgs: pr.Messages,
+				})
+			}
 		}
 
 		if len(pending) >= batchSize {
@@ -1083,10 +1181,18 @@ func (e *Engine) collectAndBatch(
 		}
 	}
 
+flush:
 	if len(pending) > 0 {
 		stats.RecordSynced(len(pending))
 		progress.MessagesIndexed += countMessages(pending)
 		e.writeBatch(pending)
+	}
+
+	// Link subagent child sessions to their parents via
+	// tool_calls.subagent_session_id references. Run once
+	// after all batches to avoid repeated full-table scans.
+	if err := e.db.LinkSubagentSessions(); err != nil {
+		log.Printf("link subagent sessions: %v", err)
 	}
 
 	progress.Phase = PhaseDone
@@ -1096,11 +1202,35 @@ func (e *Engine) collectAndBatch(
 	return stats
 }
 
+// drainResults consumes remaining items from the results
+// channel so that worker goroutines can exit and be collected.
+func drainResults(results <-chan syncJob, remaining int) {
+	for range remaining {
+		<-results
+	}
+}
+
+// incrementalUpdate holds the delta produced by an
+// incremental JSONL parse, used to partially update the
+// session row without overwriting unrelated columns.
+type incrementalUpdate struct {
+	sessionID         string
+	msgs              []parser.ParsedMessage
+	endedAt           time.Time
+	msgCount          int // total (old + new)
+	userMsgCount      int // total (old + new)
+	fileSize          int64
+	fileMtime         int64
+	totalOutputTokens int // absolute (old + new)
+	peakContextTokens int // absolute max(old, new)
+}
+
 type processResult struct {
-	results []parser.ParseResult
-	skip    bool
-	mtime   int64
-	err     error
+	results     []parser.ParseResult
+	skip        bool
+	mtime       int64
+	err         error
+	incremental *incrementalUpdate
 }
 
 func (e *Engine) processFile(
@@ -1246,6 +1376,15 @@ func (e *Engine) processClaude(
 		}
 	}
 
+	// Try incremental parse for append-only JSONL files
+	// that have already been synced.
+	if res, ok := e.tryIncrementalJSONL(
+		file, info, parser.AgentClaude,
+		parser.ParseClaudeSessionFrom,
+	); ok {
+		return res
+	}
+
 	// Determine project name from cwd if possible
 	project := parser.GetProjectName(file.Project)
 	cwd, gitBranch := parser.ExtractClaudeProjectHints(
@@ -1278,6 +1417,114 @@ func (e *Engine) processClaude(
 	return processResult{results: results}
 }
 
+// incrementalParseFunc reads new JSONL lines from a file
+// starting at the given byte offset with the given starting
+// ordinal. Returns parsed messages, the latest timestamp
+// (endedAt), bytes consumed (relative to offset), and any
+// error. The consumed count covers only complete, valid JSON
+// lines so it can be used as a safe resume offset.
+type incrementalParseFunc func(
+	path string, offset int64, startOrdinal int,
+) ([]parser.ParsedMessage, time.Time, int64, error)
+
+// tryIncrementalJSONL attempts an incremental parse of an
+// append-only JSONL file by reading only bytes appended since
+// the last sync. Returns (result, true) on success, or
+// (zero, false) to fall through to a full parse. Falls back
+// to full parse when the file maps to multiple DB sessions
+// (e.g. Claude DAG forks).
+func (e *Engine) tryIncrementalJSONL(
+	file parser.DiscoveredFile,
+	info os.FileInfo,
+	agent parser.AgentType,
+	parseFn incrementalParseFunc,
+) (processResult, bool) {
+	inc, ok := e.db.GetSessionForIncremental(file.Path)
+	if !ok || inc.FileSize <= 0 {
+		return processResult{}, false
+	}
+
+	currentSize := info.Size()
+	if currentSize <= inc.FileSize {
+		return processResult{}, false
+	}
+
+	maxOrd := e.db.MaxOrdinal(inc.ID)
+	if maxOrd < 0 {
+		return processResult{}, false
+	}
+
+	newMsgs, endedAt, consumed, err := parseFn(
+		file.Path, inc.FileSize, maxOrd+1,
+	)
+	if err != nil {
+		log.Printf(
+			"incremental %s %s: %v (full parse)",
+			agent, file.Path, err,
+		)
+		return processResult{}, false
+	}
+
+	// Use the offset through the last valid JSON line, not
+	// info.Size(), so partial lines at EOF are retried on
+	// the next sync.
+	newOffset := inc.FileSize + consumed
+
+	if len(newMsgs) == 0 {
+		// No new messages, but advance the offset past
+		// non-message lines (progress events, metadata)
+		// so they aren't re-read on every sync. Carry
+		// endedAt forward so session bounds stay current
+		// with non-message timestamps (e.g. progress).
+		if consumed > 0 {
+			return processResult{
+				incremental: &incrementalUpdate{
+					sessionID:         inc.ID,
+					endedAt:           endedAt,
+					msgCount:          inc.MsgCount,
+					userMsgCount:      inc.UserMsgCount,
+					fileSize:          newOffset,
+					fileMtime:         info.ModTime().UnixNano(),
+					totalOutputTokens: inc.TotalOutputTokens,
+					peakContextTokens: inc.PeakContextTokens,
+				},
+			}, true
+		}
+		return processResult{skip: true}, true
+	}
+
+	newUserCount := countUserMsgs(newMsgs)
+
+	log.Printf(
+		"incremental %s %s: %d new message(s) "+
+			"from offset %d",
+		agent, inc.ID, len(newMsgs), inc.FileSize,
+	)
+
+	totalOut := inc.TotalOutputTokens
+	peakCtx := inc.PeakContextTokens
+	for _, m := range newMsgs {
+		totalOut += m.OutputTokens
+		if m.ContextTokens > peakCtx {
+			peakCtx = m.ContextTokens
+		}
+	}
+
+	return processResult{
+		incremental: &incrementalUpdate{
+			sessionID:         inc.ID,
+			msgs:              newMsgs,
+			endedAt:           endedAt,
+			msgCount:          inc.MsgCount + len(newMsgs),
+			userMsgCount:      inc.UserMsgCount + newUserCount,
+			fileSize:          newOffset,
+			fileMtime:         info.ModTime().UnixNano(),
+			totalOutputTokens: totalOut,
+			peakContextTokens: peakCtx,
+		},
+	}, true
+}
+
 func (e *Engine) processCodex(
 	file parser.DiscoveredFile, info os.FileInfo,
 ) processResult {
@@ -1285,6 +1532,21 @@ func (e *Engine) processCodex(
 	// Fast path: skip by file_path + mtime before parsing.
 	if e.shouldSkipByPath(file.Path, info) {
 		return processResult{skip: true}
+	}
+
+	// Try incremental parse for append-only JSONL files
+	// that have already been synced.
+	codexParseFn := func(
+		path string, offset int64, startOrd int,
+	) ([]parser.ParsedMessage, time.Time, int64, error) {
+		return parser.ParseCodexSessionFrom(
+			path, offset, startOrd, false,
+		)
+	}
+	if res, ok := e.tryIncrementalJSONL(
+		file, info, parser.AgentCodex, codexParseFn,
+	); ok {
+		return res
 	}
 
 	sess, msgs, err := parser.ParseCodexSession(
@@ -1657,26 +1919,89 @@ func (e *Engine) writeBatch(batch []pendingWrite) {
 		s := toDBSession(pw)
 		s.MessageCount, s.UserMessageCount =
 			postFilterCounts(msgs)
+
+		// UpsertSession first: the session row must exist
+		// before messages can be inserted (FK constraint).
+		// This is safe because writeBatch runs full parses
+		// that always recompute all columns. For
+		// incremental updates (writeIncremental), messages
+		// are written first since the session already
+		// exists.
 		if err := e.db.UpsertSession(s); err != nil {
 			if errors.Is(err, db.ErrSessionExcluded) {
-				// Cache as skipped so excluded files are not
-				// re-parsed on subsequent syncs.
 				if pw.sess.File.Path != "" {
-					e.cacheSkip(pw.sess.File.Path, pw.sess.File.Mtime)
+					e.cacheSkip(
+						pw.sess.File.Path,
+						pw.sess.File.Mtime,
+					)
 				}
 				continue
 			}
 			log.Printf("upsert session %s: %v", s.ID, err)
 			continue
 		}
-		e.writeMessages(pw.sess.ID, msgs)
+
+		if err := e.writeMessages(
+			pw.sess.ID, msgs,
+		); err != nil {
+			log.Printf("%v", err)
+			continue
+		}
 	}
 
-	// Link subagent child sessions to their parents via
-	// tool_calls.subagent_session_id references.
-	if err := e.db.LinkSubagentSessions(); err != nil {
-		log.Printf("link subagent sessions: %v", err)
+}
+
+// writeIncremental appends new messages and partially updates
+// session metadata without overwriting columns that are not
+// recomputed during incremental parsing (e.g. file_hash,
+// parent_session_id, relationship_type).
+func (e *Engine) writeIncremental(
+	inc *incrementalUpdate,
+) error {
+	dbMsgs := toDBMessages(
+		pendingWrite{
+			sess: parser.ParsedSession{ID: inc.sessionID},
+			msgs: inc.msgs,
+		},
+		e.blockedResultCategories,
+	)
+
+	// Adjust counts for blocked-category filtering.
+	newTotal, newUser := postFilterCounts(dbMsgs)
+	filtered := len(inc.msgs) - newTotal
+	msgCount := inc.msgCount - filtered
+	userFiltered := countUserMsgs(inc.msgs) - newUser
+	userMsgCount := inc.userMsgCount - userFiltered
+
+	var endedAt *string
+	if !inc.endedAt.IsZero() {
+		s := inc.endedAt.Format(time.RFC3339Nano)
+		endedAt = &s
 	}
+
+	// Write messages first — only advance file_size when
+	// the insert succeeds so a failure is retried.
+	if err := e.writeMessages(
+		inc.sessionID, dbMsgs,
+	); err != nil {
+		return fmt.Errorf(
+			"incremental messages %s: %w",
+			inc.sessionID, err,
+		)
+	}
+
+	if err := e.db.UpdateSessionIncremental(
+		inc.sessionID, endedAt,
+		msgCount, userMsgCount,
+		inc.fileSize, inc.fileMtime,
+		inc.totalOutputTokens, inc.peakContextTokens,
+	); err != nil {
+		return fmt.Errorf(
+			"incremental update %s: %w",
+			inc.sessionID, err,
+		)
+	}
+	return nil
 }
 
 // writeMessages uses an incremental append when possible.
@@ -1686,18 +2011,18 @@ func (e *Engine) writeBatch(batch []pendingWrite) {
 // delete+reinsert of existing content).
 func (e *Engine) writeMessages(
 	sessionID string, msgs []db.Message,
-) {
+) error {
 	maxOrd := e.db.MaxOrdinal(sessionID)
 
 	// No existing messages — insert all.
 	if maxOrd < 0 {
 		if err := e.db.InsertMessages(msgs); err != nil {
-			log.Printf(
-				"insert messages for %s: %v",
+			return fmt.Errorf(
+				"insert messages for %s: %w",
 				sessionID, err,
 			)
 		}
-		return
+		return nil
 	}
 
 	// Find new messages (ordinal > maxOrd).
@@ -1711,22 +2036,26 @@ func (e *Engine) writeMessages(
 	}
 
 	if delta == 0 {
-		return
+		return nil
 	}
 
 	if err := e.db.InsertMessages(msgs); err != nil {
-		log.Printf(
-			"append messages for %s: %v",
+		return fmt.Errorf(
+			"append messages for %s: %w",
 			sessionID, err,
 		)
 	}
+	return nil
 }
 
 // writeSessionFull upserts a session and does a full
 // delete+reinsert of its messages. Used by explicit
 // single-session re-syncs where existing content may have
 // changed (not just appended).
-func (e *Engine) writeSessionFull(pw pendingWrite) {
+// writeSessionFull returns nil on success,
+// db.ErrSessionExcluded for intentional skips, or
+// another error for real failures.
+func (e *Engine) writeSessionFull(pw pendingWrite) error {
 	msgs := toDBMessages(pw, e.blockedResultCategories)
 	s := toDBSession(pw)
 	s.MessageCount, s.UserMessageCount =
@@ -1736,10 +2065,10 @@ func (e *Engine) writeSessionFull(pw pendingWrite) {
 			if pw.sess.File.Path != "" {
 				e.cacheSkip(pw.sess.File.Path, pw.sess.File.Mtime)
 			}
-		} else {
-			log.Printf("upsert session %s: %v", s.ID, err)
+			return db.ErrSessionExcluded
 		}
-		return
+		log.Printf("upsert session %s: %v", s.ID, err)
+		return err
 	}
 	if err := e.db.ReplaceSessionMessages(
 		pw.sess.ID, msgs,
@@ -1748,25 +2077,29 @@ func (e *Engine) writeSessionFull(pw pendingWrite) {
 			"replace messages for %s: %v",
 			pw.sess.ID, err,
 		)
+		return err
 	}
+	return nil
 }
 
 // toDBSession converts a pendingWrite to a db.Session.
 func toDBSession(pw pendingWrite) db.Session {
 	s := db.Session{
-		ID:               pw.sess.ID,
-		Project:          pw.sess.Project,
-		Machine:          pw.sess.Machine,
-		Agent:            string(pw.sess.Agent),
-		MessageCount:     pw.sess.MessageCount,
-		UserMessageCount: pw.sess.UserMessageCount,
-		ParentSessionID:  strPtr(pw.sess.ParentSessionID),
-		RelationshipType: string(pw.sess.RelationshipType),
-		Cwd:              strPtr(pw.sess.Cwd),
-		FilePath:         strPtr(pw.sess.File.Path),
-		FileSize:         int64Ptr(pw.sess.File.Size),
-		FileMtime:        int64Ptr(pw.sess.File.Mtime),
-		FileHash:         strPtr(pw.sess.File.Hash),
+		ID:                pw.sess.ID,
+		Project:           pw.sess.Project,
+		Machine:           pw.sess.Machine,
+		Agent:             string(pw.sess.Agent),
+		MessageCount:      pw.sess.MessageCount,
+		UserMessageCount:  pw.sess.UserMessageCount,
+		ParentSessionID:   strPtr(pw.sess.ParentSessionID),
+		RelationshipType:  string(pw.sess.RelationshipType),
+		Cwd:               strPtr(pw.sess.Cwd),
+		TotalOutputTokens: pw.sess.TotalOutputTokens,
+		PeakContextTokens: pw.sess.PeakContextTokens,
+		FilePath:          strPtr(pw.sess.File.Path),
+		FileSize:          int64Ptr(pw.sess.File.Size),
+		FileMtime:         int64Ptr(pw.sess.File.Mtime),
+		FileHash:          strPtr(pw.sess.File.Hash),
 	}
 	if pw.sess.FirstMessage != "" {
 		s.FirstMessage = &pw.sess.FirstMessage
@@ -1797,6 +2130,10 @@ func toDBMessages(pw pendingWrite, blocked map[string]bool) []db.Message {
 			ContentLength: m.ContentLength,
 			ModelID:       m.ModelID,
 			ProviderID:    m.ProviderID,
+			Model:         m.Model,
+			TokenUsage:    m.TokenUsage,
+			ContextTokens: m.ContextTokens,
+			OutputTokens:  m.OutputTokens,
 			ToolCalls: convertToolCalls(
 				pw.sess.ID, m.ToolCalls,
 			),
@@ -1807,7 +2144,8 @@ func toDBMessages(pw pendingWrite, blocked map[string]bool) []db.Message {
 }
 
 // postFilterCounts returns the total and user message counts
-// from a filtered message slice. System messages are excluded
+// from a filtered message slice. System-injected messages
+// (e.g. Zencoder compaction, continuation notices) are excluded
 // from the user count.
 func postFilterCounts(msgs []db.Message) (total, user int) {
 	for _, m := range msgs {
@@ -1816,6 +2154,17 @@ func postFilterCounts(msgs []db.Message) (total, user int) {
 		}
 	}
 	return len(msgs), user
+}
+
+// countUserMsgs counts user messages in parsed messages.
+func countUserMsgs(msgs []parser.ParsedMessage) int {
+	n := 0
+	for _, m := range msgs {
+		if m.Role == parser.RoleUser {
+			n++
+		}
+	}
+	return n
 }
 
 func countMessages(batch []pendingWrite) int {
@@ -1827,12 +2176,24 @@ func countMessages(batch []pendingWrite) int {
 }
 
 // FindSourceFile locates the original source file for a
-// session ID.
+// session ID. It first checks the stored file_path from the
+// database (handles cases where filename differs from session
+// ID, e.g. Zencoder header ID vs filename), then falls back
+// to agent-specific path reconstruction.
 func (e *Engine) FindSourceFile(sessionID string) string {
 	def, ok := parser.AgentByPrefix(sessionID)
 	if !ok || !def.FileBased || def.FindSourceFunc == nil {
 		return ""
 	}
+
+	// Prefer stored file_path — it's authoritative and handles
+	// cases where the session ID doesn't match the filename.
+	if fp := e.db.GetSessionFilePath(sessionID); fp != "" {
+		if _, err := os.Stat(fp); err == nil {
+			return fp
+		}
+	}
+
 	rawID := strings.TrimPrefix(sessionID, def.IDPrefix)
 	for _, d := range e.agentDirs[def.Type] {
 		if f := def.FindSourceFunc(d, rawID); f != "" {
@@ -1918,6 +2279,12 @@ func (e *Engine) SyncSingleSession(sessionID string) error {
 		return nil
 	}
 
+	// Handle incremental updates from processFile (e.g.
+	// append-only JSONL that was already synced).
+	if res.incremental != nil {
+		return e.writeIncremental(res.incremental)
+	}
+
 	// For Codex, processFile uses includeExec=false which may
 	// return empty results for exec-originated sessions. Re-parse
 	// with includeExec=true when that happens.
@@ -1940,10 +2307,21 @@ func (e *Engine) SyncSingleSession(sessionID string) error {
 	}
 
 	for _, pr := range res.results {
-		e.writeSessionFull(
+		if err := e.writeSessionFull(
 			pendingWrite{sess: pr.Session, msgs: pr.Messages},
-		)
+		); err != nil && !errors.Is(err, db.ErrSessionExcluded) {
+			return fmt.Errorf("write session %s: %w",
+				pr.Session.ID, err)
+		}
 	}
+
+	// Link subagent child sessions to their parents.
+	// Required for Zencoder sessions that reference subagent
+	// session IDs in tool_calls.subagent_session_id.
+	if err := e.db.LinkSubagentSessions(); err != nil {
+		log.Printf("link subagent sessions: %v", err)
+	}
+
 	return nil
 }
 
@@ -1993,9 +2371,12 @@ func (e *Engine) syncSingleOpenCode(
 		if sess == nil {
 			continue
 		}
-		e.writeSessionFull(
+		if err := e.writeSessionFull(
 			pendingWrite{sess: *sess, msgs: msgs},
-		)
+		); err != nil && !errors.Is(err, db.ErrSessionExcluded) {
+			return fmt.Errorf("write session %s: %w",
+				sess.ID, err)
+		}
 		return nil
 	}
 

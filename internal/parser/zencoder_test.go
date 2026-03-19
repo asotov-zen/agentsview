@@ -65,60 +65,9 @@ func TestParseZencoderSession_Basic(t *testing.T) {
 	assert.True(t, msgs[3].IsSystem)
 	assert.Equal(t, "[Turn finished: endTurn]", msgs[3].Content)
 
-	// No parent → no relationship.
+	// No parent -> no relationship.
 	assert.Empty(t, sess.ParentSessionID)
 	assert.Equal(t, RelNone, sess.RelationshipType)
-}
-
-func TestParseZencoderSession_MessageTimestamps(t *testing.T) {
-	header := `{"id":"ts-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:05:00Z"}`
-	system := `{"role":"system","content":"You are an AI.\n\nWorking directory: /home/user/proj","createdAt":"2024-01-01T00:00:01Z"}`
-	user := `{"role":"user","content":[{"type":"text","text":"Hello."}],"createdAt":"2024-01-01T00:00:02Z"}`
-	assistant := `{"role":"assistant","content":[{"type":"text","text":"Hi there."},{"type":"tool-call","toolCallId":"tc1","toolName":"Read","input":{"file_path":"a.go"}}],"createdAt":"2024-01-01T00:00:03Z"}`
-	tool := `{"role":"tool","content":[{"type":"tool-result","toolCallId":"tc1","content":[{"type":"text","text":"package main"}],"isError":false}],"createdAt":"2024-01-01T00:00:04Z"}`
-	finish := `{"role":"finish","reason":"endTurn","createdAt":"2024-01-01T00:00:05Z"}`
-
-	content := strings.Join([]string{
-		header, system, user, assistant, tool, finish,
-	}, "\n")
-
-	_, msgs, err := runZencoderParserTest(t, content)
-	require.NoError(t, err)
-	require.Equal(t, 5, len(msgs))
-
-	// System message timestamp.
-	assertTimestamp(t, msgs[0].Timestamp,
-		mustParseTime(t, "2024-01-01T00:00:01Z"))
-	// User message timestamp.
-	assertTimestamp(t, msgs[1].Timestamp,
-		mustParseTime(t, "2024-01-01T00:00:02Z"))
-	// Assistant message timestamp.
-	assertTimestamp(t, msgs[2].Timestamp,
-		mustParseTime(t, "2024-01-01T00:00:03Z"))
-	// Tool result message timestamp.
-	assertTimestamp(t, msgs[3].Timestamp,
-		mustParseTime(t, "2024-01-01T00:00:04Z"))
-	// Finish message timestamp.
-	assertTimestamp(t, msgs[4].Timestamp,
-		mustParseTime(t, "2024-01-01T00:00:05Z"))
-}
-
-func TestParseZencoderSession_MessageTimestamps_Missing(t *testing.T) {
-	// Lines without createdAt should have zero timestamps.
-	header := `{"id":"nots-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
-	user := `{"role":"user","content":[{"type":"text","text":"No ts."}]}`
-	assistant := `{"role":"assistant","content":[{"type":"text","text":"OK."}]}`
-
-	content := strings.Join([]string{
-		header, user, assistant,
-	}, "\n")
-
-	_, msgs, err := runZencoderParserTest(t, content)
-	require.NoError(t, err)
-	require.Equal(t, 2, len(msgs))
-
-	assert.True(t, msgs[0].Timestamp.IsZero())
-	assert.True(t, msgs[1].Timestamp.IsZero())
 }
 
 func TestParseZencoderSession_ToolCallAndReasoning(t *testing.T) {
@@ -234,6 +183,12 @@ func TestParseZencoderSession_ToolResults(t *testing.T) {
 	assert.Equal(t, "tc1", msgs[2].ToolResults[0].ToolUseID)
 	assert.Equal(t, len("package main"),
 		msgs[2].ToolResults[0].ContentLength)
+	// ContentRaw must be populated so pairToolResults can
+	// decode tool output for display.
+	assert.NotEmpty(t, msgs[2].ToolResults[0].ContentRaw,
+		"ContentRaw should contain raw JSON of tool result content")
+	assert.Contains(t, msgs[2].ToolResults[0].ContentRaw,
+		"package main")
 }
 
 func TestParseZencoderSession_UserInputTagFiltering(t *testing.T) {
@@ -389,7 +344,7 @@ func TestParseZencoderSession_MissingFile(t *testing.T) {
 }
 
 func TestParseZencoderSession_FallbackSessionID(t *testing.T) {
-	// Header with no id field → falls back to filename.
+	// Header with no id field -> falls back to filename.
 	header := `{"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
 	user := `{"role":"user","content":[{"type":"text","text":"hello"}]}`
 
@@ -480,7 +435,7 @@ func TestParseZencoderSession_NewChatNoRelationship(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 
-	// newChat even with parentId → no relationship.
+	// newChat even with parentId -> no relationship.
 	assert.Empty(t, sess.ParentSessionID)
 	assert.Equal(t, RelNone, sess.RelationshipType)
 }
@@ -639,6 +594,258 @@ func TestParseZencoderSession_ToolResultSystemTags(t *testing.T) {
 	assert.Equal(t, RoleUser, msgs[3].Role)
 	assert.Contains(t, msgs[3].Content, "Remember your tasks")
 	assert.Contains(t, msgs[3].Content, "Extra context")
+}
+
+func TestParseZencoderSession_ToolResultTaggedBlocksFilteredFromContentRaw(t *testing.T) {
+	// Verify that tagged text blocks in tool-result content are
+	// stripped from ContentRaw (to avoid double-rendering) and
+	// emitted as a separate system message instead.
+	tests := []struct {
+		name            string
+		toolContent     string
+		wantInRaw       []string // substrings that MUST be in ContentRaw
+		wantNotInRaw    []string // substrings that must NOT be in ContentRaw
+		wantSystemParts []string // substrings in the system message
+		wantContentLen  int      // expected ContentLength of tool result
+		wantSystemMsg   bool     // expect a separate system message
+		wantMsgCount    int      // total messages (user + assistant + tool + maybe system)
+	}{
+		{
+			name: "tagged blocks stripped, regular output kept",
+			toolContent: `[` +
+				`{"type":"shell-result","text":"file1.go\nfile2.go"},` +
+				`{"type":"text","tag":"system-reminder","text":"Remember your tasks"},` +
+				`{"type":"text","tag":"todo-reminder","text":"Check your TODOs"}` +
+				`]`,
+			wantInRaw:       []string{"file1.go", "shell-result"},
+			wantNotInRaw:    []string{"Remember your tasks", "Check your TODOs", "system-reminder", "todo-reminder"},
+			wantSystemParts: []string{"Remember your tasks", "Check your TODOs"},
+			wantContentLen:  len("file1.go\nfile2.go"),
+			wantSystemMsg:   true,
+			wantMsgCount:    4, // user + assistant + tool + system
+		},
+		{
+			name: "no tagged blocks, ContentRaw unchanged",
+			toolContent: `[` +
+				`{"type":"text","text":"plain output"}` +
+				`]`,
+			wantInRaw:      []string{"plain output"},
+			wantNotInRaw:   nil,
+			wantContentLen: len("plain output"),
+			wantSystemMsg:  false,
+			wantMsgCount:   3, // user + assistant + tool
+		},
+		{
+			name: "all blocks tagged, ContentRaw is empty array",
+			toolContent: `[` +
+				`{"type":"text","tag":"instructions","text":"sys only"}` +
+				`]`,
+			wantInRaw:       nil,
+			wantNotInRaw:    []string{"sys only", "instructions"},
+			wantSystemParts: []string{"sys only"},
+			wantContentLen:  0,
+			wantSystemMsg:   true,
+			wantMsgCount:    4,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			header := `{"id":"filt-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
+			user := `{"role":"user","content":[{"type":"text","text":"Run it."}]}`
+			assistant := `{"role":"assistant","content":[` +
+				`{"type":"tool-call","toolCallId":"tc1","toolName":"Bash","input":{"command":"ls"}}` +
+				`]}`
+			tool := `{"role":"tool","content":[` +
+				`{"type":"tool-result","toolCallId":"tc1","toolName":"Bash","content":` +
+				tt.toolContent +
+				`,"isError":false}` +
+				`]}`
+
+			content := strings.Join([]string{
+				header, user, assistant, tool,
+			}, "\n")
+
+			sess, msgs, err := runZencoderParserTest(t, content)
+			require.NoError(t, err)
+			require.NotNil(t, sess)
+			require.Equal(t, tt.wantMsgCount, len(msgs))
+
+			// Tool result message is always at index 2.
+			toolMsg := msgs[2]
+			require.Equal(t, 1, len(toolMsg.ToolResults))
+			tr := toolMsg.ToolResults[0]
+
+			// Verify ContentLength matches filtered content.
+			assert.Equal(t, tt.wantContentLen, tr.ContentLength,
+				"ContentLength should reflect filtered content")
+
+			// Verify expected substrings are present in ContentRaw.
+			for _, s := range tt.wantInRaw {
+				assert.Contains(t, tr.ContentRaw, s,
+					"ContentRaw should contain %q", s)
+			}
+
+			// Verify tagged text is NOT in ContentRaw.
+			for _, s := range tt.wantNotInRaw {
+				assert.NotContains(t, tr.ContentRaw, s,
+					"ContentRaw should not contain tagged text %q", s)
+			}
+
+			// Verify DecodeContent on the filtered ContentRaw
+			// does not include tagged text.
+			decoded := DecodeContent(tr.ContentRaw)
+			for _, s := range tt.wantNotInRaw {
+				assert.NotContains(t, decoded, s,
+					"DecodeContent should not return tagged text %q", s)
+			}
+
+			if tt.wantSystemMsg {
+				// System message is the last message.
+				sysMsg := msgs[len(msgs)-1]
+				assert.True(t, sysMsg.IsSystem,
+					"last message should be a system message")
+				assert.Equal(t, RoleUser, sysMsg.Role)
+				for _, s := range tt.wantSystemParts {
+					assert.Contains(t, sysMsg.Content, s,
+						"system message should contain %q", s)
+				}
+			}
+		})
+	}
+}
+
+func TestParseZencoderSession_SystemOnlySession(t *testing.T) {
+	// A session with only a header and a system message (e.g.
+	// environment banner) should be filtered out as empty.
+	header := `{"id":"sysonly-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
+	system := `{"role":"system","content":"You are an AI assistant.\n\nWorking directory: /home/user/proj"}`
+
+	content := strings.Join([]string{header, system}, "\n")
+
+	sess, msgs, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+	assert.Nil(t, sess, "system-only session should be nil")
+	assert.Nil(t, msgs, "system-only session should produce no messages")
+}
+
+func TestParseZencoderSession_SystemAndFinishOnlySession(t *testing.T) {
+	// A session with system + finish but no real user/assistant
+	// messages should also be filtered out.
+	header := `{"id":"sysfin-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
+	system := `{"role":"system","content":"You are an AI assistant."}`
+	finish := `{"role":"finish","reason":"endTurn"}`
+
+	content := strings.Join([]string{header, system, finish}, "\n")
+
+	sess, msgs, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+	assert.Nil(t, sess, "system+finish-only session should be nil")
+	assert.Nil(t, msgs)
+}
+
+func TestParseZencoderSession_TimestampBoundsFromMessages(t *testing.T) {
+	// When header timestamps are missing, session bounds should
+	// be derived from per-message timestamps.
+	header := `{"id":"bounds-123"}`
+	user := `{"role":"user","content":[{"type":"text","text":"Hello."}],"createdAt":"2024-01-01T10:00:00Z"}`
+	assistant := `{"role":"assistant","content":[{"type":"text","text":"Hi."}],"createdAt":"2024-01-01T10:05:00Z"}`
+	finish := `{"role":"finish","reason":"endTurn","createdAt":"2024-01-01T10:05:01Z"}`
+
+	content := strings.Join([]string{
+		header, user, assistant, finish,
+	}, "\n")
+
+	sess, _, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+
+	wantStart := mustParseTime(t, "2024-01-01T10:00:00Z")
+	wantEnd := mustParseTime(t, "2024-01-01T10:05:01Z")
+	assertTimestamp(t, sess.StartedAt, wantStart)
+	assertTimestamp(t, sess.EndedAt, wantEnd)
+}
+
+func TestParseZencoderSession_TimestampBoundsStaleHeader(t *testing.T) {
+	// When header has timestamps but messages have more
+	// recent ones, endedAt should be updated.
+	header := `{"id":"stale-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
+	user := `{"role":"user","content":[{"type":"text","text":"Hello."}],"createdAt":"2024-01-01T00:02:00Z"}`
+	assistant := `{"role":"assistant","content":[{"type":"text","text":"Hi."}],"createdAt":"2024-01-01T00:10:00Z"}`
+
+	content := strings.Join([]string{
+		header, user, assistant,
+	}, "\n")
+
+	sess, _, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+
+	// startedAt stays at header value since it's earlier.
+	wantStart := mustParseTime(t, "2024-01-01T00:00:00Z")
+	assertTimestamp(t, sess.StartedAt, wantStart)
+
+	// endedAt should be updated to the latest message time.
+	wantEnd := mustParseTime(t, "2024-01-01T00:10:00Z")
+	assertTimestamp(t, sess.EndedAt, wantEnd)
+}
+
+func TestParseZencoderSession_MessageTimestamps(t *testing.T) {
+	header := `{"id":"ts-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:05:00Z"}`
+	system := `{"role":"system","content":"You are an AI.\n\nWorking directory: /home/user/proj","createdAt":"2024-01-01T00:00:01Z"}`
+	user := `{"role":"user","content":[{"type":"text","text":"Hello."}],"createdAt":"2024-01-01T00:00:02Z"}`
+	assistant := `{"role":"assistant","content":[{"type":"text","text":"Hi."}],"createdAt":"2024-01-01T00:00:03Z"}`
+	tool := `{"role":"tool","content":[` +
+		`{"type":"tool-result","toolCallId":"tc1","content":[{"type":"text","text":"ok"}],"isError":false}` +
+		`],"createdAt":"2024-01-01T00:00:04Z"}`
+	finish := `{"role":"finish","reason":"endTurn","createdAt":"2024-01-01T00:00:05Z"}`
+
+	content := strings.Join([]string{
+		header, system, user, assistant, tool, finish,
+	}, "\n")
+
+	_, msgs, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+	require.Equal(t, 5, len(msgs))
+
+	// System message.
+	wantSys := mustParseTime(t, "2024-01-01T00:00:01Z")
+	assert.Equal(t, wantSys, msgs[0].Timestamp)
+
+	// User message.
+	wantUser := mustParseTime(t, "2024-01-01T00:00:02Z")
+	assert.Equal(t, wantUser, msgs[1].Timestamp)
+
+	// Assistant message.
+	wantAssistant := mustParseTime(t, "2024-01-01T00:00:03Z")
+	assert.Equal(t, wantAssistant, msgs[2].Timestamp)
+
+	// Tool result message.
+	wantTool := mustParseTime(t, "2024-01-01T00:00:04Z")
+	assert.Equal(t, wantTool, msgs[3].Timestamp)
+
+	// Finish message.
+	wantFinish := mustParseTime(t, "2024-01-01T00:00:05Z")
+	assert.Equal(t, wantFinish, msgs[4].Timestamp)
+}
+
+func TestParseZencoderSession_MessageTimestamps_Missing(t *testing.T) {
+	header := `{"id":"ts-miss-123","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:01:00Z"}`
+	// Lines without createdAt field.
+	user := `{"role":"user","content":[{"type":"text","text":"No timestamp."}]}`
+	assistant := `{"role":"assistant","content":[{"type":"text","text":"Also none."}]}`
+
+	content := strings.Join([]string{
+		header, user, assistant,
+	}, "\n")
+
+	_, msgs, err := runZencoderParserTest(t, content)
+	require.NoError(t, err)
+	require.Equal(t, 2, len(msgs))
+
+	// Both messages should have zero time when createdAt is missing.
+	assert.True(t, msgs[0].Timestamp.IsZero())
+	assert.True(t, msgs[1].Timestamp.IsZero())
 }
 
 func mustParseTime(t *testing.T, s string) time.Time {

@@ -56,6 +56,7 @@ func (s *Server) handleListSessions(
 	}
 
 	includeOneShot := q.Get("include_one_shot") == "true"
+	includeChildren := q.Get("include_children") == "true"
 
 	filter := db.SessionFilter{
 		Project:         q.Get("project"),
@@ -70,6 +71,7 @@ func (s *Server) handleListSessions(
 		MaxMessages:     maxMsgs,
 		MinUserMessages: minUserMsgs,
 		ExcludeOneShot:  !includeOneShot,
+		IncludeChildren: includeChildren,
 		Cursor:          q.Get("cursor"),
 		Limit:           limit,
 	}
@@ -125,4 +127,29 @@ func (s *Server) handleGetChildSessions(
 		children = []db.Session{}
 	}
 	writeJSON(w, http.StatusOK, children)
+}
+
+// handleSearchSession handles GET /api/v1/sessions/{id}/search?q=...
+// Returns matching message ordinals in document order.
+func (s *Server) handleSearchSession(
+	w http.ResponseWriter, r *http.Request,
+) {
+	id := r.PathValue("id")
+	q := r.URL.Query().Get("q")
+	if q == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"ordinals": []int{}})
+		return
+	}
+	ordinals, err := s.db.SearchSession(r.Context(), id, q)
+	if err != nil {
+		if handleContextError(w, err) {
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if ordinals == nil {
+		ordinals = []int{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ordinals": ordinals})
 }

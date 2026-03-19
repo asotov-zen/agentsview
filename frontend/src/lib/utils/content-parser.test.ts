@@ -19,6 +19,10 @@ function makeMsg(
     has_tool_use: false,
     has_thinking: false,
     content_length: 0,
+    model: "",
+    token_usage: null,
+    context_tokens: 0,
+    output_tokens: 0,
     timestamp: "2024-01-01T00:00:00Z",
   };
   return { ...defaults, ...overrides };
@@ -1153,5 +1157,54 @@ describe("hasVisibleSegments", () => {
     });
     const nothingVisible = visibilityFrom(new Set<string>());
     expect(hasVisibleSegments(m, nothingVisible)).toBe(false);
+  });
+
+  it("skill segment hidden when parent role filter is off", () => {
+    const m = makeMsg({
+      content: "[Skill: commit]\nRunning commit skill\n[/Skill]",
+    });
+    const noAssistant = visibilityFrom(
+      new Set(["user", "thinking", "tool", "code"]),
+    );
+    expect(hasVisibleSegments(m, noAssistant)).toBe(false);
+  });
+
+  it("skill segment visible when parent role filter is on", () => {
+    const m = makeMsg({
+      content: "[Skill: commit]\nRunning commit skill\n[/Skill]",
+    });
+    expect(hasVisibleSegments(m, allBlocksVisible)).toBe(true);
+  });
+
+  it("user skill segment hidden when user filter is off", () => {
+    const m = makeMsg({
+      role: "user",
+      content: "[Skill: commit]\nRunning commit skill\n[/Skill]",
+    });
+    const noUser = visibilityFrom(
+      new Set(["assistant", "thinking", "tool", "code"]),
+    );
+    expect(hasVisibleSegments(m, noUser)).toBe(false);
+  });
+
+  it("assistant skill visible when role is on but tool filter is off", () => {
+    const m = makeMsg({
+      content: "[Skill: commit]\nRunning commit skill\n[/Skill]",
+    });
+    const noTool = visibilityFrom(
+      new Set(["user", "assistant", "thinking", "code"]),
+    );
+    expect(hasVisibleSegments(m, noTool)).toBe(true);
+  });
+
+  it("user skill visible when role is on but tool filter is off", () => {
+    const m = makeMsg({
+      role: "user",
+      content: "[Skill: commit]\nRunning commit skill\n[/Skill]",
+    });
+    const noTool = visibilityFrom(
+      new Set(["user", "assistant", "thinking", "code"]),
+    );
+    expect(hasVisibleSegments(m, noTool)).toBe(true);
   });
 });

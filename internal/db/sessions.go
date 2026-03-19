@@ -26,7 +26,8 @@ const sessionBaseCols = `id, project, machine, agent,
 	first_message, display_name, started_at, ended_at,
 	message_count, user_message_count,
 	parent_session_id, relationship_type,
-	cwd, deleted_at, created_at`
+	cwd, total_output_tokens, peak_context_tokens,
+	deleted_at, created_at`
 
 // sessionPruneCols extends sessionBaseCols with file metadata
 // needed by FindPruneCandidates.
@@ -34,14 +35,16 @@ const sessionPruneCols = `id, project, machine, agent,
 	first_message, display_name, started_at, ended_at,
 	message_count, user_message_count,
 	parent_session_id, relationship_type,
-	cwd, deleted_at, file_path, file_size, created_at`
+	cwd, total_output_tokens, peak_context_tokens,
+	deleted_at, file_path, file_size, created_at`
 
 // sessionFullCols includes all columns for a complete session record.
 const sessionFullCols = `id, project, machine, agent,
 	first_message, display_name, started_at, ended_at,
 	message_count, user_message_count,
 	parent_session_id, relationship_type,
-	cwd, deleted_at, file_path, file_size, file_mtime,
+	cwd, total_output_tokens, peak_context_tokens,
+	deleted_at, file_path, file_size, file_mtime,
 	file_hash, created_at`
 
 const (
@@ -65,32 +68,35 @@ func scanSessionRow(rs rowScanner) (Session, error) {
 		&s.FirstMessage, &s.DisplayName, &s.StartedAt, &s.EndedAt,
 		&s.MessageCount, &s.UserMessageCount,
 		&s.ParentSessionID, &s.RelationshipType,
-		&s.Cwd, &s.DeletedAt, &s.CreatedAt,
+		&s.Cwd, &s.TotalOutputTokens, &s.PeakContextTokens,
+		&s.DeletedAt, &s.CreatedAt,
 	)
 	return s, err
 }
 
 // Session represents a row in the sessions table.
 type Session struct {
-	ID               string  `json:"id"`
-	Project          string  `json:"project"`
-	Machine          string  `json:"machine"`
-	Agent            string  `json:"agent"`
-	FirstMessage     *string `json:"first_message"`
-	DisplayName      *string `json:"display_name,omitempty"`
-	StartedAt        *string `json:"started_at"`
-	EndedAt          *string `json:"ended_at"`
-	MessageCount     int     `json:"message_count"`
-	UserMessageCount int     `json:"user_message_count"`
-	ParentSessionID  *string `json:"parent_session_id,omitempty"`
-	RelationshipType string  `json:"relationship_type,omitempty"`
-	Cwd              *string `json:"cwd,omitempty"`
-	DeletedAt        *string `json:"deleted_at,omitempty"`
-	FilePath         *string `json:"file_path,omitempty"`
-	FileSize         *int64  `json:"file_size,omitempty"`
-	FileMtime        *int64  `json:"file_mtime,omitempty"`
-	FileHash         *string `json:"file_hash,omitempty"`
-	CreatedAt        string  `json:"created_at"`
+	ID                string  `json:"id"`
+	Project           string  `json:"project"`
+	Machine           string  `json:"machine"`
+	Agent             string  `json:"agent"`
+	FirstMessage      *string `json:"first_message"`
+	DisplayName       *string `json:"display_name,omitempty"`
+	StartedAt         *string `json:"started_at"`
+	EndedAt           *string `json:"ended_at"`
+	MessageCount      int     `json:"message_count"`
+	UserMessageCount  int     `json:"user_message_count"`
+	ParentSessionID   *string `json:"parent_session_id,omitempty"`
+	RelationshipType  string  `json:"relationship_type,omitempty"`
+	Cwd               *string `json:"cwd,omitempty"`
+	TotalOutputTokens int     `json:"total_output_tokens"`
+	PeakContextTokens int     `json:"peak_context_tokens"`
+	DeletedAt         *string `json:"deleted_at,omitempty"`
+	FilePath          *string `json:"file_path,omitempty"`
+	FileSize          *int64  `json:"file_size,omitempty"`
+	FileMtime         *int64  `json:"file_mtime,omitempty"`
+	FileHash          *string `json:"file_hash,omitempty"`
+	CreatedAt         string  `json:"created_at"`
 }
 
 // SessionCursor is the opaque pagination token.
@@ -184,6 +190,7 @@ type SessionFilter struct {
 	MaxMessages     int    // message_count <= N (0 = no filter)
 	MinUserMessages int    // user_message_count >= N (0 = no filter)
 	ExcludeOneShot  bool   // exclude sessions with user_message_count <= 1
+	IncludeChildren bool   // include subagent sessions (for sidebar grouping)
 	Cursor          string // opaque cursor from previous page
 	Limit           int
 }
@@ -198,82 +205,138 @@ type SessionPage struct {
 // buildSessionFilter returns a WHERE clause and args for the
 // non-cursor predicates in SessionFilter.
 func buildSessionFilter(f SessionFilter) (string, []any) {
-	preds := []string{
+	// Base predicates apply to every row.
+	basePreds := []string{
 		"message_count > 0",
-		"relationship_type NOT IN ('subagent', 'fork')",
 		"deleted_at IS NULL",
 	}
-	var args []any
+	if !f.IncludeChildren {
+		basePreds = append(basePreds,
+			"relationship_type NOT IN ('subagent', 'fork')")
+	}
+
+	// Filter predicates narrow results based on user criteria.
+	// When IncludeChildren is true these only apply to root
+	// sessions; children are included via a subquery on their
+	// parent instead.
+	var filterPreds []string
+	var filterArgs []any
 
 	if f.Project != "" {
-		preds = append(preds, "project = ?")
-		args = append(args, f.Project)
+		filterPreds = append(filterPreds, "project = ?")
+		filterArgs = append(filterArgs, f.Project)
 	}
 	if f.ExcludeProject != "" {
-		preds = append(preds, "project != ?")
-		args = append(args, f.ExcludeProject)
+		filterPreds = append(filterPreds, "project != ?")
+		filterArgs = append(filterArgs, f.ExcludeProject)
 	}
 	if f.Machine != "" {
-		preds = append(preds, "machine = ?")
-		args = append(args, f.Machine)
+		filterPreds = append(filterPreds, "machine = ?")
+		filterArgs = append(filterArgs, f.Machine)
 	}
 	if f.Agent != "" {
 		agents := strings.Split(f.Agent, ",")
 		if len(agents) == 1 {
-			preds = append(preds, "agent = ?")
-			args = append(args, agents[0])
+			filterPreds = append(filterPreds, "agent = ?")
+			filterArgs = append(filterArgs, agents[0])
 		} else {
 			placeholders := make(
 				[]string, len(agents),
 			)
 			for i, a := range agents {
 				placeholders[i] = "?"
-				args = append(args, a)
+				filterArgs = append(filterArgs, a)
 			}
-			preds = append(preds,
+			filterPreds = append(filterPreds,
 				"agent IN ("+
 					strings.Join(placeholders, ",")+
-					")",
-			)
+					")")
 		}
 	}
 	if f.Date != "" {
-		preds = append(preds,
+		filterPreds = append(filterPreds,
 			"date(COALESCE(NULLIF(started_at, ''), created_at)) = ?")
-		args = append(args, f.Date)
+		filterArgs = append(filterArgs, f.Date)
 	}
 	if f.DateFrom != "" {
-		preds = append(preds,
+		filterPreds = append(filterPreds,
 			"date(COALESCE(NULLIF(started_at, ''), created_at)) >= ?")
-		args = append(args, f.DateFrom)
+		filterArgs = append(filterArgs, f.DateFrom)
 	}
 	if f.DateTo != "" {
-		preds = append(preds,
+		filterPreds = append(filterPreds,
 			"date(COALESCE(NULLIF(started_at, ''), created_at)) <= ?")
-		args = append(args, f.DateTo)
+		filterArgs = append(filterArgs, f.DateTo)
 	}
 	if f.ActiveSince != "" {
-		preds = append(preds,
+		filterPreds = append(filterPreds,
 			"COALESCE(NULLIF(ended_at, ''), NULLIF(started_at, ''), created_at) >= ?")
-		args = append(args, f.ActiveSince)
+		filterArgs = append(filterArgs, f.ActiveSince)
 	}
 	if f.MinMessages > 0 {
-		preds = append(preds, "message_count >= ?")
-		args = append(args, f.MinMessages)
+		filterPreds = append(filterPreds, "message_count >= ?")
+		filterArgs = append(filterArgs, f.MinMessages)
 	}
 	if f.MaxMessages > 0 {
-		preds = append(preds, "message_count <= ?")
-		args = append(args, f.MaxMessages)
+		filterPreds = append(filterPreds, "message_count <= ?")
+		filterArgs = append(filterArgs, f.MaxMessages)
 	}
 	if f.MinUserMessages > 0 {
-		preds = append(preds, "user_message_count >= ?")
-		args = append(args, f.MinUserMessages)
-	}
-	if f.ExcludeOneShot {
-		preds = append(preds, "user_message_count > 1")
+		filterPreds = append(filterPreds, "user_message_count >= ?")
+		filterArgs = append(filterArgs, f.MinUserMessages)
 	}
 
-	return strings.Join(preds, " AND "), args
+	// ExcludeOneShot is handled separately from filterPreds
+	// when IncludeChildren is true. Children (subagents, forks)
+	// are almost always one-shot by nature and must not be
+	// excluded. The one-shot filter applies only to root
+	// sessions that match the filter directly.
+	oneShotPred := ""
+	if f.ExcludeOneShot {
+		if f.IncludeChildren {
+			oneShotPred = "user_message_count > 1"
+		} else {
+			filterPreds = append(filterPreds,
+				"user_message_count > 1")
+		}
+	}
+
+	// Simple case: no IncludeChildren or no user filters.
+	hasFilters := len(filterPreds) > 0 || oneShotPred != ""
+	if !f.IncludeChildren || !hasFilters {
+		allPreds := append(basePreds, filterPreds...)
+		return strings.Join(allPreds, " AND "), filterArgs
+	}
+
+	// IncludeChildren + filters: match the filter directly,
+	// or be a child of a session that matches the filter.
+	// This scopes children to their parent's filter match
+	// instead of including all children in the database.
+	baseWhere := strings.Join(basePreds, " AND ")
+
+	// Root match: must pass all filter predicates + one-shot.
+	rootMatchParts := append([]string{}, filterPreds...)
+	if oneShotPred != "" {
+		rootMatchParts = append(rootMatchParts, oneShotPred)
+	}
+	rootMatch := strings.Join(rootMatchParts, " AND ")
+
+	// Subquery for parent inclusion: same criteria as root
+	// match so only children of qualifying parents appear.
+	subqWhere := "message_count > 0 AND deleted_at IS NULL"
+	if rootMatch != "" {
+		subqWhere += " AND " + rootMatch
+	}
+
+	where := baseWhere + " AND (" + rootMatch +
+		" OR parent_session_id IN" +
+		" (SELECT id FROM sessions WHERE " + subqWhere + "))"
+
+	// Args appear twice: outer root match + subquery.
+	allArgs := make([]any, 0, len(filterArgs)*2)
+	allArgs = append(allArgs, filterArgs...)
+	allArgs = append(allArgs, filterArgs...)
+	return where, allArgs
 }
 
 // ListSessions returns a cursor-paginated list of sessions.
@@ -395,7 +458,8 @@ func (db *DB) GetSessionFull(
 		&s.FirstMessage, &s.DisplayName, &s.StartedAt, &s.EndedAt,
 		&s.MessageCount, &s.UserMessageCount,
 		&s.ParentSessionID, &s.RelationshipType,
-		&s.Cwd, &s.DeletedAt, &s.FilePath, &s.FileSize,
+		&s.Cwd, &s.TotalOutputTokens, &s.PeakContextTokens,
+		&s.DeletedAt, &s.FilePath, &s.FileSize,
 		&s.FileMtime, &s.FileHash, &s.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -453,8 +517,9 @@ func (db *DB) UpsertSession(s Session) error {
 			started_at, ended_at, message_count,
 			user_message_count, parent_session_id,
 			relationship_type, cwd,
+			total_output_tokens, peak_context_tokens,
 			file_path, file_size, file_mtime, file_hash
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			project = excluded.project,
 			machine = excluded.machine,
@@ -467,6 +532,8 @@ func (db *DB) UpsertSession(s Session) error {
 			parent_session_id = excluded.parent_session_id,
 			relationship_type = excluded.relationship_type,
 			cwd = excluded.cwd,
+			total_output_tokens = excluded.total_output_tokens,
+			peak_context_tokens = excluded.peak_context_tokens,
 			file_path = excluded.file_path,
 			file_size = excluded.file_size,
 			file_mtime = excluded.file_mtime,
@@ -475,6 +542,7 @@ func (db *DB) UpsertSession(s Session) error {
 		s.StartedAt, s.EndedAt, s.MessageCount,
 		s.UserMessageCount, s.ParentSessionID,
 		s.RelationshipType, s.Cwd,
+		s.TotalOutputTokens, s.PeakContextTokens,
 		s.FilePath, s.FileSize, s.FileMtime, s.FileHash)
 	if err != nil {
 		return fmt.Errorf("upserting session %s: %w", s.ID, err)
@@ -503,7 +571,10 @@ func (db *DB) GetChildSessions(
 
 // LinkSubagentSessions sets parent_session_id and
 // relationship_type on sessions that are referenced by
-// tool_calls.subagent_session_id but don't yet have a parent.
+// tool_calls.subagent_session_id. Updates sessions that either
+// have no parent yet or have a non-subagent relationship (e.g.
+// a Zencoder session classified as "continuation" from header
+// parentId that is actually a spawned subagent).
 func (db *DB) LinkSubagentSessions() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -517,7 +588,7 @@ func (db *DB) LinkSubagentSessions() error {
 			LIMIT 1
 		),
 		relationship_type = 'subagent'
-		WHERE (parent_session_id IS NULL OR parent_session_id = '')
+		WHERE relationship_type != 'subagent'
 		AND EXISTS (
 			SELECT 1 FROM tool_calls tc
 			WHERE tc.subagent_session_id = sessions.id
@@ -542,6 +613,138 @@ func (db *DB) GetSessionFileInfo(
 		return 0, 0, false
 	}
 	return s.Int64, m.Int64, true
+}
+
+// GetSessionFilePath returns the stored file_path for a session,
+// or empty string if not found or NULL.
+func (db *DB) GetSessionFilePath(id string) string {
+	var fp sql.NullString
+	err := db.getReader().QueryRow(
+		"SELECT file_path FROM sessions WHERE id = ?", id,
+	).Scan(&fp)
+	if err != nil || !fp.Valid {
+		return ""
+	}
+	return fp.String
+}
+
+// GetSessionMessageCount returns the message_count for a
+// session. Returns (0, false) when the session does not exist.
+func (db *DB) GetSessionMessageCount(
+	id string,
+) (count int, ok bool) {
+	err := db.getReader().QueryRow(
+		"SELECT message_count FROM sessions WHERE id = ?",
+		id,
+	).Scan(&count)
+	if err != nil {
+		return 0, false
+	}
+	return count, true
+}
+
+// GetSessionVersion returns the message count and file mtime
+// for change detection in SSE watchers.
+func (db *DB) GetSessionVersion(
+	id string,
+) (count int, fileMtime int64, ok bool) {
+	err := db.getReader().QueryRow(
+		"SELECT message_count, COALESCE(file_mtime, 0)"+
+			" FROM sessions WHERE id = ?",
+		id,
+	).Scan(&count, &fileMtime)
+	if err != nil {
+		return 0, 0, false
+	}
+	return count, fileMtime, true
+}
+
+// IncrementalInfo holds the data needed for incremental
+// re-parsing of an append-only session file.
+type IncrementalInfo struct {
+	ID                string
+	FileSize          int64
+	MsgCount          int
+	UserMsgCount      int
+	TotalOutputTokens int
+	PeakContextTokens int
+}
+
+// GetSessionForIncremental returns session state needed for
+// incremental parsing, looked up by file_path. Returns false
+// when the path is unknown or maps to multiple sessions (e.g.
+// Claude DAG forks), since incremental parsing cannot update
+// multiple sessions from a single append.
+func (db *DB) GetSessionForIncremental(
+	path string,
+) (*IncrementalInfo, bool) {
+	// Bail out if the file maps to more than one session
+	// (Claude fork/subagent splits).
+	var count int
+	err := db.getReader().QueryRow(
+		`SELECT COUNT(*) FROM sessions
+		 WHERE file_path = ?`, path,
+	).Scan(&count)
+	if err != nil || count != 1 {
+		return nil, false
+	}
+
+	var info IncrementalInfo
+	var fs sql.NullInt64
+	err = db.getReader().QueryRow(
+		`SELECT id, file_size, message_count,
+			user_message_count,
+			total_output_tokens, peak_context_tokens
+		 FROM sessions WHERE file_path = ?`,
+		path,
+	).Scan(
+		&info.ID, &fs, &info.MsgCount, &info.UserMsgCount,
+		&info.TotalOutputTokens, &info.PeakContextTokens,
+	)
+	if err != nil {
+		return nil, false
+	}
+	if fs.Valid {
+		info.FileSize = fs.Int64
+	}
+	return &info, true
+}
+
+// UpdateSessionIncremental updates only the fields that change
+// during an incremental append: ended_at, message_count,
+// user_message_count, file_size, file_mtime, and token
+// aggregates. All values are absolute (not deltas) so the
+// update is idempotent on retry.
+func (db *DB) UpdateSessionIncremental(
+	id string,
+	endedAt *string,
+	msgCount, userMsgCount int,
+	fileSize, fileMtime int64,
+	totalOutputTokens, peakContextTokens int,
+) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	_, err := db.getWriter().Exec(`
+		UPDATE sessions SET
+			ended_at = COALESCE(?, ended_at),
+			message_count = ?,
+			user_message_count = ?,
+			file_size = ?,
+			file_mtime = ?,
+			total_output_tokens = ?,
+			peak_context_tokens = ?
+		WHERE id = ?`,
+		endedAt, msgCount, userMsgCount,
+		fileSize, fileMtime,
+		totalOutputTokens, peakContextTokens, id,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"incremental update session %s: %w", id, err,
+		)
+	}
+	return nil
 }
 
 // GetFileInfoByPath returns file_size and file_mtime for a
@@ -811,7 +1014,8 @@ func (db *DB) FindPruneCandidates(
 	if f.MaxMessages != nil {
 		where += ` AND (SELECT COUNT(*) FROM messages
 			WHERE messages.session_id = sessions.id
-			AND messages.role = 'user') <= ?`
+			AND messages.role = 'user'
+			AND messages.is_system = 0) <= ?`
 		args = append(args, *f.MaxMessages)
 	}
 	if f.Before != "" {
@@ -850,7 +1054,8 @@ func (db *DB) FindPruneCandidates(
 			&s.FirstMessage, &s.DisplayName, &s.StartedAt, &s.EndedAt,
 			&s.MessageCount, &s.UserMessageCount,
 			&s.ParentSessionID, &s.RelationshipType,
-			&s.Cwd, &s.DeletedAt, &s.FilePath, &s.FileSize, &s.CreatedAt,
+			&s.Cwd, &s.TotalOutputTokens, &s.PeakContextTokens,
+			&s.DeletedAt, &s.FilePath, &s.FileSize, &s.CreatedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning prune candidate: %w", err)
