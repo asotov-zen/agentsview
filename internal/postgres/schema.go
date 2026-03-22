@@ -9,12 +9,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// SchemaVersion is incremented when the PG schema changes in a
-// way that requires migration logic. EnsureSchema writes it to
-// sync_metadata so future versions can detect what they're
-// working with.
-const SchemaVersion = 1
-
 // coreDDL creates the tables and indexes. It uses unqualified
 // names because Open() sets search_path to the target schema.
 const coreDDL = `
@@ -50,6 +44,7 @@ CREATE TABLE IF NOT EXISTS messages (
     has_thinking   BOOLEAN NOT NULL DEFAULT FALSE,
     has_tool_use   BOOLEAN NOT NULL DEFAULT FALSE,
     content_length INT NOT NULL DEFAULT 0,
+    is_system      BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (session_id, ordinal),
     FOREIGN KEY (session_id)
         REFERENCES sessions(id) ON DELETE CASCADE
@@ -128,40 +123,7 @@ func EnsureSchema(
 			return fmt.Errorf("%s: %w", a.desc, err)
 		}
 	}
-
-	// Record schema version for future migration detection.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO sync_metadata (key, value)
-		 VALUES ('schema_version', $1)
-		 ON CONFLICT (key) DO UPDATE
-		 SET value = EXCLUDED.value
-		 WHERE sync_metadata.value::int < EXCLUDED.value::int`,
-		fmt.Sprintf("%d", SchemaVersion),
-	); err != nil {
-		return fmt.Errorf("setting schema version: %w", err)
-	}
 	return nil
-}
-
-// GetSchemaVersion reads the schema version from sync_metadata.
-// Returns 0 if the key is missing (pre-versioned schema).
-func GetSchemaVersion(
-	ctx context.Context, db *sql.DB,
-) (int, error) {
-	var v int
-	err := db.QueryRowContext(ctx,
-		`SELECT value::int FROM sync_metadata
-		 WHERE key = 'schema_version'`,
-	).Scan(&v)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf(
-			"reading schema version: %w", err,
-		)
-	}
-	return v, nil
 }
 
 // CheckSchemaCompat verifies that the PG schema has all columns
@@ -187,6 +149,16 @@ func CheckSchemaCompat(
 	if err != nil {
 		return fmt.Errorf(
 			"tool_calls table missing required columns: %w",
+			err,
+		)
+	}
+	rows.Close()
+
+	rows, err = db.QueryContext(ctx,
+		`SELECT is_system FROM messages LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"messages table missing is_system column: %w",
 			err,
 		)
 	}

@@ -681,19 +681,26 @@ func (s *Sync) pushMessages(
 
 	var pgCount int
 	var pgContentSum, pgContentMax, pgContentMin int64
+	// Exact string fingerprint for the system-message ordinal set:
+	// STRING_AGG produces e.g. "0,2,5" — impossible to collide for
+	// distinct ordinal sets (unlike SUM or SUM+SUM-of-squares).
+	var pgSystemFP sql.NullString
 	var pgToolCallCount int
 	var pgTCContentSum int64
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*),
 			COALESCE(SUM(content_length), 0),
 			COALESCE(MAX(content_length), 0),
-			COALESCE(MIN(content_length), 0)
+			COALESCE(MIN(content_length), 0),
+			STRING_AGG(ordinal::text, ',' ORDER BY ordinal)
+				FILTER (WHERE is_system)
 		 FROM messages
 		 WHERE session_id = $1`,
 		sessionID,
 	).Scan(
 		&pgCount, &pgContentSum,
 		&pgContentMax, &pgContentMin,
+		&pgSystemFP,
 	); err != nil {
 		return 0, fmt.Errorf(
 			"counting pg messages: %w", err,
@@ -719,6 +726,12 @@ func (s *Sync) pushMessages(
 				err,
 			)
 		}
+		localSysFP, err := s.local.SystemMessageFingerprint(sessionID)
+		if err != nil {
+			return 0, fmt.Errorf(
+				"computing local system message fingerprint: %w", err,
+			)
+		}
 		localTCCount, err := s.local.ToolCallCount(sessionID)
 		if err != nil {
 			return 0, fmt.Errorf(
@@ -735,6 +748,7 @@ func (s *Sync) pushMessages(
 		if localSum == pgContentSum &&
 			localMax == pgContentMax &&
 			localMin == pgContentMin &&
+			localSysFP == pgSystemFP.String &&
 			localTCCount == pgToolCallCount &&
 			localTCSum == pgTCContentSum {
 			return 0, nil
@@ -816,17 +830,17 @@ func bulkInsertMessages(
 		b.WriteString(`INSERT INTO messages (
 			session_id, ordinal, role, content,
 			timestamp, has_thinking, has_tool_use,
-			content_length) VALUES `)
-		args := make([]any, 0, len(batch)*8)
+			content_length, is_system) VALUES `)
+		args := make([]any, 0, len(batch)*9)
 		for j, m := range batch {
 			if j > 0 {
 				b.WriteByte(',')
 			}
-			p := j*8 + 1
+			p := j*9 + 1
 			fmt.Fprintf(&b,
-				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
 				p, p+1, p+2, p+3,
-				p+4, p+5, p+6, p+7,
+				p+4, p+5, p+6, p+7, p+8,
 			)
 			var ts any
 			if m.Timestamp != "" {
@@ -840,7 +854,7 @@ func bulkInsertMessages(
 				sessionID, m.Ordinal, m.Role,
 				sanitizePG(m.Content), ts,
 				m.HasThinking,
-				m.HasToolUse, m.ContentLength,
+				m.HasToolUse, m.ContentLength, m.IsSystem,
 			)
 		}
 		if _, err := tx.ExecContext(

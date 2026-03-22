@@ -55,6 +55,14 @@ func runPGPush(args []string) {
 	}
 	setupLogFile(appCfg.DataDir)
 
+	pgCfg, err := appCfg.ResolvePG()
+	if err != nil {
+		fatal("pg push: %v", err)
+	}
+	if pgCfg.URL == "" {
+		fatal("pg push: url not configured")
+	}
+
 	database, err := db.Open(appCfg.DBPath)
 	if err != nil {
 		fatal("opening database: %v", err)
@@ -77,14 +85,6 @@ func runPGPush(args []string) {
 	// since watermarks become stale after a local rebuild.
 	didResync := runLocalSync(appCfg, database, *full)
 	forceFull := *full || didResync
-
-	pgCfg, err := appCfg.ResolvePG()
-	if err != nil {
-		fatal("pg push: %v", err)
-	}
-	if pgCfg.URL == "" {
-		fatal("pg push: url not configured")
-	}
 
 	ps, err := postgres.New(
 		pgCfg.URL, pgCfg.Schema, database,
@@ -216,7 +216,9 @@ func runPGServe(args []string) {
 	if err := postgres.CheckSchemaCompat(
 		ctx, store.DB(),
 	); err != nil {
-		fatal("pg serve: schema incompatible: %v", err)
+		fatal("pg serve: schema incompatible: %v\n"+
+			"Drop and recreate the PG schema, then run "+
+			"'agentsview pg push --full' to repopulate.", err)
 	}
 
 	appCfg.Host = *host
