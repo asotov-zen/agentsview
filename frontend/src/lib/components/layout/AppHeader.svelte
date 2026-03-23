@@ -70,6 +70,24 @@
 <header class="header">
   <div class="header-left">
     <button
+      class="hamburger"
+      onclick={() => {
+        if (ui.isMobileViewport && router.route !== "sessions") {
+          sessions.deselectSession();
+          router.navigate("sessions");
+          ui.sidebarOpen = true;
+        } else {
+          ui.toggleSidebar();
+        }
+      }}
+      title="Toggle sidebar (b)"
+      aria-label="Toggle sidebar"
+    >
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+        <path d="M1 2.75A.75.75 0 011.75 2h12.5a.75.75 0 010 1.5H1.75A.75.75 0 011 2.75zm0 5A.75.75 0 011.75 7h12.5a.75.75 0 010 1.5H1.75A.75.75 0 011 7.75zm0 5a.75.75 0 01.75-.75h12.5a.75.75 0 010 1.5H1.75a.75.75 0 01-.75-.75z"/>
+      </svg>
+    </button>
+    <button
       class="header-home"
       onclick={() => {
         sessions.deselectSession();
@@ -101,11 +119,12 @@
         router.navigate("sessions");
       }}
       title="Sessions"
+      aria-label="Sessions"
     >
       <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
         <path d="M0 1.5A1.5 1.5 0 011.5 0h2A1.5 1.5 0 015 1.5v2A1.5 1.5 0 013.5 5h-2A1.5 1.5 0 010 3.5v-2zm6 0A1.5 1.5 0 017.5 0h2A1.5 1.5 0 0111 1.5v2A1.5 1.5 0 019.5 5h-2A1.5 1.5 0 016 3.5v-2zm5 0A1.5 1.5 0 0112.5 0h2A1.5 1.5 0 0116 1.5v2A1.5 1.5 0 0114.5 5h-2A1.5 1.5 0 0111 3.5v-2zM0 7.5A1.5 1.5 0 011.5 6h2A1.5 1.5 0 015 7.5v2A1.5 1.5 0 013.5 11h-2A1.5 1.5 0 010 9.5v-2zm6 0A1.5 1.5 0 017.5 6h2A1.5 1.5 0 0111 7.5v2A1.5 1.5 0 019.5 11h-2A1.5 1.5 0 016 9.5v-2zm5 0A1.5 1.5 0 0112.5 6h2A1.5 1.5 0 0116 7.5v2a1.5 1.5 0 01-1.5 1.5h-2A1.5 1.5 0 0111 9.5v-2zM0 13.5A1.5 1.5 0 011.5 12h2A1.5 1.5 0 015 13.5v2A1.5 1.5 0 013.5 17h-2A1.5 1.5 0 010 15.5v-2zm6 0A1.5 1.5 0 017.5 12h2a1.5 1.5 0 011.5 1.5v2A1.5 1.5 0 019.5 17h-2A1.5 1.5 0 016 15.5v-2zm5 0a1.5 1.5 0 011.5-1.5h2a1.5 1.5 0 011.5 1.5v2a1.5 1.5 0 01-1.5 1.5h-2a1.5 1.5 0 01-1.5-1.5v-2z"/>
       </svg>
-      Sessions
+      <span class="nav-label">Sessions</span>
     </button>
 
     <button
@@ -113,11 +132,12 @@
       class:active={router.route === "pinned"}
       onclick={() => router.navigate("pinned")}
       title="Pinned Messages"
+      aria-label="Pinned"
     >
       <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
         <path d="M4.146.146A.5.5 0 014.5 0h7a.5.5 0 01.5.5c0 .68-.342 1.174-.646 1.479-.126.125-.25.224-.354.298v4.431l.078.048c.203.127.476.314.751.555C12.36 7.775 13 8.527 13 9.5a.5.5 0 01-.5.5H8.5v5.5a.5.5 0 01-1 0V10H3.5a.5.5 0 01-.5-.5c0-.973.64-1.725 1.17-2.189A6 6 0 015 6.708V2.277a3 3 0 01-.354-.298C4.342 1.674 4 1.179 4 .5a.5.5 0 01.146-.354z"/>
       </svg>
-      Pinned
+      <span class="nav-label">Pinned</span>
     </button>
 
     <button
@@ -125,12 +145,13 @@
       class:active={router.route === "insights"}
       onclick={() => router.navigate("insights")}
       title="Insights"
+      aria-label="Insights"
     >
       <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
         <path d="M14.5 3a.5.5 0 01.5.5v9a.5.5 0 01-.5.5h-13a.5.5 0 01-.5-.5v-9a.5.5 0 01.5-.5h13zm-13-1A1.5 1.5 0 000 3.5v9A1.5 1.5 0 001.5 14h13a1.5 1.5 0 001.5-1.5v-9A1.5 1.5 0 0014.5 2h-13z"/>
         <path d="M3 5.5a.5.5 0 01.5-.5h9a.5.5 0 010 1h-9a.5.5 0 01-.5-.5zM3 8a.5.5 0 01.5-.5h9a.5.5 0 010 1h-9A.5.5 0 013 8zm0 2.5a.5.5 0 01.5-.5h6a.5.5 0 010 1h-6a.5.5 0 01-.5-.5z"/>
       </svg>
-      Insights
+      <span class="nav-label">Insights</span>
     </button>
 
     <button
@@ -138,12 +159,13 @@
       class:active={router.route === "trash"}
       onclick={() => router.navigate("trash")}
       title="Trash"
+      aria-label="Trash"
     >
       <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
         <path d="M5.5 5.5A.5.5 0 016 6v6a.5.5 0 01-1 0V6a.5.5 0 01.5-.5zm2.5 0a.5.5 0 01.5.5v6a.5.5 0 01-1 0V6a.5.5 0 01.5-.5zm3 .5a.5.5 0 00-1 0v6a.5.5 0 001 0V6z"/>
         <path fill-rule="evenodd" d="M14.5 3a1 1 0 01-1 1H13v9a2 2 0 01-2 2H5a2 2 0 01-2-2V4h-.5a1 1 0 01-1-1V2a1 1 0 011-1H5.5l1-1h3l1 1h2.5a1 1 0 011 1v1zM4.118 4L4 4.059V13a1 1 0 001 1h6a1 1 0 001-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
       </svg>
-      Trash
+      <span class="nav-label">Trash</span>
     </button>
   </div>
 
@@ -340,7 +362,7 @@
 
 <style>
   .header {
-    height: 40px;
+    height: var(--header-height, 40px);
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -609,5 +631,58 @@
 
   .block-filter-reset:hover {
     color: var(--text-primary);
+  }
+
+  .hamburger {
+    display: flex;
+    width: 28px;
+    height: 28px;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    transition: background 0.12s, color 0.12s;
+  }
+
+  .hamburger:hover {
+    background: var(--bg-surface-hover);
+    color: var(--text-primary);
+  }
+
+  @media (max-width: 1023px) {
+    .nav-label {
+      display: none;
+    }
+
+    .search-hint-text {
+      display: none;
+    }
+
+    .search-hint-kbd {
+      display: none;
+    }
+
+    .hamburger {
+      display: flex;
+    }
+  }
+
+  @media (max-width: 767px) {
+    .header-left .nav-btn {
+      display: none;
+    }
+
+    .header-left :global(.typeahead) {
+      display: none;
+    }
+  }
+
+  @media (pointer: coarse) {
+    .header-btn,
+    .nav-btn,
+    .hamburger {
+      min-width: 44px;
+      min-height: 44px;
+    }
   }
 </style>

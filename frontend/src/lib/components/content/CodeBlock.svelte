@@ -51,4 +51,10 @@
   .code-content code {
     font-family: inherit;
   }
+
+  @media (max-width: 767px) {
+    .code-content {
+      max-width: calc(100vw - 32px);
+    }
+  }
 </style>

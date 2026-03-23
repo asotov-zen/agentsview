@@ -204,6 +204,17 @@ export function registerShortcuts(
       "?": () => {
         ui.activeModal = "shortcuts";
       },
+      b: () => {
+        if (router.route === "sessions") {
+          ui.toggleSidebar();
+        } else if (ui.isMobileViewport) {
+          sessions.deselectSession();
+          router.navigate("sessions");
+          ui.sidebarOpen = true;
+        } else {
+          ui.toggleSidebar();
+        }
+      },
     };
 
     const action = keyActions[e.key];

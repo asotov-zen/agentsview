@@ -72,6 +72,9 @@
         ui.pendingScrollSession = null;
       }
       if (id) {
+        if (ui.isMobileViewport) {
+          ui.closeSidebar();
+        }
         messages.loadSession(id);
         sessions.loadChildSessions(id);
         sync.watchSession(id, () => {

@@ -2,6 +2,7 @@ import {
   describe,
   it,
   expect,
+  vi,
   beforeEach,
 } from "vitest";
 import { ui } from "./ui.svelte.js";
@@ -255,6 +256,75 @@ describe("UIStore", () => {
       ui.showAllBlocks();
       expect(ui.hiddenBlockCount).toBe(0);
       expect(ui.hasBlockFilters).toBe(false);
+    });
+  });
+
+  describe("sidebar", () => {
+    beforeEach(() => {
+      ui.sidebarOpen = true;
+    });
+
+    it("should default to open", () => {
+      expect(ui.sidebarOpen).toBe(true);
+    });
+
+    it("should toggle sidebar", () => {
+      ui.toggleSidebar();
+      expect(ui.sidebarOpen).toBe(false);
+
+      ui.toggleSidebar();
+      expect(ui.sidebarOpen).toBe(true);
+    });
+
+    it("should close sidebar", () => {
+      ui.closeSidebar();
+      expect(ui.sidebarOpen).toBe(false);
+    });
+
+    it("closeSidebar should be idempotent", () => {
+      ui.closeSidebar();
+      ui.closeSidebar();
+      expect(ui.sidebarOpen).toBe(false);
+    });
+
+    it("isMobileViewport should default to false in test environment", () => {
+      // matchMedia is unavailable in test env, so isMobileViewport
+      // stays at its initial value (false = desktop assumption).
+      expect(ui.isMobileViewport).toBe(false);
+    });
+
+    it("should initialize sidebar closed on narrow viewport", async () => {
+      const originalMatchMedia = window.matchMedia;
+      window.matchMedia = vi.fn().mockReturnValue({
+        matches: false,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      }) as unknown as typeof window.matchMedia;
+      try {
+        // @ts-expect-error -- cache bust for fresh UIStore
+        const mod = await import("./ui.svelte.js?narrowViewport");
+        expect(mod.ui.sidebarOpen).toBe(false);
+        expect(mod.ui.isMobileViewport).toBe(true);
+      } finally {
+        window.matchMedia = originalMatchMedia;
+      }
+    });
+
+    it("should initialize sidebar open on wide viewport", async () => {
+      const originalMatchMedia = window.matchMedia;
+      window.matchMedia = vi.fn().mockReturnValue({
+        matches: true,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      }) as unknown as typeof window.matchMedia;
+      try {
+        // @ts-expect-error -- cache bust for fresh UIStore
+        const mod = await import("./ui.svelte.js?wideViewport");
+        expect(mod.ui.sidebarOpen).toBe(true);
+        expect(mod.ui.isMobileViewport).toBe(false);
+      } finally {
+        window.matchMedia = originalMatchMedia;
+      }
     });
   });
 

@@ -108,7 +108,7 @@
 
 <style>
   .status-bar {
-    height: 24px;
+    height: var(--status-bar-height, 24px);
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -206,5 +206,11 @@
   .zoom-level:hover {
     background: var(--bg-surface-hover);
     color: var(--text-secondary);
+  }
+
+  @media (max-width: 767px) {
+    .status-left {
+      display: none;
+    }
   }
 </style>

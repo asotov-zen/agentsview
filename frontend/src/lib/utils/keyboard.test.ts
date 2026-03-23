@@ -9,6 +9,7 @@ import {
 import { ui } from "../stores/ui.svelte.js";
 import { sessions } from "../stores/sessions.svelte.js";
 import { starred } from "../stores/starred.svelte.js";
+import { router } from "../stores/router.svelte.js";
 import { registerShortcuts } from "./keyboard.js";
 
 function fireKey(
@@ -279,6 +280,59 @@ describe("registerShortcuts", () => {
 
       // Should remain unchanged since filtered list is empty
       expect(sessions.activeSessionId).toBe("s1");
+    });
+  });
+
+  describe("b shortcut (toggle sidebar)", () => {
+    it("should toggle sidebar on sessions route", () => {
+      router.navigate("sessions");
+      ui.sidebarOpen = true;
+      fireKey("b");
+      expect(ui.sidebarOpen).toBe(false);
+
+      fireKey("b");
+      expect(ui.sidebarOpen).toBe(true);
+    });
+
+    it("should navigate to sessions on non-session routes when mobile", () => {
+      router.navigate("insights");
+      ui.isMobileViewport = true;
+      ui.sidebarOpen = false;
+      fireKey("b");
+      expect(router.route).toBe("sessions");
+      expect(ui.sidebarOpen).toBe(true);
+      ui.isMobileViewport = false;
+    });
+
+    it("should toggle sidebar on non-session routes when desktop", () => {
+      router.navigate("insights");
+      ui.isMobileViewport = false;
+      ui.sidebarOpen = true;
+      fireKey("b");
+      expect(ui.sidebarOpen).toBe(false);
+      expect(router.route).toBe("insights");
+    });
+
+    it("should not toggle sidebar when modal is open", () => {
+      router.navigate("sessions");
+      ui.sidebarOpen = true;
+      ui.activeModal = "shortcuts";
+      fireKey("b");
+      expect(ui.sidebarOpen).toBe(true);
+    });
+
+    it("should not toggle sidebar when input is focused", () => {
+      router.navigate("sessions");
+      ui.sidebarOpen = true;
+      const input = document.createElement("input");
+      document.body.appendChild(input);
+      input.focus();
+      try {
+        fireKey("b");
+        expect(ui.sidebarOpen).toBe(true);
+      } finally {
+        document.body.removeChild(input);
+      }
     });
   });
 

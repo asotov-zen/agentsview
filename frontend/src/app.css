@@ -49,6 +49,8 @@
     "Fira Mono", Menlo, Consolas, monospace;
   --viewport-indicator: rgba(0, 0, 0, 0.08);
   --overlay-bg: rgba(0, 0, 0, 0.3);
+  --header-height: 40px;
+  --status-bar-height: 24px;
   color-scheme: light;
 }
 
@@ -87,6 +89,8 @@
   --shadow-lg: 0 4px 16px rgba(0, 0, 0, 0.4);
   --viewport-indicator: rgba(255, 255, 255, 0.08);
   --overlay-bg: rgba(0, 0, 0, 0.6);
+  --header-height: 40px;
+  --status-bar-height: 24px;
   color-scheme: dark;
 }
 
@@ -318,5 +322,12 @@ mark.search-highlight--current {
 @keyframes modal-spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+/* Enlarge header on touch devices so layout offsets stay in sync */
+@media (pointer: coarse) {
+  :root {
+    --header-height: 44px;
   }
 }
