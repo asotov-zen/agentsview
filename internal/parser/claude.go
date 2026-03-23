@@ -848,7 +848,13 @@ func truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	return s[:maxLen] + "..."
+	// Truncate at a valid rune boundary to avoid producing
+	// invalid UTF-8.
+	r := []rune(s)
+	if len(r) <= maxLen {
+		return s
+	}
+	return string(r[:maxLen]) + "..."
 }
 
 // claudeProviderID returns the provider for a Claude model ID.

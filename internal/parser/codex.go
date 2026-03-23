@@ -15,6 +15,7 @@ import (
 const (
 	codexTypeSessionMeta  = "session_meta"
 	codexTypeResponseItem = "response_item"
+	codexTypeTurnContext  = "turn_context"
 	codexOriginatorExec   = "codex_exec"
 )
 
@@ -31,6 +32,7 @@ type codexSessionBuilder struct {
 	modelID      string // latest model from turn_context
 	ordinal      int
 	includeExec  bool
+	currentModel string
 }
 
 func newCodexSessionBuilder(
@@ -66,10 +68,11 @@ func (b *codexSessionBuilder) processLine(
 	switch gjson.Get(line, "type").Str {
 	case codexTypeSessionMeta:
 		return b.handleSessionMeta(payload)
-	case "turn_context":
+	case codexTypeTurnContext:
 		if m := payload.Get("model").Str; m != "" {
 			b.modelID = m
 		}
+		b.currentModel = payload.Get("model").Str
 	case codexTypeResponseItem:
 		b.handleResponseItem(payload, ts)
 	}
@@ -139,6 +142,7 @@ func (b *codexSessionBuilder) handleResponseItem(
 		ContentLength: len(content),
 		ModelID:       modelID,
 		ProviderID:    providerID,
+		Model:         b.currentModel,
 	})
 	b.ordinal++
 }
@@ -169,6 +173,7 @@ func (b *codexSessionBuilder) handleFunctionCall(
 		ContentLength: len(content),
 		ModelID:       modelID,
 		ProviderID:    providerID,
+		Model:         b.currentModel,
 		ToolCalls: []ParsedToolCall{{
 			ToolName:  name,
 			Category:  NormalizeToolCategory(name),

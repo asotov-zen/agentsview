@@ -40,7 +40,18 @@ const AUTH_TOKEN_KEY = "agentsview-auth-token";
 
 function getBase(): string {
   const server = getServerUrl();
-  return server ? `${server}/api/v1` : "/api/v1";
+  if (server) return `${server}/api/v1`;
+  // Use the <base href> tag injected by --base-path so the app
+  // works behind a reverse-proxy subpath (e.g. /agentsview/api/v1).
+  // Only derive from baseURI when a real <base> tag exists;
+  // otherwise fall back to "/api/v1" so SPA fallback pages on
+  // non-root URLs don't produce wrong API paths.
+  const baseEl = document.querySelector("base[href]");
+  if (baseEl) {
+    const base = new URL(document.baseURI).pathname.replace(/\/$/, "");
+    return `${base}/api/v1`;
+  }
+  return "/api/v1";
 }
 
 export function getServerUrl(): string {

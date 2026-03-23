@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -12,11 +13,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/wesm/agentsview/internal/parser"
 )
 
@@ -24,65 +28,74 @@ import (
 type TerminalConfig struct {
 	// Mode: "auto" (detect terminal), "custom" (use CustomBin),
 	// or "clipboard" (never launch, always copy).
-	Mode string `json:"mode"`
+	Mode string `json:"mode" toml:"mode"`
 	// CustomBin is the terminal binary path (used when Mode == "custom").
-	CustomBin string `json:"custom_bin,omitempty"`
+	CustomBin string `json:"custom_bin,omitempty" toml:"custom_bin"`
 	// CustomArgs is a template for terminal args. Use {cmd} as
 	// placeholder for the resume command (e.g. "-- bash -c {cmd}").
-	CustomArgs string `json:"custom_args,omitempty"`
+	CustomArgs string `json:"custom_args,omitempty" toml:"custom_args"`
 }
 
 // ProxyConfig controls an optional managed reverse proxy.
 type ProxyConfig struct {
 	// Mode enables a managed proxy implementation.
 	// Currently supported: "caddy".
-	Mode string `json:"mode,omitempty"`
+	Mode string `json:"mode,omitempty" toml:"mode"`
 	// Bin overrides the proxy executable path.
-	Bin string `json:"bin,omitempty"`
+	Bin string `json:"bin,omitempty" toml:"bin"`
 	// BindHost is the local interface/IP the proxy binds to.
-	BindHost string `json:"bind_host,omitempty"`
+	BindHost string `json:"bind_host,omitempty" toml:"bind_host"`
 	// PublicPort is the external port exposed by the proxy.
-	PublicPort int `json:"public_port,omitempty"`
+	PublicPort int `json:"public_port,omitempty" toml:"public_port"`
 	// TLSCert and TLSKey are used by managed HTTPS mode.
-	TLSCert string `json:"tls_cert,omitempty"`
-	TLSKey  string `json:"tls_key,omitempty"`
+	TLSCert string `json:"tls_cert,omitempty" toml:"tls_cert"`
+	TLSKey  string `json:"tls_key,omitempty" toml:"tls_key"`
 	// AllowedSubnets restrict inbound clients to these CIDRs.
-	AllowedSubnets []string `json:"allowed_subnets,omitempty"`
+	AllowedSubnets []string `json:"allowed_subnets,omitempty" toml:"allowed_subnets"`
+}
+
+// PGConfig holds PostgreSQL connection settings.
+type PGConfig struct {
+	URL           string `toml:"url" json:"url"`
+	Schema        string `toml:"schema" json:"schema"`
+	MachineName   string `toml:"machine_name" json:"machine_name"`
+	AllowInsecure bool   `toml:"allow_insecure" json:"allow_insecure"`
 }
 
 // Config holds all application configuration.
 type Config struct {
-	Host                 string         `json:"host"`
-	Port                 int            `json:"port"`
-	NoBrowser            bool           `json:"no_browser"`
-	DataDir              string         `json:"data_dir"`
-	DBPath               string         `json:"-"`
-	PublicURL            string         `json:"public_url,omitempty"`
-	PublicOrigins        []string       `json:"public_origins,omitempty"`
-	Proxy                ProxyConfig    `json:"proxy,omitempty"`
-	WatchExcludePatterns []string       `json:"watch_exclude_patterns,omitempty"`
-	CursorSecret         string         `json:"cursor_secret"`
-	GithubToken          string         `json:"github_token,omitempty"`
-	Terminal             TerminalConfig `json:"terminal,omitempty"`
-	AuthToken            string         `json:"auth_token,omitempty"`
-	RemoteAccess         bool           `json:"remote_access"`
-	WriteTimeout         time.Duration  `json:"-"`
+	Host                 string         `json:"host" toml:"host"`
+	Port                 int            `json:"port" toml:"port"`
+	DataDir              string         `json:"data_dir" toml:"data_dir"`
+	DBPath               string         `json:"-" toml:"-"`
+	PublicURL            string         `json:"public_url,omitempty" toml:"public_url"`
+	PublicOrigins        []string       `json:"public_origins,omitempty" toml:"public_origins"`
+	Proxy                ProxyConfig    `json:"proxy,omitempty" toml:"proxy"`
+	WatchExcludePatterns []string       `json:"watch_exclude_patterns,omitempty" toml:"watch_exclude_patterns"`
+	CursorSecret         string         `json:"cursor_secret" toml:"cursor_secret"`
+	GithubToken          string         `json:"github_token,omitempty" toml:"github_token"`
+	Terminal             TerminalConfig `json:"terminal,omitempty" toml:"terminal"`
+	AuthToken            string         `json:"auth_token,omitempty" toml:"auth_token"`
+	RemoteAccess         bool           `json:"remote_access" toml:"remote_access"`
+	NoBrowser            bool           `json:"no_browser" toml:"no_browser"`
+	PG                   PGConfig       `json:"pg,omitempty" toml:"pg"`
+	WriteTimeout         time.Duration  `json:"-" toml:"-"`
 
 	// AgentDirs maps each AgentType to its configured
 	// directories. Single-dir agents store a one-element
 	// slice; unconfigured agents use nil.
-	AgentDirs map[parser.AgentType][]string `json:"-"`
+	AgentDirs map[parser.AgentType][]string `json:"-" toml:"-"`
 
 	// agentDirSource tracks how each agent's dirs were
 	// set so loadFile doesn't override env-set values.
 	agentDirSource map[parser.AgentType]dirSource
 
-	ResultContentBlockedCategories []string `json:"result_content_blocked_categories,omitempty"`
+	ResultContentBlockedCategories []string `json:"result_content_blocked_categories,omitempty" toml:"result_content_blocked_categories"`
 
 	// HostExplicit is true when the user passed --host on the CLI.
 	// Used to prevent auto-bind to 0.0.0.0 when the user
 	// explicitly requested a specific host.
-	HostExplicit bool `json:"-"`
+	HostExplicit bool `json:"-" toml:"-"`
 }
 
 type dirSource int
@@ -182,31 +195,73 @@ func LoadMinimal() (Config, error) {
 }
 
 func (c *Config) configPath() string {
+	return filepath.Join(c.DataDir, "config.toml")
+}
+
+func (c *Config) jsonConfigPath() string {
 	return filepath.Join(c.DataDir, "config.json")
 }
 
-func (c *Config) loadFile() error {
-	data, err := os.ReadFile(c.configPath())
+// migrateJSONToTOML converts config.json to config.toml if
+// config.json exists and config.toml does not. The original
+// JSON file is renamed to config.json.bak.
+func (c *Config) migrateJSONToTOML() error {
+	jsonPath := c.jsonConfigPath()
+	tomlPath := c.configPath()
+
+	if _, err := os.Stat(tomlPath); err == nil {
+		return nil // TOML already exists
+	}
+	data, err := os.ReadFile(jsonPath)
 	if os.IsNotExist(err) {
-		return nil
+		return nil // no JSON to migrate
 	}
 	if err != nil {
+		return fmt.Errorf("reading config.json for migration: %w", err)
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return fmt.Errorf("parsing config.json for migration: %w", err)
+	}
+
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(m); err != nil {
+		return fmt.Errorf("encoding config.toml: %w", err)
+	}
+	if err := os.WriteFile(tomlPath, buf.Bytes(), 0o600); err != nil {
+		return fmt.Errorf("writing config.toml: %w", err)
+	}
+	if err := os.Rename(jsonPath, jsonPath+".bak"); err != nil {
+		return fmt.Errorf("renaming config.json to .bak: %w", err)
+	}
+	return nil
+}
+
+func (c *Config) loadFile() error {
+	if err := c.migrateJSONToTOML(); err != nil {
 		return err
 	}
 
-	var file struct {
-		GithubToken                    string         `json:"github_token"`
-		CursorSecret                   string         `json:"cursor_secret"`
-		PublicURL                      string         `json:"public_url"`
-		PublicOrigins                  []string       `json:"public_origins"`
-		Proxy                          ProxyConfig    `json:"proxy"`
-		WatchExcludePatterns           []string       `json:"watch_exclude_patterns"`
-		ResultContentBlockedCategories []string       `json:"result_content_blocked_categories"`
-		Terminal                       TerminalConfig `json:"terminal"`
-		AuthToken                      string         `json:"auth_token"`
-		RemoteAccess                   bool           `json:"remote_access"`
+	path := c.configPath()
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil
 	}
-	if err := json.Unmarshal(data, &file); err != nil {
+
+	var file struct {
+		GithubToken                    string         `toml:"github_token"`
+		CursorSecret                   string         `toml:"cursor_secret"`
+		PublicURL                      string         `toml:"public_url"`
+		PublicOrigins                  []string       `toml:"public_origins"`
+		Proxy                          ProxyConfig    `toml:"proxy"`
+		WatchExcludePatterns           []string       `toml:"watch_exclude_patterns"`
+		ResultContentBlockedCategories []string       `toml:"result_content_blocked_categories"`
+		Terminal                       TerminalConfig `toml:"terminal"`
+		AuthToken                      string         `toml:"auth_token"`
+		RemoteAccess                   bool           `toml:"remote_access"`
+		PG                             PGConfig       `toml:"pg"`
+	}
+	if _, err := toml.DecodeFile(path, &file); err != nil {
 		return fmt.Errorf("parsing config: %w", err)
 	}
 	if file.GithubToken != "" {
@@ -240,11 +295,25 @@ func (c *Config) loadFile() error {
 		c.AuthToken = file.AuthToken
 	}
 	c.RemoteAccess = file.RemoteAccess
+	// Merge pg field-by-field so env vars override only
+	// the fields they set, preserving config-file settings.
+	if file.PG.URL != "" && c.PG.URL == "" {
+		c.PG.URL = file.PG.URL
+	}
+	if file.PG.Schema != "" && c.PG.Schema == "" {
+		c.PG.Schema = file.PG.Schema
+	}
+	if file.PG.MachineName != "" && c.PG.MachineName == "" {
+		c.PG.MachineName = file.PG.MachineName
+	}
+	if file.PG.AllowInsecure {
+		c.PG.AllowInsecure = true
+	}
 
 	// Parse config-file dir arrays for agents that have a
 	// ConfigKey. Only apply when not already set by env var.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
+	var raw map[string]any
+	if _, err := toml.DecodeFile(path, &raw); err != nil {
 		return fmt.Errorf("parsing config raw: %w", err)
 	}
 	for _, def := range parser.Registry {
@@ -258,13 +327,26 @@ func (c *Config) loadFile() error {
 		if c.agentDirSource[def.Type] == dirEnv {
 			continue
 		}
-		var dirs []string
-		if err := json.Unmarshal(rawVal, &dirs); err != nil {
+		rawSlice, ok := rawVal.([]any)
+		if !ok {
 			log.Printf(
-				"config: %s: expected string array: %v",
-				def.ConfigKey, err,
+				"config: %s: expected string array: got %T",
+				def.ConfigKey, rawVal,
 			)
 			continue
+		}
+		dirs := make([]string, 0, len(rawSlice))
+		for _, v := range rawSlice {
+			s, ok := v.(string)
+			if !ok {
+				log.Printf(
+					"config: %s: expected string array: element is %T",
+					def.ConfigKey, v,
+				)
+				dirs = nil
+				break
+			}
+			dirs = append(dirs, s)
 		}
 		if len(dirs) > 0 {
 			c.AgentDirs[def.Type] = dirs
@@ -290,24 +372,39 @@ func (c *Config) ensureCursorSecret() error {
 		return fmt.Errorf("creating data dir: %w", err)
 	}
 
-	existing := make(map[string]any)
-	data, err := os.ReadFile(c.configPath())
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("reading config: %w", err)
-	}
-	if err == nil {
-		if err := json.Unmarshal(data, &existing); err != nil {
-			return fmt.Errorf("existing config invalid: %w", err)
-		}
+	existing, err := c.readConfigMap()
+	if err != nil {
+		return err
 	}
 
 	existing["cursor_secret"] = secret
-	out, err := json.MarshalIndent(existing, "", "  ")
-	if err != nil {
+	return c.writeConfigMap(existing)
+}
+
+// readConfigMap reads the TOML config file into a map. Returns
+// an empty map if the file does not exist.
+func (c *Config) readConfigMap() (map[string]any, error) {
+	existing := make(map[string]any)
+	data, err := os.ReadFile(c.configPath())
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("reading config: %w", err)
+	}
+	if err == nil {
+		if _, err := toml.Decode(string(data), &existing); err != nil {
+			return nil, fmt.Errorf("existing config invalid: %w", err)
+		}
+	}
+	return existing, nil
+}
+
+// writeConfigMap encodes a map as TOML and writes it to the
+// config file.
+func (c *Config) writeConfigMap(m map[string]any) error {
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(m); err != nil {
 		return fmt.Errorf("marshaling config: %w", err)
 	}
-
-	if err := os.WriteFile(c.configPath(), out, 0o600); err != nil {
+	if err := os.WriteFile(c.configPath(), buf.Bytes(), 0o600); err != nil {
 		return fmt.Errorf("writing config: %w", err)
 	}
 	return nil
@@ -322,6 +419,15 @@ func (c *Config) loadEnv() {
 	}
 	if v := os.Getenv("AGENT_VIEWER_DATA_DIR"); v != "" {
 		c.DataDir = v
+	}
+	if v := os.Getenv("AGENTSVIEW_PG_URL"); v != "" {
+		c.PG.URL = v
+	}
+	if v := os.Getenv("AGENTSVIEW_PG_SCHEMA"); v != "" {
+		c.PG.Schema = v
+	}
+	if v := os.Getenv("AGENTSVIEW_PG_MACHINE"); v != "" {
+		c.PG.MachineName = v
 	}
 }
 
@@ -422,6 +528,8 @@ func applyFlags(cfg *Config, fs *flag.FlagSet) {
 			cfg.Proxy.TLSKey = f.Value.String()
 		case "allowed-subnet":
 			cfg.Proxy.AllowedSubnets = splitFlagList(f.Value.String())
+		case "no-browser":
+			cfg.NoBrowser = f.Value.String() == "true"
 		}
 	})
 }
@@ -713,78 +821,138 @@ func ResolveDataDir() (string, error) {
 	return cfg.DataDir, nil
 }
 
+// ResolvePG returns a copy of PG config with defaults applied
+// and environment variables expanded in URL.
+func (c *Config) ResolvePG() (PGConfig, error) {
+	pg := c.PG
+	if pg.URL != "" {
+		expanded, err := expandBracedEnv(pg.URL)
+		if err != nil {
+			return pg, fmt.Errorf("expanding url: %w", err)
+		}
+		pg.URL = expanded
+	}
+	if pg.Schema == "" {
+		pg.Schema = "agentsview"
+	}
+	if pg.MachineName == "" {
+		h, err := os.Hostname()
+		if err != nil {
+			return pg, fmt.Errorf("os.Hostname failed (%w); set machine_name explicitly in config", err)
+		}
+		pg.MachineName = h
+	}
+	return pg, nil
+}
+
+var (
+	bracedEnvPattern      = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+	bareEnvPattern        = regexp.MustCompile(`^\$([A-Za-z_][A-Za-z0-9_]*)$`)
+	partialBareEnvPattern = regexp.MustCompile(`\$([A-Za-z_][A-Za-z0-9_]*)`)
+)
+
+// bareEnvWarned tracks which bare $VAR names have already been warned
+// about, so each distinct variable triggers a warning at most once.
+var bareEnvWarned sync.Map
+
+// ResetBareEnvWarned clears the warning dedup state. Exported for tests.
+func ResetBareEnvWarned() {
+	bareEnvWarned.Range(func(k, _ any) bool { bareEnvWarned.Delete(k); return true })
+}
+
+// expandBracedEnv expands ${VAR} references in s. As a convenience,
+// if the entire string is a single bare $VAR (e.g. "$PGURL"), it is
+// expanded as a whole-string shortcut. Bare $VAR references embedded
+// in a larger string (e.g. "postgres://$USER@host") are NOT expanded;
+// use ${VAR} syntax instead.
+func expandBracedEnv(s string) (string, error) {
+	if parts := bareEnvPattern.FindStringSubmatch(s); parts != nil {
+		val, ok := os.LookupEnv(parts[1])
+		if !ok {
+			return "", fmt.Errorf("environment variable %s is not set", parts[1])
+		}
+		return val, nil
+	}
+
+	// Warn about bare $VAR references that won't be expanded.
+	if remaining := bracedEnvPattern.ReplaceAllString(s, ""); partialBareEnvPattern.MatchString(remaining) {
+		for _, m := range partialBareEnvPattern.FindAllStringSubmatch(remaining, -1) {
+			if _, set := os.LookupEnv(m[1]); set {
+				if _, warned := bareEnvWarned.LoadOrStore(m[1], true); !warned {
+					log.Printf("warning: pg.url contains bare $%s which will NOT be expanded; use ${%s} syntax instead", m[1], m[1])
+				}
+			}
+		}
+	}
+
+	var missingVars []string
+	result := bracedEnvPattern.ReplaceAllStringFunc(s, func(match string) string {
+		name := bracedEnvPattern.FindStringSubmatch(match)[1]
+		val, ok := os.LookupEnv(name)
+		if !ok {
+			missingVars = append(missingVars, name)
+			return ""
+		}
+		return val
+	})
+	if len(missingVars) > 0 {
+		return "", fmt.Errorf("environment variable(s) not set: %s",
+			strings.Join(missingVars, ", "))
+	}
+	return result, nil
+}
+
 // SaveTerminalConfig persists terminal settings to the config file.
 func (c *Config) SaveTerminalConfig(tc TerminalConfig) error {
 	if err := os.MkdirAll(c.DataDir, 0o700); err != nil {
 		return fmt.Errorf("creating data dir: %w", err)
 	}
 
-	existing := make(map[string]any)
-	data, err := os.ReadFile(c.configPath())
-	if err != nil && !os.IsNotExist(err) {
+	existing, err := c.readConfigMap()
+	if err != nil {
 		return fmt.Errorf("reading config file: %w", err)
-	}
-	if err == nil {
-		if err := json.Unmarshal(data, &existing); err != nil {
-			return fmt.Errorf(
-				"existing config is invalid, cannot update: %w",
-				err,
-			)
-		}
 	}
 
 	existing["terminal"] = tc
-	out, err := json.MarshalIndent(existing, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshaling config: %w", err)
-	}
-
-	if err := os.WriteFile(c.configPath(), out, 0o600); err != nil {
-		return fmt.Errorf("writing config: %w", err)
+	if err := c.writeConfigMap(existing); err != nil {
+		return err
 	}
 	c.Terminal = tc
 	return nil
 }
 
 // SaveSettings persists a partial settings update to the config file.
-// The patch map contains JSON keys mapped to their new values. Only
+// The patch map contains config keys mapped to their new values. Only
 // the keys present in patch are written; other config keys are preserved.
 func (c *Config) SaveSettings(patch map[string]any) error {
 	if err := os.MkdirAll(c.DataDir, 0o700); err != nil {
 		return fmt.Errorf("creating data dir: %w", err)
 	}
 
-	existing := make(map[string]any)
-	data, err := os.ReadFile(c.configPath())
-	if err != nil && !os.IsNotExist(err) {
+	existing, err := c.readConfigMap()
+	if err != nil {
 		return fmt.Errorf("reading config file: %w", err)
-	}
-	if err == nil {
-		if err := json.Unmarshal(data, &existing); err != nil {
-			return fmt.Errorf(
-				"existing config is invalid, cannot update: %w",
-				err,
-			)
-		}
 	}
 
 	maps.Copy(existing, patch)
 
-	out, err := json.MarshalIndent(existing, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshaling config: %w", err)
-	}
-
-	if err := os.WriteFile(c.configPath(), out, 0o600); err != nil {
-		return fmt.Errorf("writing config: %w", err)
+	if err := c.writeConfigMap(existing); err != nil {
+		return err
 	}
 
 	// Update in-memory config for known keys.
 	if v, ok := patch["terminal"]; ok {
-		if b, err := json.Marshal(v); err == nil {
-			var tc TerminalConfig
-			if err := json.Unmarshal(b, &tc); err == nil {
-				c.Terminal = tc
+		if tc, ok := v.(TerminalConfig); ok {
+			c.Terminal = tc
+		} else if m, ok := v.(map[string]any); ok {
+			if s, ok := m["mode"].(string); ok {
+				c.Terminal.Mode = s
+			}
+			if s, ok := m["custom_bin"].(string); ok {
+				c.Terminal.CustomBin = s
+			}
+			if s, ok := m["custom_args"].(string); ok {
+				c.Terminal.CustomArgs = s
 			}
 		}
 	}
@@ -824,27 +992,13 @@ func (c *Config) EnsureAuthToken() error {
 		return fmt.Errorf("creating data dir: %w", err)
 	}
 
-	existing := make(map[string]any)
-	data, err := os.ReadFile(c.configPath())
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("reading config: %w", err)
-	}
-	if err == nil {
-		if err := json.Unmarshal(data, &existing); err != nil {
-			return fmt.Errorf("existing config invalid: %w", err)
-		}
+	existing, err := c.readConfigMap()
+	if err != nil {
+		return err
 	}
 
 	existing["auth_token"] = token
-	out, err := json.MarshalIndent(existing, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshaling config: %w", err)
-	}
-
-	if err := os.WriteFile(c.configPath(), out, 0o600); err != nil {
-		return fmt.Errorf("writing config: %w", err)
-	}
-	return nil
+	return c.writeConfigMap(existing)
 }
 
 // SaveGithubToken persists the GitHub token to the config file.
@@ -853,27 +1007,13 @@ func (c *Config) SaveGithubToken(token string) error {
 		return fmt.Errorf("creating data dir: %w", err)
 	}
 
-	existing := make(map[string]any)
-	data, err := os.ReadFile(c.configPath())
-	if err != nil && !os.IsNotExist(err) {
+	existing, err := c.readConfigMap()
+	if err != nil {
 		return fmt.Errorf("reading config file: %w", err)
-	}
-	if err == nil {
-		if err := json.Unmarshal(data, &existing); err != nil {
-			return fmt.Errorf(
-				"existing config is invalid, cannot update: %w",
-				err,
-			)
-		}
 	}
 
 	existing["github_token"] = token
-	out, err := json.MarshalIndent(existing, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshaling config: %w", err)
-	}
-
-	if err := os.WriteFile(c.configPath(), out, 0o600); err != nil {
+	if err := c.writeConfigMap(existing); err != nil {
 		return fmt.Errorf("writing config: %w", err)
 	}
 	c.GithubToken = token

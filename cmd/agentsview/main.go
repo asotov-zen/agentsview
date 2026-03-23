@@ -49,6 +49,12 @@ func main() {
 		case "sync":
 			runSync(os.Args[2:])
 			return
+		case "pg":
+			runPG(os.Args[2:])
+			return
+		case "token-use":
+			runTokenUse(os.Args[2:])
+			return
 		case "version", "--version", "-v":
 			fmt.Printf("agentsview %s (commit %s, built %s)\n",
 				version, commit, buildDate)
@@ -73,6 +79,10 @@ Usage:
   agentsview [flags]          Start the server (default command)
   agentsview serve [flags]    Start the server (explicit)
   agentsview sync [flags]     Sync session data without serving
+  agentsview pg push [flags]  Push local data to PostgreSQL
+  agentsview pg status        Show PG sync status
+  agentsview pg serve [flags] Serve from PostgreSQL (read-only)
+  agentsview token-use <id>   Show token usage for a session (JSON)
   agentsview prune [flags]    Delete sessions matching filters
   agentsview update [flags]   Check for and install updates
   agentsview version          Show version information
@@ -90,9 +100,17 @@ Server flags:
   -tls-cert string    TLS certificate path for managed Caddy HTTPS mode
   -tls-key string     TLS key path for managed Caddy HTTPS mode
   -allowed-subnet str Client CIDR allowed to connect to the managed proxy
+  -no-browser         Don't open browser on startup
 
 Sync flags:
   -full              Force a full resync regardless of data version
+
+PG push flags:
+  -full              Bypass per-message skip heuristic
+
+PG serve flags:
+  -host string       Host to bind to (default "127.0.0.1")
+  -port int          Port to listen on (default 8080)
 
 Prune flags:
   -project string     Sessions whose project contains this substring
@@ -117,21 +135,20 @@ Environment variables:
   IFLOW_DIR               iFlow projects directory
   AMP_DIR                 Amp threads directory
   AGENT_VIEWER_DATA_DIR   Data directory (database, config)
+  AGENTSVIEW_PG_URL       PostgreSQL connection URL for sync
+  AGENTSVIEW_PG_MACHINE   Machine name for PG sync
+  AGENTSVIEW_PG_SCHEMA    PG schema name (default "agentsview")
 
 Watcher excludes:
-  Add "watch_exclude_patterns" to ~/.agentsview/config.json to skip
+  Add "watch_exclude_patterns" to ~/.agentsview/config.toml to skip
   directory names/patterns while recursively watching roots.
   Example:
-  {
-    "watch_exclude_patterns": [".git", "node_modules", ".next", "dist"]
-  }
+  watch_exclude_patterns = [".git", "node_modules", ".next", "dist"]
 
 Multiple directories:
-  Add arrays to ~/.agentsview/config.json to scan multiple locations:
-  {
-    "claude_project_dirs": ["/path/one", "/path/two"],
-    "codex_sessions_dirs": ["/codex/a", "/codex/b"]
-  }
+  Add arrays to ~/.agentsview/config.toml to scan multiple locations:
+  claude_project_dirs = ["/path/one", "/path/two"]
+  codex_sessions_dirs = ["/codex/a", "/codex/b"]
   When set, these override the default directory. Environment variables
   override config file arrays.
 
@@ -166,9 +183,17 @@ func runServe(args []string) {
 	start := time.Now()
 	cfg := mustLoadConfig(args)
 	setupLogFile(cfg.DataDir)
+
 	if err := validateServeConfig(cfg); err != nil {
 		fatal("invalid serve config: %v", err)
 	}
+
+	// Write the startup lock immediately after config setup,
+	// before opening the DB, so token-use never sees a window
+	// with no lock and no state file during startup.
+	server.WriteStartupLock(cfg.DataDir)
+	defer server.RemoveStartupLock(cfg.DataDir)
+
 	database := mustOpenDB(cfg)
 	defer database.Close()
 
@@ -323,6 +348,24 @@ func runServe(args []string) {
 			}
 			fatal("managed caddy error: %v", err)
 		}
+	}
+
+	// Server is ready — write the definitive state file with the
+	// final port and remove the startup lock. If the state file
+	// write fails, keep the startup lock as a fallback "server
+	// is active" marker so token-use doesn't start a competing
+	// on-demand sync against our live DB.
+	if _, sfErr := server.WriteStateFile(
+		cfg.DataDir, cfg.Host, cfg.Port, version,
+	); sfErr != nil {
+		log.Printf(
+			"warning: could not write state file: %v"+
+				" (keeping startup lock as fallback)",
+			sfErr,
+		)
+	} else {
+		defer server.RemoveStateFile(cfg.DataDir, cfg.Port)
+		server.RemoveStartupLock(cfg.DataDir)
 	}
 
 	localURL := fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
@@ -621,3 +664,4 @@ func startUnwatchedPoll(engine *sync.Engine) {
 		engine.SyncAll(context.Background(), nil)
 	}
 }
+

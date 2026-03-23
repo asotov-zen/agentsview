@@ -8,15 +8,20 @@ agentsview is a local web viewer for AI agent sessions (Claude Code, Codex, Copi
 
 ```
 CLI (agentsview) → Config → DB (SQLite/FTS5)
-                  ↓
+                  ↓              ↓
               File Watcher → Sync Engine → Parser (Claude, Codex, Copilot, Gemini, OpenCode, Amp)
-                  ↓
+                  ↓              ↓
               HTTP Server → REST API + SSE + Embedded SPA
+                                 ↓
+                           PG Push Sync → PostgreSQL (optional)
+                                 ↑
+              HTTP Server (pg serve) ← PostgreSQL
 ```
 
 - **Server**: HTTP server with auto-port discovery (default 8080)
-- **Storage**: SQLite with WAL mode, FTS5 for full-text search
+- **Storage**: SQLite with WAL mode, FTS5 for full-text search; optional PostgreSQL for multi-machine shared access
 - **Sync**: File watcher + periodic sync (15min) for session directories
+- **PG Sync**: On-demand push sync from SQLite to PostgreSQL via `pg push`
 - **Frontend**: Svelte 5 SPA embedded in the Go binary at build time
 - **Config**: Env vars (`AGENT_VIEWER_DATA_DIR`, `CLAUDE_PROJECTS_DIR`, `CODEX_SESSIONS_DIR`, `COPILOT_DIR`, `GEMINI_DIR`, `OPENCODE_DIR`, `AMP_DIR`) and CLI flags
 
@@ -24,8 +29,9 @@ CLI (agentsview) → Config → DB (SQLite/FTS5)
 
 - `cmd/agentsview/` - Go server entrypoint
 - `cmd/testfixture/` - Test data generator for E2E tests
-- `internal/config/` - Config loading, flag registration, legacy migration
+- `internal/config/` - Config loading (TOML, JSON migration), flag registration
 - `internal/db/` - SQLite operations (sessions, messages, search, analytics)
+- `internal/postgres/` - PostgreSQL support: push sync, read-only store, schema, connection helpers
 - `internal/parser/` - Session file parsers (Claude, Codex, Copilot, Gemini, OpenCode, Amp, content extraction)
 - `internal/server/` - HTTP handlers, SSE, middleware, search, export
 - `internal/sync/` - Sync engine, file watcher, discovery, hashing
@@ -39,6 +45,7 @@ CLI (agentsview) → Config → DB (SQLite/FTS5)
 | Path | Purpose |
 |------|---------|
 | `cmd/agentsview/main.go` | CLI entry point, server startup, file watcher |
+| `cmd/agentsview/pg.go` | pg command group (push, status, serve) |
 | `internal/server/server.go` | HTTP router and handler setup |
 | `internal/server/sessions.go` | Session list/detail API handlers |
 | `internal/server/search.go` | Full-text search API |
@@ -51,6 +58,15 @@ CLI (agentsview) → Config → DB (SQLite/FTS5)
 | `internal/parser/codex.go` | Codex session parser |
 | `internal/parser/copilot.go` | Copilot CLI session parser |
 | `internal/parser/amp.go` | Amp session parser |
+| `internal/postgres/connect.go` | Connection setup, SSL checks, DSN helpers |
+| `internal/postgres/schema.go` | PG DDL, schema management |
+| `internal/postgres/push.go` | Push logic, fingerprinting |
+| `internal/postgres/sync.go` | Push sync lifecycle |
+| `internal/postgres/store.go` | PostgreSQL read-only store |
+| `internal/postgres/sessions.go` | PG session queries (read side) |
+| `internal/postgres/messages.go` | PG message queries, ILIKE search |
+| `internal/postgres/analytics.go` | PG analytics queries |
+| `internal/postgres/time.go` | Timestamp conversion helpers |
 | `internal/config/config.go` | Config loading, flag registration |
 
 ## Development
@@ -77,6 +93,29 @@ make e2e        # Playwright E2E tests
 make lint       # golangci-lint
 make vet        # go vet
 ```
+
+### PostgreSQL Integration Tests
+
+PG integration tests require a real PostgreSQL instance and the `pgtest`
+build tag. The easiest way to run them is with docker-compose:
+
+```bash
+make test-postgres   # Starts PG container, runs tests, leaves container running
+make postgres-down   # Stop the test container when done
+```
+
+Or manually with an existing PostgreSQL instance:
+
+```bash
+TEST_PG_URL="postgres://user:pass@host:5432/dbname?sslmode=disable" \
+  CGO_ENABLED=1 go test -tags "fts5,pgtest" ./internal/postgres/... -v
+```
+
+Tests create and drop the `agentsview` schema, so use a dedicated
+database or one where schema changes are acceptable.
+
+The CI pipeline runs these tests automatically via a GitHub Actions
+service container (see `.github/workflows/ci.yml`, `integration` job).
 
 ### Test Guidelines
 

@@ -123,23 +123,18 @@ agentsview -host 127.0.0.1 -port 8080 \
   -allowed-subnet 192.168.1.0/24
 ```
 
-You can persist the same settings in `~/.agentsview/config.json`:
+You can persist the same settings in `~/.agentsview/config.toml`:
 
-```json
-{
-  "public_url": "https://viewer.example.test",
-  "proxy": {
-    "mode": "caddy",
-    "bind_host": "0.0.0.0",
-    "public_port": 8443,
-    "tls_cert": "/home/user/.certs/viewer.crt",
-    "tls_key": "/home/user/.certs/viewer.key",
-    "allowed_subnets": [
-      "10.0/16",
-      "192.168.1.0/24"
-    ]
-  }
-}
+```toml
+public_url = "https://viewer.example.test"
+
+[proxy]
+mode = "caddy"
+bind_host = "0.0.0.0"
+public_port = 8443
+tls_cert = "/home/user/.certs/viewer.crt"
+tls_key = "/home/user/.certs/viewer.key"
+allowed_subnets = ["10.0/16", "192.168.1.0/24"]
 ```
 
 `public_origins` remains available as an advanced override when you
@@ -168,6 +163,66 @@ need to allow additional browser origins beyond the main `public_url`.
 | `p` | Publish to GitHub Gist |
 | `r` | Sync sessions |
 | `?` | Show all shortcuts |
+
+## PostgreSQL Sync
+
+agentsview can push session data from the local SQLite database to a
+remote PostgreSQL instance, enabling shared team dashboards and
+centralized search across multiple machines.
+
+### Push Sync (SQLite to PG)
+
+Configure `pg` in `~/.agentsview/config.toml`:
+
+```toml
+[pg]
+url = "postgres://user:pass@host:5432/dbname?sslmode=require"
+machine_name = "my-laptop"
+```
+
+Use `sslmode=require` (or `verify-full` for CA-verified connections)
+for non-local PostgreSQL instances. Only use `sslmode=disable` for
+trusted local/loopback connections.
+
+The `machine_name` identifies which machine pushed each session
+(must not be `"local"`, which is reserved).
+
+CLI commands:
+
+```bash
+agentsview pg push          # push now
+agentsview pg push --full   # force full re-push (bypasses heuristic)
+agentsview pg status        # show sync status
+```
+
+Push is on-demand — run `pg push` whenever you want to sync to
+PostgreSQL. There is no automatic background push.
+
+### PG Read-Only Mode
+
+Serve the web UI directly from PostgreSQL with no local SQLite.
+Configure `[pg].url` in config (as shown above), then:
+
+```bash
+agentsview pg serve              # default: 127.0.0.1:8080
+agentsview pg serve -port 9090   # custom port
+```
+
+This mode is useful for shared team viewers where multiple machines
+push to a central PG database and one or more read-only instances
+serve the UI. Uploads, file watching, and local sync are disabled.
+By default, `pg serve` binds to `127.0.0.1`. When a non-loopback
+`-host` is specified, remote access is enabled automatically and an
+auth token is generated and printed to stdout.
+
+### Known Limitations
+
+- **Deleted sessions**: Sessions permanently pruned from SQLite
+  (via `agentsview prune`) are not propagated as deletions to PG.
+  Sessions soft-deleted with `deleted_at` are synced correctly.
+- **Change detection**: Push uses aggregate length statistics
+  rather than content hashes. Use `-full` to force a complete
+  re-push if content was rewritten in-place.
 
 ## Documentation
 
@@ -218,6 +273,7 @@ PATH/API keys overrides).
 cmd/agentsview/     CLI entrypoint
 internal/config/    Configuration loading
 internal/db/        SQLite operations (sessions, search, analytics)
+internal/postgres/  PostgreSQL support (push sync, read-only store, schema)
 internal/parser/    Session parsers (all supported agents)
 internal/server/    HTTP handlers, SSE, middleware
 internal/sync/      Sync engine, file watcher, discovery

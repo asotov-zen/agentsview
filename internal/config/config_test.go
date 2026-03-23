@@ -2,7 +2,6 @@ package config
 
 import (
 	"bytes"
-	"encoding/json"
 	"flag"
 	"log"
 	"os"
@@ -11,10 +10,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/BurntSushi/toml"
 	"github.com/wesm/agentsview/internal/parser"
 )
 
-const configFileName = "config.json"
+const configFileName = "config.toml"
 
 func skipIfNotUnix(t *testing.T) {
 	t.Helper()
@@ -32,11 +32,11 @@ func skipIfNotUnix(t *testing.T) {
 
 func writeConfig(t *testing.T, dir string, data any) {
 	t.Helper()
-	b, err := json.Marshal(data)
-	if err != nil {
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(data); err != nil {
 		t.Fatalf("marshal config: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, configFileName), b, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, configFileName), buf.Bytes(), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 }
@@ -369,10 +369,10 @@ func TestSaveGithubToken_RejectsCorruptConfig(t *testing.T) {
 	tmp := setupTestEnv(t)
 	cfg := Config{DataDir: tmp}
 
-	// Write invalid JSON to config file
+	// Write invalid TOML to config file
 	path := filepath.Join(tmp, configFileName)
 	if err := os.WriteFile(
-		path, []byte("not json"), 0o600,
+		path, []byte("[invalid toml = ="), 0o600,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -392,7 +392,7 @@ func TestSaveGithubToken_ReturnsErrorOnReadFailure(t *testing.T) {
 	// Create a config file that is not readable
 	path := filepath.Join(tmp, configFileName)
 	if err := os.WriteFile(
-		path, []byte(`{"k":"v"}`), 0o000,
+		path, []byte("k = \"v\"\n"), 0o000,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +422,7 @@ func TestSaveGithubToken_PreservesExistingKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	var result map[string]any
-	if err := json.Unmarshal(got, &result); err != nil {
+	if _, err := toml.Decode(string(got), &result); err != nil {
 		t.Fatal(err)
 	}
 	if result["custom_key"] != "value" {
@@ -726,5 +726,203 @@ func TestLoadFile_ResultContentBlockedCategories(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestLoadFile_PGConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		config map[string]any
+		envURL string
+		want   PGConfig
+	}{
+		{
+			"NoConfig",
+			map[string]any{},
+			"",
+			PGConfig{},
+		},
+		{
+			"FromConfigFile",
+			map[string]any{
+				"pg": map[string]any{
+					"url":          "postgres://localhost/test",
+					"machine_name": "laptop",
+				},
+			},
+			"",
+			PGConfig{
+				URL:         "postgres://localhost/test",
+				MachineName: "laptop",
+			},
+		},
+		{
+			"EnvOverridesConfig",
+			map[string]any{
+				"pg": map[string]any{
+					"url": "postgres://from-config",
+				},
+			},
+			"postgres://from-env",
+			PGConfig{
+				URL: "postgres://from-env",
+			},
+		},
+		{
+			"EnvURLMergesFileFields",
+			map[string]any{
+				"pg": map[string]any{
+					"url":          "postgres://from-config",
+					"machine_name": "laptop",
+				},
+			},
+			"postgres://from-env",
+			PGConfig{
+				URL:         "postgres://from-env",
+				MachineName: "laptop",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := setupTestEnv(t)
+			writeConfig(t, dir, tt.config)
+			if tt.envURL != "" {
+				t.Setenv("AGENTSVIEW_PG_URL", tt.envURL)
+			}
+
+			cfg, err := LoadMinimal()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if cfg.PG.URL != tt.want.URL {
+				t.Errorf(
+					"URL = %q, want %q",
+					cfg.PG.URL,
+					tt.want.URL,
+				)
+			}
+			if cfg.PG.MachineName != tt.want.MachineName {
+				t.Errorf(
+					"MachineName = %q, want %q",
+					cfg.PG.MachineName,
+					tt.want.MachineName,
+				)
+			}
+		})
+	}
+}
+
+func TestResolvePG_Defaults(t *testing.T) {
+	cfg := Config{
+		PG: PGConfig{
+			URL: "postgres://localhost/test",
+		},
+	}
+	resolved, err := cfg.ResolvePG()
+	if err != nil {
+		t.Fatalf("ResolvePG: %v", err)
+	}
+
+	if resolved.Schema != "agentsview" {
+		t.Errorf("Schema = %q, want agentsview", resolved.Schema)
+	}
+	if resolved.MachineName == "" {
+		t.Error("MachineName should default to hostname")
+	}
+}
+
+func TestResolvePG_ExpandsEnvVars(t *testing.T) {
+	t.Setenv("PGPASS", "env-secret")
+	t.Setenv("PGURL", "postgres://localhost/test")
+
+	cfg := Config{
+		PG: PGConfig{
+			URL: "${PGURL}?password=${PGPASS}",
+		},
+	}
+
+	resolved, err := cfg.ResolvePG()
+	if err != nil {
+		t.Fatalf("ResolvePG: %v", err)
+	}
+
+	want := "postgres://localhost/test?password=env-secret"
+	if resolved.URL != want {
+		t.Fatalf("URL = %q, want %q", resolved.URL, want)
+	}
+}
+
+func TestResolvePG_ExpandsBareEnvOnlyForWholeValue(t *testing.T) {
+	t.Setenv("PGURL", "postgres://localhost/test")
+
+	cfg := Config{
+		PG: PGConfig{
+			URL: "$PGURL",
+		},
+	}
+
+	resolved, err := cfg.ResolvePG()
+	if err != nil {
+		t.Fatalf("ResolvePG: %v", err)
+	}
+
+	want := "postgres://localhost/test"
+	if resolved.URL != want {
+		t.Fatalf("URL = %q, want %q", resolved.URL, want)
+	}
+}
+
+func TestResolvePG_PreservesLiteralDollarSequencesInURL(t *testing.T) {
+	t.Setenv("PGPASS", "env-secret")
+
+	cfg := Config{
+		PG: PGConfig{
+			URL: "postgres://user:pa$word@localhost/db?application_name=$client&password=${PGPASS}",
+		},
+	}
+
+	resolved, err := cfg.ResolvePG()
+	if err != nil {
+		t.Fatalf("ResolvePG: %v", err)
+	}
+
+	want := "postgres://user:pa$word@localhost/db?application_name=$client&password=env-secret"
+	if resolved.URL != want {
+		t.Fatalf("URL = %q, want %q", resolved.URL, want)
+	}
+}
+
+func TestResolvePG_ErrorsOnMissingEnvVar(t *testing.T) {
+	cfg := Config{
+		PG: PGConfig{
+			URL: "${NONEXISTENT_PG_VAR}",
+		},
+	}
+
+	_, err := cfg.ResolvePG()
+	if err == nil {
+		t.Fatal("expected error for unset env var")
+	}
+	if !strings.Contains(err.Error(), "NONEXISTENT_PG_VAR") {
+		t.Errorf("error = %v, want mention of NONEXISTENT_PG_VAR", err)
+	}
+}
+
+func TestResolvePG_ErrorsOnMissingBareEnvVar(t *testing.T) {
+	cfg := Config{
+		PG: PGConfig{
+			URL: "$NONEXISTENT_PG_BARE_VAR",
+		},
+	}
+
+	_, err := cfg.ResolvePG()
+	if err == nil {
+		t.Fatal("expected error for unset bare env var")
+	}
+	if !strings.Contains(err.Error(), "NONEXISTENT_PG_BARE_VAR") {
+		t.Errorf("error = %v, want mention of NONEXISTENT_PG_BARE_VAR", err)
 	}
 }
