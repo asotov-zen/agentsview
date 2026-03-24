@@ -8,6 +8,7 @@ type ModalType =
   | "publish"
   | "resync"
   | "update"
+  | "confirmDelete"
   | null;
 
 /** Block types that can be toggled visible/hidden. */

@@ -201,6 +201,22 @@ export function registerShortcuts(
           inSessionSearch.open();
         }
       },
+      Delete: () => {
+        if (
+          router.route === "sessions" &&
+          sessions.activeSessionId
+        ) {
+          ui.activeModal = "confirmDelete";
+        }
+      },
+      Backspace: () => {
+        if (
+          router.route === "sessions" &&
+          sessions.activeSessionId
+        ) {
+          ui.activeModal = "confirmDelete";
+        }
+      },
       "?": () => {
         ui.activeModal = "shortcuts";
       },
