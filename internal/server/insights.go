@@ -112,6 +112,9 @@ func (s *Server) handleDeleteInsight(
 	}
 
 	if err := s.db.DeleteInsight(id); err != nil {
+		if handleReadOnly(w, err) {
+			return
+		}
 		writeError(
 			w, http.StatusInternalServerError, err.Error(),
 		)
@@ -130,13 +133,33 @@ type generateInsightRequest struct {
 	Agent    string `json:"agent"`
 }
 
-func insightGenerateClientMessage(agent string) string {
-	return fmt.Sprintf("%s generation failed", agent)
+func insightGenerateClientMessage(
+	agent string, err error,
+) string {
+	if err == nil {
+		return fmt.Sprintf("%s generation failed", agent)
+	}
+	msg := err.Error()
+	// Strip stderr dump after newline for the short
+	// client message; full details are in the log stream.
+	if idx := strings.Index(msg, "\nstderr:"); idx > 0 {
+		msg = msg[:idx]
+	}
+	if idx := strings.Index(msg, "\nraw:"); idx > 0 {
+		msg = msg[:idx]
+	}
+	return msg
 }
 
 func (s *Server) handleGenerateInsight(
 	w http.ResponseWriter, r *http.Request,
 ) {
+	if s.db.ReadOnly() {
+		writeError(w, http.StatusNotImplemented,
+			"insight generation is not available in read-only mode")
+		return
+	}
+
 	var req generateInsightRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest,
@@ -170,7 +193,7 @@ func (s *Server) handleGenerateInsight(
 	}
 	if !insight.ValidAgents[req.Agent] {
 		writeError(w, http.StatusBadRequest,
-			"invalid agent: must be claude, codex, copilot, or gemini")
+			"invalid agent: must be claude, codex, or gemini")
 		return
 	}
 
@@ -341,7 +364,9 @@ func (s *Server) handleGenerateInsight(
 	if err != nil {
 		log.Printf("insight generate error: %v", err)
 		sendJSON("error", map[string]string{
-			"message": insightGenerateClientMessage(req.Agent),
+			"message": insightGenerateClientMessage(
+				req.Agent, err,
+			),
 		})
 		return
 	}

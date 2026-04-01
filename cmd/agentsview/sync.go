@@ -41,7 +41,9 @@ func parseSyncFlags(args []string) (SyncConfig, error) {
 		)
 	}
 
-	return SyncConfig{Full: *full}, nil
+	return SyncConfig{
+		Full: *full,
+	}, nil
 }
 
 func runSync(args []string) {
@@ -65,8 +67,7 @@ func runSync(args []string) {
 
 	setupLogFile(appCfg.DataDir)
 
-	var database *db.DB
-	database, err = db.Open(appCfg.DBPath)
+	database, err := db.Open(appCfg.DBPath)
 	if err != nil {
 		fatal("opening database: %v", err)
 	}
@@ -80,6 +81,16 @@ func runSync(args []string) {
 		database.SetCursorSecret(secret)
 	}
 
+	runLocalSync(appCfg, database, cfg.Full)
+}
+
+// runLocalSync runs a local sync (incremental or full resync).
+// It returns true if a full resync was performed, which callers
+// can use to force a full PG push (watermarks become stale after
+// a local resync).
+func runLocalSync(
+	appCfg config.Config, database *db.DB, full bool,
+) bool {
 	for _, def := range parser.Registry {
 		if !appCfg.IsUserConfigured(def.Type) {
 			continue
@@ -97,8 +108,9 @@ func runSync(args []string) {
 		Machine:   "local",
 	})
 
+	didResync := full || database.NeedsResync()
 	ctx := context.Background()
-	if cfg.Full || database.NeedsResync() {
+	if didResync {
 		runInitialResync(ctx, engine)
 	} else {
 		runInitialSync(ctx, engine)
@@ -112,4 +124,12 @@ func runSync(args []string) {
 			stats.SessionCount, stats.MessageCount,
 		)
 	}
+	return didResync
+}
+
+func valueOrNever(s string) string {
+	if s == "" {
+		return "never"
+	}
+	return s
 }

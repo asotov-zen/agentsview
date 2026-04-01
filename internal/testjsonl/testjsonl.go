@@ -114,19 +114,6 @@ func ClaudeAssistantWithModelJSON(
 	return mustMarshal(m)
 }
 
-// CodexTurnContextJSON returns a Codex turn_context message
-// with a model field as a JSON string.
-func CodexTurnContextJSON(model, timestamp string) string {
-	m := map[string]any{
-		"type":      "turn_context",
-		"timestamp": timestamp,
-		"payload": map[string]any{
-			"model": model,
-		},
-	}
-	return mustMarshal(m)
-}
-
 // ClaudeSnapshotJSON returns a Claude snapshot message as a
 // JSON string.
 func ClaudeSnapshotJSON(timestamp string) string {
@@ -242,6 +229,20 @@ func CodexFunctionCallFieldsJSON(
 		"type":      "response_item",
 		"timestamp": timestamp,
 		"payload":   payload,
+	}
+	return mustMarshal(m)
+}
+
+// CodexTurnContextJSON returns a Codex turn_context entry as a
+// JSON string with the given model.
+func CodexTurnContextJSON(model, timestamp string) string {
+	m := map[string]any{
+		"type":      "turn_context",
+		"timestamp": timestamp,
+		"payload": map[string]any{
+			"model": model,
+			"cwd":   "/tmp",
+		},
 	}
 	return mustMarshal(m)
 }
