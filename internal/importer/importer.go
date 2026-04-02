@@ -20,6 +20,79 @@ type ImportStats struct {
 	Errors   int `json:"errors"`
 }
 
+// ImportCallbacks provides optional progress reporting.
+type ImportCallbacks struct {
+	// OnProgress fires after each conversation with current
+	// cumulative stats.
+	OnProgress func(ImportStats)
+	// OnIndexing fires before the FTS index rebuild starts.
+	OnIndexing func()
+}
+
+func (c *ImportCallbacks) progress(s ImportStats) {
+	if c != nil && c.OnProgress != nil {
+		c.OnProgress(s)
+	}
+}
+
+func (c *ImportCallbacks) indexing() {
+	if c != nil && c.OnIndexing != nil {
+		c.OnIndexing()
+	}
+}
+
+// ftsSuspender is optionally implemented by stores that
+// support dropping and rebuilding FTS indexes.
+type ftsSuspender interface {
+	DropFTS() error
+	RebuildFTS() error
+}
+
+// lazyFTS suspends FTS triggers on first call to suspend()
+// and rebuilds on restore(). If suspend() is never called
+// (no message work happened), restore() is a no-op. This
+// avoids the expensive FTS rebuild when re-importing an
+// unchanged archive.
+type lazyFTS struct {
+	sus        ftsSuspender
+	dropped    bool
+	onIndexing func()
+}
+
+func newLazyFTS(
+	store db.Store, onIndexing func(),
+) *lazyFTS {
+	s, ok := store.(ftsSuspender)
+	if !ok || !store.HasFTS() {
+		return nil
+	}
+	return &lazyFTS{sus: s, onIndexing: onIndexing}
+}
+
+func (f *lazyFTS) suspend() {
+	if f == nil || f.dropped {
+		return
+	}
+	if err := f.sus.DropFTS(); err != nil {
+		log.Printf("import: drop FTS: %v", err)
+		return
+	}
+	f.dropped = true
+}
+
+func (f *lazyFTS) restore() error {
+	if f == nil || !f.dropped {
+		return nil
+	}
+	if f.onIndexing != nil {
+		f.onIndexing()
+	}
+	if err := f.sus.RebuildFTS(); err != nil {
+		return fmt.Errorf("rebuilding FTS index: %w", err)
+	}
+	return nil
+}
+
 // ImportClaudeAI reads a Claude.ai conversations.json export
 // and upserts each conversation into the store. Existing
 // sessions are updated (messages replaced); user-renamed
@@ -29,9 +102,14 @@ func ImportClaudeAI(
 	ctx context.Context,
 	store db.Store,
 	r io.Reader,
-	onProgress func(imported int),
-) (ImportStats, error) {
-	var stats ImportStats
+	cb *ImportCallbacks,
+) (stats ImportStats, retErr error) {
+	fts := newLazyFTS(store, cb.indexing)
+	defer func() {
+		if err := fts.restore(); err != nil {
+			retErr = errors.Join(retErr, err)
+		}
+	}()
 
 	err := parser.ParseClaudeAIExport(r, func(
 		result parser.ParseResult,
@@ -40,13 +118,16 @@ func ImportClaudeAI(
 			return ctx.Err()
 		}
 
-		status, err := upsertConversation(ctx, store, result)
+		status, err := upsertConversation(
+			ctx, store, result, fts,
+		)
 		if err != nil {
 			stats.Errors++
 			log.Printf(
 				"import: skipping %s: %v",
 				result.Session.ID, err,
 			)
+			cb.progress(stats)
 			return nil
 		}
 
@@ -59,15 +140,12 @@ func ImportClaudeAI(
 			stats.Skipped++
 		}
 
-		if onProgress != nil {
-			total := stats.Imported + stats.Updated + stats.Skipped
-			onProgress(total)
-		}
-
+		cb.progress(stats)
 		return nil
 	})
 
-	return stats, err
+	retErr = err
+	return
 }
 
 type importStatus int
@@ -82,6 +160,7 @@ func upsertConversation(
 	ctx context.Context,
 	store db.Store,
 	result parser.ParseResult,
+	fts *lazyFTS,
 ) (importStatus, error) {
 	s := result.Session
 
@@ -121,6 +200,21 @@ func upsertConversation(
 		}
 		return importNew, fmt.Errorf("upserting session: %w", err)
 	}
+
+	// Skip expensive message replacement when the conversation
+	// has not changed since the last import. Compare both
+	// message count and ended_at (source updated_at) to detect
+	// content/metadata changes even when count is unchanged.
+	if !isNew && existing.MessageCount == s.MessageCount {
+		newEnd := timeStr(s.EndedAt)
+		if ptrEqual(existing.EndedAt, newEnd) {
+			return importSkipped, nil
+		}
+	}
+
+	// Suspend FTS before first message-changing operation to
+	// avoid per-row trigger overhead during bulk work.
+	fts.suspend()
 
 	msgs := make([]db.Message, len(result.Messages))
 	for i, m := range result.Messages {
@@ -172,9 +266,14 @@ func ImportChatGPT(
 	store db.Store,
 	dir string,
 	assetsDir string,
-	onProgress func(processed int),
-) (ImportStats, error) {
-	var stats ImportStats
+	cb *ImportCallbacks,
+) (stats ImportStats, retErr error) {
+	fts := newLazyFTS(store, cb.indexing)
+	defer func() {
+		if err := fts.restore(); err != nil {
+			retErr = errors.Join(retErr, err)
+		}
+	}()
 
 	index := BuildAssetIndex(dir)
 	resolver := &assetResolverAdapter{
@@ -196,13 +295,12 @@ func ImportChatGPT(
 				log.Printf(
 					"import: skipping %s: %v", s.ID, err,
 				)
+				cb.progress(stats)
 				return nil
 			}
 			if existing != nil {
 				stats.Skipped++
-				if onProgress != nil {
-					onProgress(stats.Imported + stats.Skipped)
-				}
+				cb.progress(stats)
 				return nil
 			}
 
@@ -222,17 +320,18 @@ func ImportChatGPT(
 			if err := store.UpsertSession(sess); err != nil {
 				if errors.Is(err, db.ErrSessionExcluded) {
 					stats.Skipped++
-					if onProgress != nil {
-						onProgress(stats.Imported + stats.Skipped)
-					}
+					cb.progress(stats)
 					return nil
 				}
 				stats.Errors++
 				log.Printf(
 					"import: skipping %s: %v", s.ID, err,
 				)
+				cb.progress(stats)
 				return nil
 			}
+
+			fts.suspend()
 
 			msgs := make([]db.Message, len(result.Messages))
 			for i, m := range result.Messages {
@@ -263,18 +362,28 @@ func ImportChatGPT(
 					"import: skipping messages for %s: %v",
 					s.ID, err,
 				)
+				cb.progress(stats)
 				return nil
 			}
 
 			stats.Imported++
-			if onProgress != nil {
-				onProgress(stats.Imported + stats.Skipped)
-			}
+			cb.progress(stats)
 			return nil
 		},
 	)
 
-	return stats, err
+	retErr = err
+	return
+}
+
+func ptrEqual(a, b *string) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
 }
 
 func strPtr(s string) *string {

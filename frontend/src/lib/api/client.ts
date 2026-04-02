@@ -924,14 +924,82 @@ export async function emptyTrash(): Promise<{ deleted: number }> {
 
 /* Import */
 
+export interface ImportStats {
+  imported: number;
+  updated: number;
+  skipped: number;
+  errors: number;
+}
+
+export interface ImportCallbacks {
+  onProgress?: (stats: ImportStats) => void;
+  onIndexing?: () => void;
+}
+
+async function readImportSSE(
+  res: Response,
+  cb?: ImportCallbacks,
+): Promise<ImportStats> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let result: ImportStats | null = null;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+
+    // Process complete SSE frames (double newline delimited).
+    let idx: number;
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const frame = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+
+      let event = "";
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event: ")) event = line.slice(7);
+        else if (line.startsWith("data: ")) data = line.slice(6);
+      }
+      if (!event || !data) continue;
+
+      const parsed = JSON.parse(data);
+      switch (event) {
+        case "progress":
+          cb?.onProgress?.(parsed as ImportStats);
+          break;
+        case "indexing":
+          cb?.onIndexing?.();
+          break;
+        case "done":
+          result = parsed as ImportStats;
+          break;
+        case "error":
+          throw new Error(
+            (parsed as { error?: string }).error
+            ?? "Import failed",
+          );
+      }
+    }
+  }
+
+  if (!result) throw new Error("Import stream ended without result");
+  return result;
+}
+
 export async function importClaudeAI(
   file: File,
-): Promise<{ imported: number; updated: number; errors: number }> {
+  cb?: ImportCallbacks,
+): Promise<ImportStats> {
   const form = new FormData();
   form.append("file", file);
+  const init = authHeaders({ method: "POST", body: form });
+  const headers = new Headers(init.headers);
+  headers.set("Accept", "text/event-stream");
   const res = await fetch(
     `${getBase()}/import/claude-ai`,
-    authHeaders({ method: "POST", body: form }),
+    { ...init, headers },
   );
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -940,17 +1008,24 @@ export async function importClaudeAI(
       ?? `Import failed (${res.status})`,
     );
   }
+  if (res.headers.get("content-type")?.includes("text/event-stream")) {
+    return readImportSSE(res, cb);
+  }
   return res.json();
 }
 
 export async function importChatGPT(
   file: File,
-): Promise<{ imported: number; updated: number; skipped: number; errors: number }> {
+  cb?: ImportCallbacks,
+): Promise<ImportStats> {
   const form = new FormData();
   form.append("file", file);
+  const init = authHeaders({ method: "POST", body: form });
+  const headers = new Headers(init.headers);
+  headers.set("Accept", "text/event-stream");
   const res = await fetch(
     `${getBase()}/import/chatgpt`,
-    authHeaders({ method: "POST", body: form }),
+    { ...init, headers },
   );
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -958,6 +1033,9 @@ export async function importChatGPT(
       (err as { error?: string }).error
       ?? `Import failed (${res.status})`,
     );
+  }
+  if (res.headers.get("content-type")?.includes("text/event-stream")) {
+    return readImportSSE(res, cb);
   }
   return res.json();
 }

@@ -1,6 +1,8 @@
 package server
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -9,6 +11,41 @@ import (
 
 	"github.com/wesm/agentsview/internal/importer"
 )
+
+// wantsSSE checks if the client opted into streaming via
+// the Accept header.
+func wantsSSE(r *http.Request) bool {
+	return strings.Contains(
+		r.Header.Get("Accept"), "text/event-stream",
+	)
+}
+
+// sseWriter wraps an http.ResponseWriter for streaming
+// Server-Sent Events. Each call to event() writes one SSE
+// frame and flushes immediately.
+type sseWriter struct {
+	w http.ResponseWriter
+	f http.Flusher
+}
+
+func newSSEWriter(
+	w http.ResponseWriter,
+) (*sseWriter, bool) {
+	f, ok := w.(http.Flusher)
+	if !ok {
+		return nil, false
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	return &sseWriter{w: w, f: f}, true
+}
+
+func (s *sseWriter) event(name string, data any) {
+	b, _ := json.Marshal(data)
+	fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", name, b)
+	s.f.Flush()
+}
 
 func (s *Server) handleImportClaudeAI(
 	w http.ResponseWriter, r *http.Request,
@@ -82,16 +119,45 @@ func (s *Server) handleImportClaudeAI(
 		reader = jsonFile
 	}
 
-	stats, err := importer.ImportClaudeAI(
-		r.Context(), s.db, reader, nil,
-	)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError,
-			"import failed: "+err.Error())
+	if !wantsSSE(r) {
+		stats, err := importer.ImportClaudeAI(
+			r.Context(), s.db, reader, nil,
+		)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError,
+				"import failed: "+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, stats)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, stats)
+	sse, ok := newSSEWriter(w)
+	if !ok {
+		writeError(w, http.StatusInternalServerError,
+			"streaming not supported")
+		return
+	}
+
+	cb := &importer.ImportCallbacks{
+		OnProgress: func(stats importer.ImportStats) {
+			sse.event("progress", stats)
+		},
+		OnIndexing: func() {
+			sse.event("indexing", struct{}{})
+		},
+	}
+
+	stats, err := importer.ImportClaudeAI(
+		r.Context(), s.db, reader, cb,
+	)
+	if err != nil {
+		sse.event("error", map[string]string{
+			"error": err.Error(),
+		})
+		return
+	}
+	sse.event("done", stats)
 }
 
 func (s *Server) handleImportChatGPT(
@@ -154,14 +220,44 @@ func (s *Server) handleImportChatGPT(
 	defer cleanup()
 
 	assetsDir := filepath.Join(s.cfg.DataDir, "assets")
-	stats, err := importer.ImportChatGPT(
-		r.Context(), s.db, dir, assetsDir, nil,
-	)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError,
-			"import failed: "+err.Error())
+
+	if !wantsSSE(r) {
+		stats, err := importer.ImportChatGPT(
+			r.Context(), s.db, dir, assetsDir, nil,
+		)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError,
+				"import failed: "+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, stats)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, stats)
+	sse, ok := newSSEWriter(w)
+	if !ok {
+		writeError(w, http.StatusInternalServerError,
+			"streaming not supported")
+		return
+	}
+
+	cb := &importer.ImportCallbacks{
+		OnProgress: func(stats importer.ImportStats) {
+			sse.event("progress", stats)
+		},
+		OnIndexing: func() {
+			sse.event("indexing", struct{}{})
+		},
+	}
+
+	stats, err := importer.ImportChatGPT(
+		r.Context(), s.db, dir, assetsDir, cb,
+	)
+	if err != nil {
+		sse.event("error", map[string]string{
+			"error": err.Error(),
+		})
+		return
+	}
+	sse.event("done", stats)
 }
