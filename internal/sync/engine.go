@@ -556,6 +556,43 @@ func (e *Engine) classifyOnePath(
 		}
 	}
 
+	// Cortex: <cortexDir>/<uuid>.json
+	//     or: <cortexDir>/<uuid>.history.jsonl → remap to .json
+	for _, cortexDir := range e.agentDirs[parser.AgentCortex] {
+		if cortexDir == "" {
+			continue
+		}
+		if rel, ok := isUnder(cortexDir, path); ok {
+			if strings.Count(rel, sep) != 0 {
+				continue
+			}
+			name := filepath.Base(rel)
+
+			// .history.jsonl companion → remap to .json metadata.
+			if stem, ok := strings.CutSuffix(
+				name, ".history.jsonl",
+			); ok {
+				jsonPath := filepath.Join(
+					cortexDir, stem+".json",
+				)
+				if parser.IsCortexSessionFile(stem + ".json") {
+					return parser.DiscoveredFile{
+						Path:  jsonPath,
+						Agent: parser.AgentCortex,
+					}, true
+				}
+				continue
+			}
+
+			if parser.IsCortexSessionFile(name) {
+				return parser.DiscoveredFile{
+					Path:  path,
+					Agent: parser.AgentCortex,
+				}, true
+			}
+		}
+	}
+
 	return parser.DiscoveredFile{}, false
 }
 
@@ -1303,6 +1340,8 @@ func (e *Engine) processFile(
 		res = e.processKiro(file, info)
 	case parser.AgentKiroIDE:
 		res = e.processKiroIDE(file, info)
+	case parser.AgentCortex:
+		res = e.processCortex(file, info)
 	default:
 		res = processResult{
 			err: fmt.Errorf(
@@ -1853,6 +1892,35 @@ func (e *Engine) processKiroIDE(
 	}
 
 	sess, msgs, err := parser.ParseKiroIDESession(
+		file.Path, e.machine,
+	)
+	if err != nil {
+		return processResult{err: err}
+	}
+	if sess == nil {
+		return processResult{}
+	}
+
+	hash, err := ComputeFileHash(file.Path)
+	if err == nil {
+		sess.File.Hash = hash
+	}
+
+	return processResult{
+		results: []parser.ParseResult{
+			{Session: *sess, Messages: msgs},
+		},
+	}
+}
+
+func (e *Engine) processCortex(
+	file parser.DiscoveredFile, info os.FileInfo,
+) processResult {
+	if e.shouldSkipByPath(file.Path, info) {
+		return processResult{skip: true}
+	}
+
+	sess, msgs, err := parser.ParseCortexSession(
 		file.Path, e.machine,
 	)
 	if err != nil {
