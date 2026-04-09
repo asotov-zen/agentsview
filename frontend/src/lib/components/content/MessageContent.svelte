@@ -4,8 +4,13 @@
     parseContent,
     enrichSegments,
   } from "../../utils/content-parser.js";
-  import { formatTimestamp } from "../../utils/format.js";
+  import {
+    formatTimestamp,
+    formatTokenUsage,
+  } from "../../utils/format.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
+  import { formatMessageForCopy } from "../../utils/copy-message.js";
+  import { messages as messagesStore } from "../../stores/messages.svelte.js";
   import ThinkingBlock from "./ThinkingBlock.svelte";
   import ToolBlock from "./ToolBlock.svelte";
   import SkillBlock from "./SkillBlock.svelte";
@@ -30,13 +35,47 @@
 
   let segments = $derived(
     enrichSegments(
-      parseContent(message.content, message.has_tool_use),
+      parseContent(
+        message.content,
+        message.has_tool_use,
+        message.id,
+        message.content_length,
+      ),
       message.tool_calls,
     ),
   );
 
   let isUser = $derived(message.role === "user");
   let isSystem = $derived(message.is_system);
+
+  let mainModel = $derived(
+    !isSubagentContext &&
+    messagesStore.sessionId === message.session_id
+      ? messagesStore.mainModel
+      : "",
+  );
+
+  let offMainModel = $derived.by((): string => {
+    if (isUser || !message.model || !mainModel) return "";
+    return message.model !== mainModel ? message.model : "";
+  });
+
+  let hasContextTokens = $derived(
+    message.has_context_tokens ?? message.context_tokens > 0,
+  );
+
+  let hasOutputTokens = $derived(
+    message.has_output_tokens ?? message.output_tokens > 0,
+  );
+
+  let tokenSummary = $derived(
+    formatTokenUsage(
+      message.context_tokens,
+      hasContextTokens,
+      message.output_tokens,
+      hasOutputTokens,
+    ),
+  );
 
   /** Resolve the session that owns this message, falling back to activeSession. */
   let owningSession = $derived(
@@ -133,7 +172,7 @@
   let pinTimer: ReturnType<typeof setTimeout>;
 
   async function handleCopy() {
-    const ok = await copyToClipboard(message.content);
+    const ok = await copyToClipboard(formatMessageForCopy(message));
     if (ok) {
       clearTimeout(copyTimer);
       copied = true;
@@ -215,9 +254,21 @@
     {#if pinFeedback}
       <span class="pin-feedback">{pinFeedback}</span>
     {/if}
-    <span class="timestamp">
-      {formatTimestamp(message.timestamp)}
-    </span>
+    <div class="header-meta">
+      {#if tokenSummary}
+        <span class="message-tokens">
+          {tokenSummary}
+        </span>
+      {/if}
+      <span class="timestamp">
+        {formatTimestamp(message.timestamp)}
+      </span>
+      {#if offMainModel}
+        <span class="message-model" title={offMainModel}>
+          {offMainModel}
+        </span>
+      {/if}
+    </div>
   </div>
 
   <div class="message-body">
@@ -327,7 +378,32 @@
   .timestamp {
     font-size: 12px;
     color: var(--text-muted);
+  }
+
+  .header-meta {
     margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .message-tokens {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    white-space: nowrap;
+  }
+
+  .message-model {
+    font-size: 10px;
+    color: var(--text-muted);
+    padding: 1px 4px;
+    border-radius: 3px;
+    background: var(--bg-tertiary);
+    white-space: nowrap;
+    flex-shrink: 0;
+    opacity: 0.8;
   }
 
   .copy-btn {

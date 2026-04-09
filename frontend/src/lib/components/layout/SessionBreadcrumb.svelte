@@ -9,15 +9,19 @@
     type Opener,
   } from "../../api/client.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
-  import { agentColor } from "../../utils/agents.js";
-  import { formatTokenCount } from "../../utils/format.js";
+  import { agentColor, agentLabel } from "../../utils/agents.js";
+  import { formatTokenUsage } from "../../utils/format.js";
   import { sessions } from "../../stores/sessions.svelte.js";
+  import { router } from "../../stores/router.svelte.js";
   import {
     supportsResume,
     buildResumeCommand,
+    formatResumeResponseCommand,
   } from "../../utils/resume.js";
 
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+  import { messages as messagesStore } from "../../stores/messages.svelte.js";
+  import { ui } from "../../stores/ui.svelte.js";
 
   interface Props {
     session: Session | undefined;
@@ -46,18 +50,57 @@
       .catch(() => {});
   });
 
+  let resolvedSessionDirId: string | null = null;
   $effect(() => {
-    sessionDir = null;
-    if (!session) return;
+    if (!session) {
+      sessionDir = null;
+      resolvedSessionDirId = null;
+      return;
+    }
     const id = session.id;
+    if (id === resolvedSessionDirId) return;
+    sessionDir = null;
     getSessionDirectory(id)
       .then(({ path }) => {
-        if (session?.id === id) sessionDir = path || null;
+        if (session?.id === id) {
+          sessionDir = path || null;
+          resolvedSessionDirId = id;
+        }
       })
-      .catch(() => {});
+      .catch(() => {
+        // Don't cache the ID on failure so the next
+        // session refresh retries the lookup.
+      });
   });
 
   let sessionContextTokens = $derived(session?.peak_context_tokens ?? 0);
+  let sessionOutputTokens = $derived(session?.total_output_tokens ?? 0);
+  let sessionHasContextTokens = $derived(
+    session
+      ? (session.has_peak_context_tokens ?? session.peak_context_tokens > 0)
+      : false,
+  );
+  let sessionHasOutputTokens = $derived(
+    session
+      ? (session.has_total_output_tokens ?? session.total_output_tokens > 0)
+      : false,
+  );
+  let sessionTokenSummary = $derived(
+    session
+      ? formatTokenUsage(
+          sessionContextTokens,
+          sessionHasContextTokens,
+          sessionOutputTokens,
+          sessionHasOutputTokens,
+        )
+      : null,
+  );
+
+  let mainModel = $derived(
+    messagesStore.sessionId === session?.id
+      ? messagesStore.mainModel
+      : "",
+  );
 
   function sessionDisplayId(id: string): string {
     const idx = id.indexOf(":");
@@ -86,6 +129,24 @@
     copiedSessionId = sessionId;
     setTimeout(() => {
       if (copiedSessionId === sessionId) copiedSessionId = "";
+    }, 1500);
+  }
+
+
+  let copiedLinkId = $state("");
+  let copiedLinkTimer: ReturnType<typeof setTimeout> | undefined;
+
+  async function copySessionLink() {
+    if (!session) return;
+    const id = session.id;
+    const href = router.buildSessionHref(id);
+    const url = window.location.origin + href;
+    const ok = await copyToClipboard(url);
+    if (!ok) return;
+    copiedLinkId = id;
+    clearTimeout(copiedLinkTimer);
+    copiedLinkTimer = setTimeout(() => {
+      if (copiedLinkId === id) copiedLinkId = "";
     }, 1500);
   }
 
@@ -150,7 +211,8 @@
       }
       // Launch failed — fall back to clipboard copy.
       if (resp.command) {
-        const ok = await copyToClipboard(resp.command);
+        const cmd = formatResumeResponseCommand(session.agent, resp);
+        const ok = cmd ? await copyToClipboard(cmd) : false;
         showFeedback(ok ? "Command copied!" : "Failed");
         return;
       }
@@ -172,7 +234,8 @@
     try {
       const resp = await resumeSession(session.id, { command_only: true });
       if (resp.command) {
-        const ok = await copyToClipboard(resp.command);
+        const cmd = formatResumeResponseCommand(session.agent, resp);
+        const ok = cmd ? await copyToClipboard(cmd) : false;
         showFeedback(ok ? "Command copied!" : "Failed");
         return;
       }
@@ -221,7 +284,8 @@
         return;
       }
       if (resp.command) {
-        const ok = await copyToClipboard(resp.command);
+        const cmd = formatResumeResponseCommand(session.agent, resp);
+        const ok = cmd ? await copyToClipboard(cmd) : false;
         showFeedback(ok ? "Command copied!" : "Failed");
         return;
       }
@@ -245,6 +309,12 @@
     openers.filter((o) => o.kind === "terminal"),
   );
 
+  const claudeDesktopOpener = $derived(
+    session?.agent === "claude"
+      ? openers.find((o) => o.id === "claude-desktop") ?? null
+      : null,
+  );
+
   const editorOpeners = $derived(
     openers.filter((o) => o.kind === "editor"),
   );
@@ -257,7 +327,7 @@
     canResume ||
     editorOpeners.length > 0 ||
     fileOpeners.length > 0 ||
-    sessionDir !== null,
+    (sessionDir !== null && !!session?.file_path),
   );
 
   const isClaudeAgent = $derived(
@@ -351,7 +421,7 @@
       <span
         class="agent-badge"
         style:background={agentColor(session.agent)}
-      >{session.agent}</span>
+      >{agentLabel(session.agent)}</span>
       {#if session.started_at}
         <span class="session-time">
           {new Date(session.started_at).toLocaleDateString(
@@ -455,6 +525,20 @@
                   </button>
                 {/each}
               {/if}
+              {#if canResume && claudeDesktopOpener}
+                <div class="open-menu-divider"></div>
+                <button
+                  class="open-menu-item"
+                  onclick={() => handleResumeIn(claudeDesktopOpener)}
+                >
+                  <span class="open-menu-num">
+                    <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
+                      <path d="M8 0a8 8 0 100 16A8 8 0 008 0zm3.5 8.9l-5 3a.75.75 0 01-1.125-.65v-6a.75.75 0 011.125-.65l5 3a.75.75 0 010 1.3z"/>
+                    </svg>
+                  </span>
+                  <span class="open-menu-name">Claude Desktop</span>
+                </button>
+              {/if}
             </div>
           {/if}
         </span>
@@ -475,12 +559,50 @@
           </svg>
         </button>
       {/if}
-      {#if sessionContextTokens + (session?.total_output_tokens ?? 0) > 0}
-        <span class="token-badge">
-          {formatTokenCount(sessionContextTokens)} ctx / {formatTokenCount(session?.total_output_tokens ?? 0)} out
+      {#if sessionTokenSummary}
+        <span class="token-badge token-badge--desktop">
+          {sessionTokenSummary}
+        </span>
+        <span
+          class="token-badge token-badge--mobile"
+          title={sessionTokenSummary}
+        >
+          {sessionTokenSummary}
         </span>
       {/if}
+      {#if mainModel}
+        <span class="model-badge" title={mainModel}>{mainModel}</span>
+      {/if}
       <div class="actions-wrapper">
+        <button
+          class="link-btn"
+          class:link-btn--copied={copiedLinkId === session?.id}
+          title="Copy link to session"
+          onclick={copySessionLink}
+          aria-label="Copy link to session"
+        >
+          {#if copiedLinkId === session?.id}
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z"/>
+            </svg>
+          {:else}
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M4.715 6.542L3.343 7.914a3 3 0 104.243 4.243l1.828-1.829A3 3 0 008.586 5.5L8 6.086a1.002 1.002 0 00-.154.199 2 2 0 01.861 3.337L6.88 11.45a2 2 0 11-2.83-2.83l.793-.792a4.018 4.018 0 01-.128-1.287z"/>
+              <path d="M11.285 9.458l1.372-1.372a3 3 0 10-4.243-4.243L6.586 5.671A3 3 0 007.414 10.5l.586-.586a1.002 1.002 0 00.154-.199 2 2 0 01-.861-3.337L9.12 4.55a2 2 0 112.83 2.83l-.793.792c.112.42.155.855.128 1.287z"/>
+            </svg>
+          {/if}
+        </button>
+        <button
+          class="minimap-btn"
+          class:minimap-btn--active={ui.activityMinimapOpen}
+          title="Activity minimap"
+          onclick={() => ui.toggleActivityMinimap()}
+          aria-label="Toggle activity minimap"
+        >
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M1 14V8h2v6H1zm4 0V2h2v12H5zm4 0V5h2v9H9zm4 0V9h2v5h-2z"/>
+          </svg>
+        </button>
         <button
           class="find-btn"
           class:find-btn--active={inSessionSearch.isOpen}
@@ -777,12 +899,79 @@
     flex-shrink: 0;
   }
 
+  .token-badge--mobile {
+    display: none;
+    white-space: nowrap;
+  }
+
+  .model-badge {
+    font-size: 10px;
+    color: var(--text-muted);
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
 
   .actions-wrapper {
     position: relative;
     display: flex;
     align-items: center;
     gap: 2px;
+  }
+
+  .link-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border: none;
+    border-radius: var(--radius-sm, 4px);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+    flex-shrink: 0;
+  }
+
+  .link-btn:hover {
+    background: var(--bg-surface-hover);
+    color: var(--accent-blue);
+  }
+
+  .link-btn--copied {
+    color: var(--accent-green, #2ea043);
+  }
+
+  .minimap-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border: none;
+    border-radius: var(--radius-sm, 4px);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+    flex-shrink: 0;
+  }
+
+  .minimap-btn:hover {
+    background: var(--bg-surface-hover);
+    color: var(--accent-blue);
+  }
+
+  .minimap-btn--active {
+    color: var(--accent-blue);
+    background: color-mix(
+      in srgb,
+      var(--accent-blue) 12%,
+      transparent
+    );
   }
 
   .find-btn {
@@ -936,5 +1125,32 @@
   .info-copy:hover {
     color: var(--accent-blue);
     background: color-mix(in srgb, var(--accent-blue) 8%, transparent);
+  }
+
+  @media (max-width: 767px) {
+    .breadcrumb-meta {
+      gap: 4px;
+    }
+
+    .session-time {
+      display: none;
+    }
+
+    .token-badge--desktop {
+      display: none;
+    }
+
+    .token-badge--mobile {
+      display: inline-flex;
+      font-size: 9px;
+      padding: 1px 4px;
+      max-width: 110px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .session-id {
+      display: none;
+    }
   }
 </style>

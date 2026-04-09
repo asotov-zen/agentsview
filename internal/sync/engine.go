@@ -347,23 +347,19 @@ func (e *Engine) classifyOnePath(
 		}
 	}
 
-	// Cursor: <cursorDir>/<project>/agent-transcripts/<uuid>.{txt,jsonl}
+	// Cursor:
+	//   <cursorDir>/<project>/agent-transcripts/<uuid>.{txt,jsonl}
+	//   <cursorDir>/<project>/agent-transcripts/<uuid>/<uuid>.{txt,jsonl}
 	for _, cursorDir := range e.agentDirs[parser.AgentCursor] {
 		if cursorDir == "" {
 			continue
 		}
 		if rel, ok := isUnder(cursorDir, path); ok {
-			parts := strings.Split(rel, sep)
-			if len(parts) != 3 {
+			projectDir, ok := parser.ParseCursorTranscriptRelPath(rel)
+			if !ok {
 				continue
 			}
-			if parts[1] != "agent-transcripts" {
-				continue
-			}
-			if !parser.IsCursorTranscriptExt(parts[2]) {
-				continue
-			}
-			project := parser.DecodeCursorProjectDir(parts[0])
+			project := parser.DecodeCursorProjectDir(projectDir)
 			if project == "" {
 				project = "unknown"
 			}
@@ -392,6 +388,24 @@ func (e *Engine) classifyOnePath(
 				Path:    path,
 				Project: parts[0],
 				Agent:   parser.AgentIflow,
+			}, true
+		}
+	}
+
+	// Kimi: <kimiDir>/<project-hash>/<session-uuid>/wire.jsonl
+	for _, kimiDir := range e.agentDirs[parser.AgentKimi] {
+		if kimiDir == "" {
+			continue
+		}
+		if rel, ok := isUnder(kimiDir, path); ok {
+			parts := strings.Split(rel, sep)
+			if len(parts) != 3 || parts[2] != "wire.jsonl" {
+				continue
+			}
+			return parser.DiscoveredFile{
+				Path:    path,
+				Project: parts[0],
+				Agent:   parser.AgentKimi,
 			}, true
 		}
 	}
@@ -1214,15 +1228,17 @@ func drainResults(results <-chan syncJob, remaining int) {
 // incremental JSONL parse, used to partially update the
 // session row without overwriting unrelated columns.
 type incrementalUpdate struct {
-	sessionID         string
-	msgs              []parser.ParsedMessage
-	endedAt           time.Time
-	msgCount          int // total (old + new)
-	userMsgCount      int // total (old + new)
-	fileSize          int64
-	fileMtime         int64
-	totalOutputTokens int // absolute (old + new)
-	peakContextTokens int // absolute max(old, new)
+	sessionID            string
+	msgs                 []parser.ParsedMessage
+	endedAt              time.Time
+	msgCount             int // total (old + new)
+	userMsgCount         int // total (old + new)
+	fileSize             int64
+	fileMtime            int64
+	totalOutputTokens    int // absolute (old + new)
+	peakContextTokens    int // absolute max(old, new)
+	hasTotalOutputTokens bool
+	hasPeakContextTokens bool
 }
 
 type processResult struct {
@@ -1281,6 +1297,12 @@ func (e *Engine) processFile(
 		res = e.processPi(file, info)
 	case parser.AgentOpenClaw:
 		res = e.processOpenClaw(file, info)
+	case parser.AgentKimi:
+		res = e.processKimi(file, info)
+	case parser.AgentKiro:
+		res = e.processKiro(file, info)
+	case parser.AgentKiroIDE:
+		res = e.processKiroIDE(file, info)
 	default:
 		res = processResult{
 			err: fmt.Errorf(
@@ -1458,6 +1480,13 @@ func (e *Engine) tryIncrementalJSONL(
 		file.Path, inc.FileSize, maxOrd+1,
 	)
 	if err != nil {
+		if parser.IsIncrementalFullParseFallback(err) {
+			log.Printf(
+				"incremental %s %s: %v (explicit full parse fallback)",
+				agent, file.Path, err,
+			)
+			return processResult{}, false
+		}
 		log.Printf(
 			"incremental %s %s: %v (full parse)",
 			agent, file.Path, err,
@@ -1479,14 +1508,16 @@ func (e *Engine) tryIncrementalJSONL(
 		if consumed > 0 {
 			return processResult{
 				incremental: &incrementalUpdate{
-					sessionID:         inc.ID,
-					endedAt:           endedAt,
-					msgCount:          inc.MsgCount,
-					userMsgCount:      inc.UserMsgCount,
-					fileSize:          newOffset,
-					fileMtime:         info.ModTime().UnixNano(),
-					totalOutputTokens: inc.TotalOutputTokens,
-					peakContextTokens: inc.PeakContextTokens,
+					sessionID:            inc.ID,
+					endedAt:              endedAt,
+					msgCount:             inc.MsgCount,
+					userMsgCount:         inc.UserMsgCount,
+					fileSize:             newOffset,
+					fileMtime:            info.ModTime().UnixNano(),
+					totalOutputTokens:    inc.TotalOutputTokens,
+					peakContextTokens:    inc.PeakContextTokens,
+					hasTotalOutputTokens: inc.HasTotalOutputTokens,
+					hasPeakContextTokens: inc.HasPeakContextTokens,
 				},
 			}, true
 		}
@@ -1503,24 +1534,33 @@ func (e *Engine) tryIncrementalJSONL(
 
 	totalOut := inc.TotalOutputTokens
 	peakCtx := inc.PeakContextTokens
+	hasTotalOut := inc.HasTotalOutputTokens
+	hasPeakCtx := inc.HasPeakContextTokens
 	for _, m := range newMsgs {
-		totalOut += m.OutputTokens
-		if m.ContextTokens > peakCtx {
+		msgHasCtx, msgHasOut := m.TokenPresence()
+		if msgHasOut {
+			totalOut += m.OutputTokens
+			hasTotalOut = true
+		}
+		if msgHasCtx && (!hasPeakCtx || m.ContextTokens > peakCtx) {
 			peakCtx = m.ContextTokens
+			hasPeakCtx = true
 		}
 	}
 
 	return processResult{
 		incremental: &incrementalUpdate{
-			sessionID:         inc.ID,
-			msgs:              newMsgs,
-			endedAt:           endedAt,
-			msgCount:          inc.MsgCount + len(newMsgs),
-			userMsgCount:      inc.UserMsgCount + newUserCount,
-			fileSize:          newOffset,
-			fileMtime:         info.ModTime().UnixNano(),
-			totalOutputTokens: totalOut,
-			peakContextTokens: peakCtx,
+			sessionID:            inc.ID,
+			msgs:                 newMsgs,
+			endedAt:              endedAt,
+			msgCount:             inc.MsgCount + len(newMsgs),
+			userMsgCount:         inc.UserMsgCount + newUserCount,
+			fileSize:             newOffset,
+			fileMtime:            info.ModTime().UnixNano(),
+			totalOutputTokens:    totalOut,
+			peakContextTokens:    peakCtx,
+			hasTotalOutputTokens: hasTotalOut,
+			hasPeakContextTokens: hasPeakCtx,
 		},
 	}, true
 }
@@ -1727,6 +1767,93 @@ func (e *Engine) processOpenClaw(
 
 	sess, msgs, err := parser.ParseOpenClawSession(
 		file.Path, file.Project, e.machine,
+	)
+	if err != nil {
+		return processResult{err: err}
+	}
+	if sess == nil {
+		return processResult{}
+	}
+
+	hash, err := ComputeFileHash(file.Path)
+	if err == nil {
+		sess.File.Hash = hash
+	}
+
+	return processResult{
+		results: []parser.ParseResult{
+			{Session: *sess, Messages: msgs},
+		},
+	}
+}
+
+func (e *Engine) processKimi(
+	file parser.DiscoveredFile, info os.FileInfo,
+) processResult {
+	if e.shouldSkipByPath(file.Path, info) {
+		return processResult{skip: true}
+	}
+
+	sess, msgs, err := parser.ParseKimiSession(
+		file.Path, file.Project, e.machine,
+	)
+	if err != nil {
+		return processResult{err: err}
+	}
+	if sess == nil {
+		return processResult{}
+	}
+
+	hash, err := ComputeFileHash(file.Path)
+	if err == nil {
+		sess.File.Hash = hash
+	}
+
+	return processResult{
+		results: []parser.ParseResult{
+			{Session: *sess, Messages: msgs},
+		},
+	}
+}
+
+func (e *Engine) processKiro(
+	file parser.DiscoveredFile, info os.FileInfo,
+) processResult {
+	if e.shouldSkipByPath(file.Path, info) {
+		return processResult{skip: true}
+	}
+
+	sess, msgs, err := parser.ParseKiroSession(
+		file.Path, e.machine,
+	)
+	if err != nil {
+		return processResult{err: err}
+	}
+	if sess == nil {
+		return processResult{}
+	}
+
+	hash, err := ComputeFileHash(file.Path)
+	if err == nil {
+		sess.File.Hash = hash
+	}
+
+	return processResult{
+		results: []parser.ParseResult{
+			{Session: *sess, Messages: msgs},
+		},
+	}
+}
+
+func (e *Engine) processKiroIDE(
+	file parser.DiscoveredFile, info os.FileInfo,
+) processResult {
+	if e.shouldSkipByPath(file.Path, info) {
+		return processResult{skip: true}
+	}
+
+	sess, msgs, err := parser.ParseKiroIDESession(
+		file.Path, e.machine,
 	)
 	if err != nil {
 		return processResult{err: err}
@@ -1995,6 +2122,7 @@ func (e *Engine) writeIncremental(
 		msgCount, userMsgCount,
 		inc.fileSize, inc.fileMtime,
 		inc.totalOutputTokens, inc.peakContextTokens,
+		inc.hasTotalOutputTokens, inc.hasPeakContextTokens,
 	); err != nil {
 		return fmt.Errorf(
 			"incremental update %s: %w",
@@ -2084,22 +2212,25 @@ func (e *Engine) writeSessionFull(pw pendingWrite) error {
 
 // toDBSession converts a pendingWrite to a db.Session.
 func toDBSession(pw pendingWrite) db.Session {
+	hasTotal, hasPeak := pw.sess.TokenCoverage(pw.msgs)
 	s := db.Session{
-		ID:                pw.sess.ID,
-		Project:           pw.sess.Project,
-		Machine:           pw.sess.Machine,
-		Agent:             string(pw.sess.Agent),
-		MessageCount:      pw.sess.MessageCount,
-		UserMessageCount:  pw.sess.UserMessageCount,
-		ParentSessionID:   strPtr(pw.sess.ParentSessionID),
-		RelationshipType:  string(pw.sess.RelationshipType),
-		Cwd:               strPtr(pw.sess.Cwd),
-		TotalOutputTokens: pw.sess.TotalOutputTokens,
-		PeakContextTokens: pw.sess.PeakContextTokens,
-		FilePath:          strPtr(pw.sess.File.Path),
-		FileSize:          int64Ptr(pw.sess.File.Size),
-		FileMtime:         int64Ptr(pw.sess.File.Mtime),
-		FileHash:          strPtr(pw.sess.File.Hash),
+		ID:                   pw.sess.ID,
+		Project:              pw.sess.Project,
+		Machine:              pw.sess.Machine,
+		Agent:                string(pw.sess.Agent),
+		MessageCount:         pw.sess.MessageCount,
+		UserMessageCount:     pw.sess.UserMessageCount,
+		ParentSessionID:      strPtr(pw.sess.ParentSessionID),
+		RelationshipType:     string(pw.sess.RelationshipType),
+		Cwd:                  strPtr(pw.sess.Cwd),
+		TotalOutputTokens:    pw.sess.TotalOutputTokens,
+		PeakContextTokens:    pw.sess.PeakContextTokens,
+		HasTotalOutputTokens: hasTotal,
+		HasPeakContextTokens: hasPeak,
+		FilePath:             strPtr(pw.sess.File.Path),
+		FileSize:             int64Ptr(pw.sess.File.Size),
+		FileMtime:            int64Ptr(pw.sess.File.Mtime),
+		FileHash:             strPtr(pw.sess.File.Hash),
 	}
 	if pw.sess.FirstMessage != "" {
 		s.FirstMessage = &pw.sess.FirstMessage
@@ -2118,22 +2249,25 @@ func toDBSession(pw pendingWrite) db.Session {
 func toDBMessages(pw pendingWrite, blocked map[string]bool) []db.Message {
 	msgs := make([]db.Message, len(pw.msgs))
 	for i, m := range pw.msgs {
+		hasCtx, hasOut := m.TokenPresence()
 		msgs[i] = db.Message{
-			SessionID:     pw.sess.ID,
-			Ordinal:       m.Ordinal,
-			Role:          string(m.Role),
-			Content:       m.Content,
-			Timestamp:     timeutil.Format(m.Timestamp),
-			HasThinking:   m.HasThinking,
-			HasToolUse:    m.HasToolUse,
-			IsSystem:      m.IsSystem,
-			ContentLength: m.ContentLength,
-			ModelID:       m.ModelID,
-			ProviderID:    m.ProviderID,
-			Model:         m.Model,
-			TokenUsage:    m.TokenUsage,
-			ContextTokens: m.ContextTokens,
-			OutputTokens:  m.OutputTokens,
+			SessionID:        pw.sess.ID,
+			Ordinal:          m.Ordinal,
+			Role:             string(m.Role),
+			Content:          m.Content,
+			Timestamp:        timeutil.Format(m.Timestamp),
+			HasThinking:      m.HasThinking,
+			HasToolUse:       m.HasToolUse,
+			IsSystem:         m.IsSystem,
+			ContentLength:    m.ContentLength,
+			ModelID:          m.ModelID,
+			ProviderID:       m.ProviderID,
+			Model:            m.Model,
+			TokenUsage:       m.TokenUsage,
+			ContextTokens:    m.ContextTokens,
+			OutputTokens:     m.OutputTokens,
+			HasContextTokens: hasCtx,
+			HasOutputTokens:  hasOut,
 			ToolCalls: convertToolCalls(
 				pw.sess.ID, m.ToolCalls,
 			),
@@ -2250,12 +2384,22 @@ func (e *Engine) SyncSingleSession(sessionID string) error {
 			file.Project = filepath.Base(filepath.Dir(path))
 		}
 	case parser.AgentCursor:
-		// path is <cursorDir>/<project>/agent-transcripts/<uuid>.txt
-		// Extract project dir name from two levels up
-		projDir := filepath.Base(
-			filepath.Dir(filepath.Dir(path)),
-		)
-		file.Project = parser.DecodeCursorProjectDir(projDir)
+		// Support both flat and nested transcript layouts.
+		for _, cursorDir := range e.agentDirs[parser.AgentCursor] {
+			rel, ok := isUnder(cursorDir, path)
+			if !ok {
+				continue
+			}
+			projDir, ok := parser.ParseCursorTranscriptRelPath(rel)
+			if !ok {
+				continue
+			}
+			file.Project = parser.DecodeCursorProjectDir(projDir)
+			break
+		}
+		if file.Project == "" {
+			file.Project = "unknown"
+		}
 	case parser.AgentIflow:
 		// path is <iflowDir>/<project>/session-<uuid>.jsonl
 		// Extract project dir name from parent directory
@@ -2266,6 +2410,10 @@ func (e *Engine) SyncSingleSession(sessionID string) error {
 		} else {
 			file.Project = filepath.Base(filepath.Dir(path))
 		}
+	case parser.AgentKimi:
+		// path is <kimiDir>/<project-hash>/<session-uuid>/wire.jsonl
+		// Derive project from two levels up.
+		file.Project = filepath.Base(filepath.Dir(filepath.Dir(path)))
 	}
 
 	res := e.processFile(file)
@@ -2423,9 +2571,33 @@ func convertToolCalls(
 			InputJSON:         tc.InputJSON,
 			SkillName:         tc.SkillName,
 			SubagentSessionID: tc.SubagentSessionID,
+			ResultEvents:      convertToolResultEvents(tc.ResultEvents),
 		}
 	}
 	return calls
+}
+
+func convertToolResultEvents(
+	parsed []parser.ParsedToolResultEvent,
+) []db.ToolResultEvent {
+	if len(parsed) == 0 {
+		return nil
+	}
+	events := make([]db.ToolResultEvent, len(parsed))
+	for i, ev := range parsed {
+		events[i] = db.ToolResultEvent{
+			ToolUseID:         ev.ToolUseID,
+			AgentID:           ev.AgentID,
+			SubagentSessionID: ev.SubagentSessionID,
+			Source:            ev.Source,
+			Status:            ev.Status,
+			Content:           ev.Content,
+			ContentLength:     len(ev.Content),
+			Timestamp:         timeutil.Format(ev.Timestamp),
+			EventIndex:        i,
+		}
+	}
+	return events
 }
 
 // convertToolResults maps parsed tool results to db.ToolResult
@@ -2452,6 +2624,7 @@ func convertToolResults(
 // tool_result blocks (no displayable text).
 func pairAndFilter(msgs []db.Message, blocked map[string]bool) []db.Message {
 	pairToolResults(msgs, blocked)
+	pairToolResultEventSummaries(msgs, blocked)
 	filtered := msgs[:0]
 	for _, m := range msgs {
 		if m.Role == "user" &&
@@ -2490,4 +2663,81 @@ func pairToolResults(msgs []db.Message, blocked map[string]bool) {
 			}
 		}
 	}
+}
+
+func pairToolResultEventSummaries(
+	msgs []db.Message, blocked map[string]bool,
+) {
+	for i := range msgs {
+		for j := range msgs[i].ToolCalls {
+			tc := &msgs[i].ToolCalls[j]
+			if len(tc.ResultEvents) == 0 {
+				continue
+			}
+			summary := summarizeToolResultEvents(tc.ResultEvents)
+			tc.ResultContentLength = len(summary)
+			if blocked[tc.Category] {
+				tc.ResultContent = ""
+				tc.ResultEvents = nil
+				continue
+			}
+			tc.ResultContent = summary
+		}
+	}
+}
+
+func summarizeToolResultEvents(
+	events []db.ToolResultEvent,
+) string {
+	if len(events) == 0 {
+		return ""
+	}
+	type agentSummary struct {
+		order   int
+		content string
+	}
+	latestByAgent := map[string]agentSummary{}
+	orderedAgents := make([]string, 0, len(events))
+	lastAnon := ""
+	allHaveAgentID := true
+	for _, ev := range events {
+		if strings.TrimSpace(ev.Content) == "" {
+			continue
+		}
+		agentID := strings.TrimSpace(ev.AgentID)
+		if agentID == "" {
+			allHaveAgentID = false
+			lastAnon = ev.Content
+			continue
+		}
+		if _, ok := latestByAgent[agentID]; !ok {
+			latestByAgent[agentID] = agentSummary{
+				order:   len(orderedAgents),
+				content: ev.Content,
+			}
+			orderedAgents = append(orderedAgents, agentID)
+			continue
+		}
+		entry := latestByAgent[agentID]
+		entry.content = ev.Content
+		latestByAgent[agentID] = entry
+	}
+	if len(latestByAgent) <= 1 {
+		if len(latestByAgent) == 1 {
+			summary := latestByAgent[orderedAgents[0]].content
+			if lastAnon != "" {
+				return summary + "\n\n" + lastAnon
+			}
+			return summary
+		}
+		return lastAnon
+	}
+	parts := make([]string, 0, len(orderedAgents))
+	for _, agentID := range orderedAgents {
+		parts = append(parts, agentID+":\n"+latestByAgent[agentID].content)
+	}
+	if !allHaveAgentID && lastAnon != "" {
+		parts = append(parts, lastAnon)
+	}
+	return strings.Join(parts, "\n\n")
 }

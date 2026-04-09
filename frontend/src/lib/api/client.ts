@@ -2,7 +2,6 @@ import type {
   SessionPage,
   Session,
   MessagesResponse,
-  MinimapResponse,
   SearchResponse,
   ProjectsResponse,
   MachinesResponse,
@@ -34,6 +33,7 @@ import type {
   PinsResponse,
   TrashResponse,
 } from "./types.js";
+import type { SessionActivityResponse } from "./types/session-activity.js";
 
 const SERVER_URL_KEY = "agentsview-server-url";
 const AUTH_TOKEN_KEY = "agentsview-auth-token";
@@ -171,6 +171,14 @@ export function getChildSessions(
   return fetchJSON(`/sessions/${id}/children`, init);
 }
 
+export function getSessionActivity(
+  sessionId: string,
+): Promise<SessionActivityResponse> {
+  return fetchJSON(
+    `/sessions/${sessionId}/activity`,
+  );
+}
+
 /* Messages */
 
 export interface GetMessagesParams {
@@ -190,20 +198,6 @@ export function getMessages(
   );
 }
 
-export interface GetMinimapParams {
-  from?: number;
-  max?: number;
-}
-
-export function getMinimap(
-  sessionId: string,
-  params: GetMinimapParams = {},
-): Promise<MinimapResponse> {
-  return fetchJSON(
-    `/sessions/${sessionId}/minimap${buildQuery({ ...params })}`,
-  );
-}
-
 /* Search */
 
 export function search(
@@ -212,6 +206,7 @@ export function search(
     project?: string;
     limit?: number;
     cursor?: number;
+    sort?: "relevance" | "recency";
   } = {},
   init?: RequestInit,
 ): Promise<SearchResponse> {
@@ -238,26 +233,31 @@ export function searchSession(
 
 /* Metadata */
 
+interface MetadataParams {
+  include_one_shot?: boolean;
+  include_automated?: boolean;
+}
+
 export function getProjects(
-  params: { include_one_shot?: boolean } = {},
+  params: MetadataParams = {},
 ): Promise<ProjectsResponse> {
   return fetchJSON(`/projects${buildQuery({ ...params })}`);
 }
 
 export function getMachines(
-  params: { include_one_shot?: boolean } = {},
+  params: MetadataParams = {},
 ): Promise<MachinesResponse> {
   return fetchJSON(`/machines${buildQuery({ ...params })}`);
 }
 
 export function getAgents(
-  params: { include_one_shot?: boolean } = {},
+  params: MetadataParams = {},
 ): Promise<AgentsResponse> {
   return fetchJSON(`/agents${buildQuery({ ...params })}`);
 }
 
 export function getStats(
-  params: { include_one_shot?: boolean } = {},
+  params: MetadataParams = {},
 ): Promise<Stats> {
   return fetchJSON(`/stats${buildQuery({ ...params })}`);
 }
@@ -665,6 +665,7 @@ export interface AnalyticsParams {
   hour?: number;
   min_user_messages?: number;
   include_one_shot?: boolean;
+  include_automated?: boolean;
   active_since?: string;
 }
 
@@ -924,6 +925,124 @@ export function listTrash(): Promise<TrashResponse> {
 
 export async function emptyTrash(): Promise<{ deleted: number }> {
   return fetchJSON("/trash", { method: "DELETE" });
+}
+
+/* Import */
+
+export interface ImportStats {
+  imported: number;
+  updated: number;
+  skipped: number;
+  errors: number;
+}
+
+export interface ImportCallbacks {
+  onProgress?: (stats: ImportStats) => void;
+  onIndexing?: () => void;
+}
+
+async function readImportSSE(
+  res: Response,
+  cb?: ImportCallbacks,
+): Promise<ImportStats> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let result: ImportStats | null = null;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+
+    // Process complete SSE frames (double newline delimited).
+    let idx: number;
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const frame = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+
+      let event = "";
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event: ")) event = line.slice(7);
+        else if (line.startsWith("data: ")) data = line.slice(6);
+      }
+      if (!event || !data) continue;
+
+      const parsed = JSON.parse(data);
+      switch (event) {
+        case "progress":
+          cb?.onProgress?.(parsed as ImportStats);
+          break;
+        case "indexing":
+          cb?.onIndexing?.();
+          break;
+        case "done":
+          result = parsed as ImportStats;
+          break;
+        case "error":
+          throw new Error(
+            (parsed as { error?: string }).error
+            ?? "Import failed",
+          );
+      }
+    }
+  }
+
+  if (!result) throw new Error("Import stream ended without result");
+  return result;
+}
+
+export async function importClaudeAI(
+  file: File,
+  cb?: ImportCallbacks,
+): Promise<ImportStats> {
+  const form = new FormData();
+  form.append("file", file);
+  const init = authHeaders({ method: "POST", body: form });
+  const headers = new Headers(init.headers);
+  headers.set("Accept", "text/event-stream");
+  const res = await fetch(
+    `${getBase()}/import/claude-ai`,
+    { ...init, headers },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(
+      (err as { error?: string }).error
+      ?? `Import failed (${res.status})`,
+    );
+  }
+  if (res.headers.get("content-type")?.includes("text/event-stream")) {
+    return readImportSSE(res, cb);
+  }
+  return res.json();
+}
+
+export async function importChatGPT(
+  file: File,
+  cb?: ImportCallbacks,
+): Promise<ImportStats> {
+  const form = new FormData();
+  form.append("file", file);
+  const init = authHeaders({ method: "POST", body: form });
+  const headers = new Headers(init.headers);
+  headers.set("Accept", "text/event-stream");
+  const res = await fetch(
+    `${getBase()}/import/chatgpt`,
+    { ...init, headers },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(
+      (err as { error?: string }).error
+      ?? `Import failed (${res.status})`,
+    );
+  }
+  if (res.headers.get("content-type")?.includes("text/event-stream")) {
+    return readImportSSE(res, cb);
+  }
+  return res.json();
 }
 
 /* Pins */

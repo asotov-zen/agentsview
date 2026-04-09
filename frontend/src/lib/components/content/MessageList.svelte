@@ -12,41 +12,77 @@
     buildDisplayItems,
     type DisplayItem,
   } from "../../utils/display-items.js";
+  import { filterDisplayItemsByTranscriptMode } from "../../utils/transcript-mode.js";
   import {
     hasVisibleSegments,
   } from "../../utils/content-parser.js";
+  import { isSystemMessage } from "../../utils/messages.js";
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+  import { sessionActivity } from "../../stores/sessionActivity.svelte.js";
   import SessionFindBar from "./SessionFindBar.svelte";
 
   let containerRef: HTMLDivElement | undefined = $state(undefined);
   let scrollRaf: number | null = $state(null);
   let lastScrollRequest = 0;
 
-  let filteredMessages: Message[] = $derived.by(() => {
+  let baseMessages: Message[] = $derived.by(() => {
     let msgs = messages.messages;
 
     // Filter system messages unless toggled on
     if (!ui.showSystem) {
-      msgs = msgs.filter((m) => !m.is_system);
-    }
-
-    // Hide messages where all segments are filtered out
-    // (e.g. hiding "Assistant text" still shows code/tool/thinking
-    // nested inside assistant messages, but hides pure-text ones)
-    if (ui.hasBlockFilters) {
-      msgs = msgs.filter((m) =>
-        hasVisibleSegments(m, (type) => ui.isBlockVisible(type)),
-      );
+      msgs = msgs.filter((m) => !isSystemMessage(m));
     }
 
     return msgs;
   });
 
-  let displayItemsAsc = $derived(
-    buildDisplayItems(filteredMessages, {
+  let baseDisplayItemsAsc = $derived(
+    buildDisplayItems(baseMessages),
+  );
+
+  let filteredDisplayItemsAsc = $derived(
+    buildDisplayItems(baseMessages, {
       skipToolGrouping: !ui.isBlockVisible("tool"),
     }),
   );
+
+  function isItemVisible(item: DisplayItem): boolean {
+    if (item.kind === "tool-group") {
+      return true;
+    }
+    return hasVisibleSegments(item.message, (type) =>
+      ui.isBlockVisible(type),
+    );
+  }
+
+  let normalDisplayItemsAsc = $derived.by(() => {
+    if (!ui.hasBlockFilters) return baseDisplayItemsAsc;
+    return filteredDisplayItemsAsc.filter(isItemVisible);
+  });
+
+  let displayItemsAsc = $derived.by(() => {
+    if (ui.transcriptMode === "normal") {
+      return normalDisplayItemsAsc;
+    }
+
+    if (!ui.hasBlockFilters) {
+      return filterDisplayItemsByTranscriptMode(
+        baseDisplayItemsAsc,
+        "focused",
+      );
+    }
+
+    return filterDisplayItemsByTranscriptMode(
+      filteredDisplayItemsAsc,
+      "focused",
+      {
+        isMessageVisible: (message) =>
+          hasVisibleSegments(message, (type) =>
+            ui.isBlockVisible(type),
+          ),
+      },
+    ).filter(isItemVisible);
+  });
 
   function itemAt(index: number) {
     if (ui.sortNewestFirst) {
@@ -98,24 +134,70 @@
     };
   }
 
+  function publishVisibleTimestamp() {
+    const v = virtualizer.instance;
+    if (!v) return;
+    const items = v.getVirtualItems();
+    // Skip overscanned items above the viewport.
+    const scrollTop = v.scrollOffset ?? 0;
+    for (const vi of items) {
+      if (vi.end <= scrollTop) continue;
+      const item =
+        displayItemsAsc[
+          ui.sortNewestFirst
+            ? displayItemsAsc.length - 1 - vi.index
+            : vi.index
+        ];
+      if (!item) continue;
+      const ts =
+        item.kind === "message"
+          ? item.message.timestamp
+          : item.timestamp;
+      if (ts) {
+        sessionActivity.firstVisibleTimestamp = ts;
+        return;
+      }
+    }
+    sessionActivity.firstVisibleTimestamp = null;
+  }
+
+  // Recompute visible timestamp when minimap opens or
+  // message content changes (e.g. SSE reload).
+  $effect(() => {
+    if (ui.activityMinimapOpen) {
+      // Track message array so the effect re-runs after
+      // content changes while the minimap is open.
+      void messages.messages.length;
+      publishVisibleTimestamp();
+    }
+  });
+
   function handleScroll() {
     if (!containerRef) return;
     if (scrollRaf !== null) return;
     scrollRaf = requestAnimationFrame(() => {
       scrollRaf = null;
       if (!containerRef) return;
-      const items = virtualizer.instance?.getVirtualItems() ?? [];
+      const items =
+        virtualizer.instance?.getVirtualItems() ?? [];
       if (items.length > 0 && messages.hasOlder) {
         const firstVisible = items[0]!.index;
-        const lastVisible = items[items.length - 1]!.index;
+        const lastVisible =
+          items[items.length - 1]!.index;
         const threshold = 30;
         if (
           (ui.sortNewestFirst &&
-            lastVisible >= displayItemsAsc.length - threshold) ||
-          (!ui.sortNewestFirst && firstVisible <= threshold)
+            lastVisible >=
+              displayItemsAsc.length - threshold) ||
+          (!ui.sortNewestFirst &&
+            firstVisible <= threshold)
         ) {
           messages.loadOlder();
         }
+      }
+
+      if (ui.activityMinimapOpen) {
+        publishVisibleTimestamp();
       }
     });
   }
@@ -129,40 +211,69 @@
 
   function scrollToDisplayIndex(
     index: number,
-    attempt: number = 0,
+    waitFrames: number = 0,
+    scrollRetries: number = 0,
+    reqId: number = lastScrollRequest,
   ) {
+    if (reqId !== lastScrollRequest) return;
+
     const v = virtualizer.instance;
     if (!v) return;
 
+    // Phase 1: wait up to 5 frames for virtualCount to sync.
     const desiredCount = displayItemsAsc.length;
     const virtualCount = v.options.count;
     if (
-      attempt < 5 &&
+      waitFrames < 5 &&
       (virtualCount !== desiredCount || index >= virtualCount)
     ) {
       requestAnimationFrame(() => {
-        scrollToDisplayIndex(index, attempt + 1);
+        scrollToDisplayIndex(
+          index, waitFrames + 1, 0, reqId,
+        );
       });
       return;
     }
 
-    // TanStack's scrollToIndex may continuously re-seek
-    // in dynamic mode. Use one offset seek to avoid
-    // visible scroll "fight."
-    const offsetAndAlign =
-      v.getOffsetForIndex(index, "start");
-    if (offsetAndAlign) {
-      const [offset] = offsetAndAlign;
-      v.scrollToOffset(
-        Math.round(offset),
-        { align: "start" },
-      );
+    // Phase 2a: item already rendered — use exact measured offset.
+    const virtualItems = v.getVirtualItems();
+    const isRendered = virtualItems.some(
+      (vi) => vi.index === index,
+    );
+    if (isRendered) {
+      const offsetAndAlign =
+        v.getOffsetForIndex(index, "start");
+      if (offsetAndAlign) {
+        const [offset] = offsetAndAlign;
+        v.scrollToOffset(
+          Math.round(offset),
+          { align: "start" },
+        );
+      }
       return;
     }
 
-    // Item not yet measured — use scrollToIndex which will
-    // estimate and then correct once measured.
+    // Phase 2b: item not yet in render window. scrollToIndex
+    // scrolls to an estimated position, but TanStack's reconcile
+    // loop exits after 1 stable frame — before ResizeObserver
+    // measurements (delayed by bumpVersion's setTimeout(0)) have
+    // updated the offsets.
+    //
+    // Retry in 2 frames: by then ResizeObserver + bumpVersion have
+    // fired, measurements are updated, and the next attempt either
+    // finds the item rendered (for an exact offset scroll) or
+    // repeats with a more accurate estimate. Limit to 15 scroll
+    // retries (~480 ms) to avoid looping forever.
     v.scrollToIndex(index, { align: "start" });
+    if (scrollRetries < 15) {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          scrollToDisplayIndex(
+            index, waitFrames, scrollRetries + 1, reqId,
+          );
+        });
+      });
+    }
   }
 
   function raf(): Promise<void> {
@@ -179,7 +290,7 @@
       const idx = ui.sortNewestFirst
         ? displayItemsAsc.length - 1 - idxAsc
         : idxAsc;
-      scrollToDisplayIndex(idx);
+      scrollToDisplayIndex(idx, 0, 0, reqId);
       return;
     }
 
@@ -201,7 +312,7 @@
     const loadedIdx = ui.sortNewestFirst
       ? displayItemsAsc.length - 1 - loadedIdxAsc
       : loadedIdxAsc;
-    scrollToDisplayIndex(loadedIdx);
+    scrollToDisplayIndex(loadedIdx, 0, 0, reqId);
   }
 
   export function scrollToOrdinal(ordinal: number) {
@@ -210,6 +321,10 @@
 
   export function getDisplayItems(): DisplayItem[] {
     return displayItemsAsc;
+  }
+
+  export function getNormalDisplayItems(): DisplayItem[] {
+    return normalDisplayItemsAsc;
   }
 
   let highlightQuery = $derived(

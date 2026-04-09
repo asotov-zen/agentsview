@@ -21,10 +21,13 @@
   let { content, label, toolCall, highlightQuery = "", isCurrentHighlight = false }: Props = $props();
   let userCollapsed: boolean = $state(true);
   let userOutputCollapsed: boolean = $state(true);
+  let userHistoryCollapsed: boolean = $state(true);
   let userOverride: boolean = $state(false);
   let userOutputOverride: boolean = $state(false);
+  let userHistoryOverride: boolean = $state(false);
   let searchExpandedInput: boolean = $state(false);
   let searchExpandedOutput: boolean = $state(false);
+  let searchExpandedHistory: boolean = $state(false);
   let prevQuery: string = "";
 
   // Auto-expand when a search match exists in input or output
@@ -42,14 +45,19 @@
     const inputText = (
       taskPrompt ?? content ?? fallbackContent ?? ""
     ).toLowerCase();
+    const historyText = (
+      toolCall?.result_events?.map((event) => event.content).join("\n\n") ?? ""
+    ).toLowerCase();
     const outputText = (
-      toolCall?.result_content ?? ""
+      [toolCall?.result_content ?? "", historyText].filter(Boolean).join("\n\n")
     ).toLowerCase();
     searchExpandedInput = inputText.includes(q);
     searchExpandedOutput = outputText.includes(q);
+    searchExpandedHistory = historyText.includes(q);
     if (hq !== prevQuery) {
       userOverride = false;
       userOutputOverride = false;
+      userHistoryOverride = false;
       prevQuery = hq;
     }
   });
@@ -64,12 +72,25 @@
       : searchExpandedOutput ? false
       : userOutputCollapsed,
   );
+  let historyCollapsed = $derived(
+    userHistoryOverride ? userHistoryCollapsed
+      : searchExpandedHistory ? false
+      : userHistoryCollapsed,
+  );
 
   let outputPreviewLine = $derived.by(() => {
     const rc = toolCall?.result_content;
     if (!rc) return "";
     const nl = rc.indexOf("\n");
     return (nl === -1 ? rc : rc.slice(0, nl)).slice(0, 100);
+  });
+
+  let resultEvents = $derived(toolCall?.result_events ?? []);
+
+  let historyPreviewLine = $derived.by(() => {
+    const last = resultEvents[resultEvents.length - 1];
+    if (!last) return "";
+    return `${last.status}: ${last.content.split("\n")[0]}`.slice(0, 100);
   });
 
   /** Parsed input parameters from structured tool call data */
@@ -185,6 +206,16 @@
   let subagentSessionId = $derived(
     isTask ? toolCall?.subagent_session_id ?? null : null,
   );
+  let isDiff = $derived.by(() => {
+    const text = fallbackContent ?? content ?? "";
+    return text.startsWith("--- a/") || text.startsWith("@@");
+  });
+
+  let diffLines = $derived.by(() => {
+    if (!isDiff) return [];
+    const raw = fallbackContent ?? content ?? "";
+    return raw.split("\n");
+  });
 </script>
 
 <div class="tool-block">
@@ -222,6 +253,12 @@
       <pre class="tool-content" use:applyHighlight={{ q: highlightQuery, current: isCurrentHighlight, content: taskPrompt }}>{@html escapeHTML(taskPrompt)}</pre>
     {:else if content}
       <pre class="tool-content" use:applyHighlight={{ q: highlightQuery, current: isCurrentHighlight, content }}>{@html escapeHTML(content)}</pre>
+    {:else if fallbackContent && isDiff}
+      <div class="diff-view">
+        {#each diffLines as line}
+          <div class="diff-line {line.startsWith('@@') ? 'diff-hunk' : line.startsWith('+') ? 'diff-add' : line.startsWith('-') ? 'diff-del' : 'diff-ctx'}">{line}</div>
+        {/each}
+      </div>
     {:else if fallbackContent}
       <pre class="tool-content" use:applyHighlight={{ q: highlightQuery, current: isCurrentHighlight, content: fallbackContent }}>{@html escapeHTML(fallbackContent)}</pre>
     {/if}
@@ -246,6 +283,51 @@
       </button>
       {#if !outputCollapsed}
         <pre class="tool-content output-content" use:applyHighlight={{ q: highlightQuery, current: isCurrentHighlight, content: toolCall.result_content }}>{@html escapeHTML(toolCall.result_content)}</pre>
+      {/if}
+    {/if}
+    {#if resultEvents.length > 0}
+      <button
+        class="history-header"
+        onclick={(e) => {
+          e.stopPropagation();
+          const sel = window.getSelection();
+          if (sel && sel.toString().length > 0) return;
+          userHistoryCollapsed = !userHistoryCollapsed;
+          userHistoryOverride = true;
+        }}
+      >
+        <span class="tool-chevron" class:open={!historyCollapsed}>
+          &#9656;
+        </span>
+        <span class="output-label">history</span>
+        {#if historyCollapsed && historyPreviewLine}
+          <span class="tool-preview">{historyPreviewLine}</span>
+        {/if}
+      </button>
+      {#if !historyCollapsed}
+        <div class="result-history">
+          {#each resultEvents as event (event.event_index)}
+            <div class="result-event">
+              <div class="result-event-meta">
+                <span class="meta-tag">
+                  <span class="meta-label">status:</span>
+                  {event.status}
+                </span>
+                <span class="meta-tag">
+                  <span class="meta-label">source:</span>
+                  {event.source}
+                </span>
+                {#if event.agent_id}
+                  <span class="meta-tag">
+                    <span class="meta-label">agent:</span>
+                    {event.agent_id}
+                  </span>
+                {/if}
+              </div>
+              <pre class="tool-content output-content history-content" use:applyHighlight={{ q: highlightQuery, current: isCurrentHighlight, content: event.content }}>{@html escapeHTML(event.content)}</pre>
+            </div>
+          {/each}
+        </div>
       {/if}
     {/if}
   {/if}
@@ -365,6 +447,26 @@
     color: var(--text-primary);
   }
 
+  .history-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    width: 100%;
+    text-align: left;
+    font-size: 12px;
+    color: var(--text-secondary);
+    min-width: 0;
+    border-top: 1px solid var(--border-muted);
+    transition: background 0.1s;
+    user-select: text;
+  }
+
+  .history-header:hover {
+    background: var(--bg-surface-hover);
+    color: var(--text-primary);
+  }
+
   .output-label {
     font-family: var(--font-mono);
     font-weight: 500;
@@ -377,5 +479,62 @@
   .output-content {
     max-height: 300px;
     overflow-y: auto;
+  }
+
+  .result-history {
+    border-top: 1px solid var(--border-muted);
+  }
+
+  .result-event + .result-event {
+    border-top: 1px solid var(--border-muted);
+  }
+
+  .result-event-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 6px 14px 0;
+  }
+
+  .history-content {
+    border-top: 0;
+    margin-top: 0;
+  }
+
+  .diff-view {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    overflow-x: auto;
+    border-top: 1px solid var(--border-muted);
+    padding: 4px 0;
+    max-height: 400px;
+    overflow-y: auto;
+  }
+
+  .diff-line {
+    padding: 0 14px;
+    white-space: pre;
+  }
+
+  .diff-hunk {
+    color: var(--accent-blue, #58a6ff);
+    background: color-mix(in srgb, var(--accent-blue, #58a6ff) 8%, transparent);
+    padding: 2px 14px;
+    margin: 2px 0;
+  }
+
+  .diff-add {
+    color: var(--accent-green, #3fb950);
+    background: color-mix(in srgb, var(--accent-green, #3fb950) 10%, transparent);
+  }
+
+  .diff-del {
+    color: var(--accent-red, #f85149);
+    background: color-mix(in srgb, var(--accent-red, #f85149) 10%, transparent);
+  }
+
+  .diff-ctx {
+    color: var(--text-muted);
   }
 </style>

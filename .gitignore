@@ -32,6 +32,9 @@ Thumbs.db
 .idea/
 .vscode/
 
+# Python
+__pycache__/
+
 # Build caches
 .gocache
 .cache
@@ -44,3 +47,4 @@ sessions/
 html/
 .superset/
 .github/hooks/
+.superpowers/

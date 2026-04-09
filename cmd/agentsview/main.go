@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -55,6 +54,12 @@ func main() {
 		case "token-use":
 			runTokenUse(os.Args[2:])
 			return
+		case "import":
+			runImport(os.Args[2:])
+			return
+		case "projects":
+			runProjects(os.Args[2:])
+			return
 		case "version", "--version", "-v":
 			fmt.Printf("agentsview %s (commit %s, built %s)\n",
 				version, commit, buildDate)
@@ -84,6 +89,9 @@ Usage:
   agentsview pg serve [flags] Serve from PostgreSQL (read-only)
   agentsview token-use <id>   Show token usage for a session (JSON)
   agentsview prune [flags]    Delete sessions matching filters
+  agentsview import --type <type> <path>
+                          Import conversations (claude-ai, chatgpt)
+  agentsview projects [flags] List projects with session counts
   agentsview update [flags]   Check for and install updates
   agentsview version          Show version information
   agentsview help             Show this help
@@ -107,6 +115,9 @@ Sync flags:
 
 PG push flags:
   -full              Bypass per-message skip heuristic
+  -projects string   Comma-separated projects to push (inclusive)
+  -exclude-projects string  Comma-separated projects to exclude from push
+  -all-projects      Ignore configured project filters for this run
 
 PG serve flags:
   -host string       Host to bind to (default "127.0.0.1")
@@ -119,6 +130,9 @@ Prune flags:
   -first-message str  Sessions whose first message starts with this text
   -dry-run            Show what would be pruned without deleting
   -yes                Skip confirmation prompt
+
+Projects flags:
+  -json              Output as JSON array
 
 Update flags:
   -check              Check for updates without installing
@@ -215,27 +229,30 @@ func runServe(args []string) {
 	)
 	defer stop()
 
-	engine := sync.NewEngine(database, sync.EngineConfig{
-		AgentDirs:               cfg.AgentDirs,
-		Machine:                 "local",
-		BlockedResultCategories: cfg.ResultContentBlockedCategories,
-	})
+	var engine *sync.Engine
+	if !cfg.NoSync {
+		engine = sync.NewEngine(database, sync.EngineConfig{
+			AgentDirs:               cfg.AgentDirs,
+			Machine:                 "local",
+			BlockedResultCategories: cfg.ResultContentBlockedCategories,
+		})
 
-	if database.NeedsResync() {
-		runInitialResync(ctx, engine)
-	} else {
-		runInitialSync(ctx, engine)
-	}
-	if ctx.Err() != nil {
-		return
-	}
+		if database.NeedsResync() {
+			runInitialResync(ctx, engine)
+		} else {
+			runInitialSync(ctx, engine)
+		}
+		if ctx.Err() != nil {
+			return
+		}
 
-	stopWatcher, unwatchedDirs := startFileWatcher(cfg, engine)
-	defer stopWatcher()
+		stopWatcher, unwatchedDirs := startFileWatcher(cfg, engine)
+		defer stopWatcher()
 
-	go startPeriodicSync(engine)
-	if len(unwatchedDirs) > 0 {
-		go startUnwatchedPoll(engine)
+		go startPeriodicSync(engine)
+		if len(unwatchedDirs) > 0 {
+			go startUnwatchedPoll(engine)
+		}
 	}
 
 	// Auto-bind to 0.0.0.0 when remote access is enabled so the
@@ -256,27 +273,15 @@ func runServe(args []string) {
 		}
 	}
 
-	requestedPort := cfg.Port
-	port := server.FindAvailablePort(cfg.Host, cfg.Port)
-	if port != cfg.Port {
-		fmt.Printf("Port %d in use, using %d\n", cfg.Port, port)
+	rtOpts := serveRuntimeOptions{
+		Mode:          "serve",
+		RequestedPort: cfg.Port,
 	}
-	cfg.Port = port
-	if cfg.Proxy.Mode == "" && cfg.PublicURL != "" {
-		updatedURL, updatedOrigins, changed, err := rewriteConfiguredPublicURLPort(
-			cfg.PublicURL,
-			cfg.PublicOrigins,
-			requestedPort,
-			cfg.Port,
-		)
-		if err != nil {
-			fatal("invalid public url: %v", err)
-		}
-		if changed {
-			cfg.PublicURL = updatedURL
-			cfg.PublicOrigins = updatedOrigins
-		}
+	preparedCfg, prepErr := prepareServeRuntimeConfig(cfg, rtOpts)
+	if prepErr != nil {
+		fatal("%v", prepErr)
 	}
+	cfg = preparedCfg
 
 	srv := server.New(cfg, database, engine,
 		server.WithVersion(server.VersionInfo{
@@ -288,66 +293,12 @@ func runServe(args []string) {
 		server.WithBaseContext(ctx),
 	)
 
-	serveErrCh := make(chan error, 1)
-	go func() {
-		serveErrCh <- srv.ListenAndServe()
-	}()
-	if err := waitForLocalPort(
-		ctx, cfg.Host, cfg.Port, 5*time.Second, serveErrCh,
-	); err != nil {
-		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(), 5*time.Second,
-		)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+	rt, err := startServerWithOptionalCaddy(ctx, cfg, srv, rtOpts)
+	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
-		fatal("server failed to start: %v", err)
-	}
-
-	var caddy *managedCaddy
-	if cfg.Proxy.Mode == "caddy" {
-		var err error
-		caddy, err = startManagedCaddy(ctx, cfg)
-		if err != nil {
-			shutdownCtx, cancel := context.WithTimeout(
-				context.Background(), 5*time.Second,
-			)
-			defer cancel()
-			_ = srv.Shutdown(shutdownCtx)
-			fatal("managed caddy error: %v", err)
-		}
-		defer caddy.Stop()
-
-		publicPort, err := publicURLPort(cfg.PublicURL)
-		if err != nil {
-			shutdownCtx, cancel := context.WithTimeout(
-				context.Background(), 5*time.Second,
-			)
-			defer cancel()
-			caddy.Stop()
-			_ = srv.Shutdown(shutdownCtx)
-			fatal("invalid public url: %v", err)
-		}
-		if err := waitForLocalPort(
-			ctx,
-			cfg.Proxy.BindHost,
-			publicPort,
-			5*time.Second,
-			caddy.Err(),
-		); err != nil {
-			shutdownCtx, cancel := context.WithTimeout(
-				context.Background(), 5*time.Second,
-			)
-			defer cancel()
-			caddy.Stop()
-			_ = srv.Shutdown(shutdownCtx)
-			if errors.Is(err, context.Canceled) {
-				return
-			}
-			fatal("managed caddy error: %v", err)
-		}
+		fatal("%v", err)
 	}
 
 	// Server is ready — write the definitive state file with the
@@ -356,7 +307,7 @@ func runServe(args []string) {
 	// is active" marker so token-use doesn't start a competing
 	// on-demand sync against our live DB.
 	if _, sfErr := server.WriteStateFile(
-		cfg.DataDir, cfg.Host, cfg.Port, version,
+		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version,
 	); sfErr != nil {
 		log.Printf(
 			"warning: could not write state file: %v"+
@@ -364,68 +315,27 @@ func runServe(args []string) {
 			sfErr,
 		)
 	} else {
-		defer server.RemoveStateFile(cfg.DataDir, cfg.Port)
-		server.RemoveStartupLock(cfg.DataDir)
+		defer server.RemoveStateFile(rt.Cfg.DataDir, rt.Cfg.Port)
+		server.RemoveStartupLock(rt.Cfg.DataDir)
 	}
 
-	localURL := fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
-	publicURL := browserURL(cfg)
-	if publicURL == localURL {
+	if rt.PublicURL == rt.LocalURL {
 		fmt.Printf(
 			"agentsview %s listening at %s (started in %s)\n",
-			version, localURL,
+			version, rt.LocalURL,
 			time.Since(start).Round(time.Millisecond),
 		)
 	} else {
 		fmt.Printf(
 			"agentsview %s backend at %s, public at %s (started in %s)\n",
-			version, localURL, publicURL,
+			version, rt.LocalURL, rt.PublicURL,
 			time.Since(start).Round(time.Millisecond),
 		)
 	}
+	fmt.Printf("Database: %s\n", cfg.DBPath)
 
-	var caddyErrCh <-chan error
-	if caddy != nil {
-		caddyErrCh = caddy.Err()
-	}
-
-	select {
-	case err := <-serveErrCh:
-		if err != nil && err != http.ErrServerClosed {
-			caddy.Stop()
-			fatal("server error: %v", err)
-		}
-	case err := <-caddyErrCh:
-		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(), 5*time.Second,
-		)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-		if ctx.Err() != nil {
-			if serveErr := <-serveErrCh; serveErr != nil &&
-				serveErr != http.ErrServerClosed {
-				fatal("server error: %v", serveErr)
-			}
-			return
-		}
-		if err != nil {
-			fatal("managed caddy error: %v", err)
-		}
-		fatal("managed caddy exited unexpectedly")
-	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(), 5*time.Second,
-		)
-		defer cancel()
-		caddy.Stop()
-		if err := srv.Shutdown(shutdownCtx); err != nil &&
-			err != http.ErrServerClosed {
-			fatal("server shutdown error: %v", err)
-		}
-		if err := <-serveErrCh; err != nil &&
-			err != http.ErrServerClosed {
-			fatal("server error: %v", err)
-		}
+	if err := waitForServerRuntime(ctx, srv, rt); err != nil {
+		fatal("%v", err)
 	}
 }
 

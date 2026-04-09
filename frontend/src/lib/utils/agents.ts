@@ -25,6 +25,11 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     label: "OpenClaw",
   },
   { name: "iflow", color: "var(--accent-sky)", label: "iFlow" },
+  { name: "kimi", color: "var(--accent-pink)", label: "Kimi" },
+  { name: "claude-ai", color: "var(--accent-violet)", label: "Claude.ai" },
+  { name: "chatgpt", color: "var(--accent-lime)", label: "ChatGPT" },
+  { name: "kiro", color: "var(--accent-lime)", label: "Kiro" },
+  { name: "kiro-ide", color: "var(--accent-lime)", label: "Kiro IDE" }
 ];
 
 const agentColorMap = new Map(

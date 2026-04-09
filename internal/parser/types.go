@@ -22,6 +22,11 @@ const (
 	AgentVSCodeCopilot AgentType = "vscode-copilot"
 	AgentPi            AgentType = "pi"
 	AgentOpenClaw      AgentType = "openclaw"
+	AgentKimi          AgentType = "kimi"
+	AgentClaudeAI      AgentType = "claude-ai"
+	AgentChatGPT       AgentType = "chatgpt"
+	AgentKiro          AgentType = "kiro"
+	AgentKiroIDE       AgentType = "kiro-ide"
 )
 
 // AgentDef describes a supported coding agent's filesystem
@@ -195,6 +200,62 @@ var Registry = []AgentDef{
 		DiscoverFunc:   DiscoverOpenClawSessions,
 		FindSourceFunc: FindOpenClawSourceFile,
 	},
+	{
+		Type:           AgentKimi,
+		DisplayName:    "Kimi",
+		EnvVar:         "KIMI_DIR",
+		ConfigKey:      "kimi_dirs",
+		DefaultDirs:    []string{".kimi/sessions"},
+		IDPrefix:       "kimi:",
+		FileBased:      true,
+		DiscoverFunc:   DiscoverKimiSessions,
+		FindSourceFunc: FindKimiSourceFile,
+	},
+	{
+		Type:        AgentClaudeAI,
+		DisplayName: "Claude.ai",
+		IDPrefix:    "claude-ai:",
+		FileBased:   false,
+	},
+	{
+		Type:        AgentChatGPT,
+		DisplayName: "ChatGPT",
+		IDPrefix:    "chatgpt:",
+		FileBased:   false,
+	},
+	{
+		Type:           AgentKiro,
+		DisplayName:    "Kiro",
+		EnvVar:         "KIRO_SESSIONS_DIR",
+		ConfigKey:      "kiro_dirs",
+		DefaultDirs:    []string{".kiro/sessions/cli"},
+		IDPrefix:       "kiro:",
+		FileBased:      true,
+		DiscoverFunc:   DiscoverKiroSessions,
+		FindSourceFunc: FindKiroSourceFile,
+	},
+	{
+		Type:           AgentKiroIDE,
+		DisplayName:    "Kiro IDE",
+		EnvVar:         "KIRO_IDE_DIR",
+		ConfigKey:      "kiro_ide_dirs",
+		DefaultDirs:    kiroIDEDefaultDirs(),
+		IDPrefix:       "kiro-ide:",
+		FileBased:      true,
+		DiscoverFunc:   DiscoverKiroIDESessions,
+		FindSourceFunc: FindKiroIDESourceFile,
+	},
+}
+
+// NonFileBackedAgents returns agent types where FileBased is false.
+func NonFileBackedAgents() []AgentType {
+	var agents []AgentType
+	for _, def := range Registry {
+		if !def.FileBased {
+			agents = append(agents, def.Type)
+		}
+	}
+	return agents
 }
 
 // AgentByType returns the AgentDef for the given type.
@@ -264,14 +325,21 @@ type ParsedSession struct {
 	RelationshipType RelationshipType
 	Cwd              string
 	FirstMessage     string
+	DisplayName      string
 	StartedAt        time.Time
 	EndedAt          time.Time
 	MessageCount     int
 	UserMessageCount int
 	File             FileInfo
 
-	TotalOutputTokens int
-	PeakContextTokens int
+	TotalOutputTokens    int
+	PeakContextTokens    int
+	HasTotalOutputTokens bool
+	HasPeakContextTokens bool
+
+	// aggregateTokenPresenceKnown marks session aggregate token
+	// coverage as parser-owned and authoritative.
+	aggregateTokenPresenceKnown bool
 }
 
 // ParsedToolCall holds a single tool invocation extracted from
@@ -283,6 +351,7 @@ type ParsedToolCall struct {
 	InputJSON         string // raw JSON of the input object
 	SkillName         string // skill name when ToolName is "Skill"
 	SubagentSessionID string // linked subagent session file (e.g. "agent-{task_id}")
+	ResultEvents      []ParsedToolResultEvent
 }
 
 // ParsedToolResult holds metadata about a tool result block in a
@@ -291,6 +360,18 @@ type ParsedToolResult struct {
 	ToolUseID     string
 	ContentLength int
 	ContentRaw    string // raw JSON of the content field; decode with DecodeContent
+}
+
+// ParsedToolResultEvent is a canonical chronological update attached
+// to a tool call. Used for Codex subagent terminal status updates.
+type ParsedToolResultEvent struct {
+	ToolUseID         string
+	AgentID           string
+	SubagentSessionID string
+	Source            string
+	Status            string
+	Content           string
+	Timestamp         time.Time
 }
 
 // ParsedMessage holds a single extracted message.
@@ -308,10 +389,114 @@ type ParsedMessage struct {
 	ToolCalls     []ParsedToolCall
 	ToolResults   []ParsedToolResult
 
-	Model         string
-	TokenUsage    json.RawMessage
-	ContextTokens int
-	OutputTokens  int
+	Model            string
+	TokenUsage       json.RawMessage
+	ContextTokens    int
+	OutputTokens     int
+	HasContextTokens bool
+	HasOutputTokens  bool
+
+	// tokenPresenceKnown marks per-message token coverage as
+	// parser-owned and authoritative.
+	tokenPresenceKnown bool
+}
+
+// accumulateMessageTokenUsage rolls up explicit per-message token
+// metadata into session totals without inferring presence from raw
+// numeric values alone.
+func accumulateMessageTokenUsage(
+	sess *ParsedSession,
+	messages []ParsedMessage,
+) {
+	sess.aggregateTokenPresenceKnown = true
+	for _, m := range messages {
+		if m.HasOutputTokens {
+			sess.HasTotalOutputTokens = true
+			sess.TotalOutputTokens += m.OutputTokens
+		}
+		if m.HasContextTokens {
+			sess.HasPeakContextTokens = true
+			if m.ContextTokens > sess.PeakContextTokens {
+				sess.PeakContextTokens = m.ContextTokens
+			}
+		}
+	}
+}
+
+// InferTokenPresence determines whether context/output tokens were
+// present in a provider payload. It starts from explicit boolean
+// flags (and non-zero numeric values), then inspects tokenUsage JSON
+// keys when available. This is the single source of truth for token
+// presence inference across all storage backends.
+func InferTokenPresence(
+	tokenUsage []byte,
+	contextTokens, outputTokens int,
+	hasContext, hasOutput bool,
+) (bool, bool) {
+	hasContext = hasContext || contextTokens != 0
+	hasOutput = hasOutput || outputTokens != 0
+
+	if len(tokenUsage) == 0 {
+		return hasContext, hasOutput
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(tokenUsage, &payload); err != nil {
+		return hasContext, hasOutput
+	}
+
+	for key := range payload {
+		switch key {
+		case "input_tokens", "cache_creation_input_tokens",
+			"cache_read_input_tokens", "input",
+			"cached", "context_tokens":
+			hasContext = true
+		case "output_tokens", "output":
+			hasOutput = true
+		}
+	}
+	return hasContext, hasOutput
+}
+
+// TokenPresence reports whether context/output token fields were
+// present in the provider payload. Falls back to raw token_usage
+// key inspection when parser-specific flags were not populated.
+func (m ParsedMessage) TokenPresence() (bool, bool) {
+	if m.tokenPresenceKnown {
+		return m.HasContextTokens, m.HasOutputTokens
+	}
+	return InferTokenPresence(
+		m.TokenUsage, m.ContextTokens, m.OutputTokens,
+		m.HasContextTokens, m.HasOutputTokens,
+	)
+}
+
+// AggregateTokenPresence reports whether aggregate session token
+// metrics were present. This preserves explicit flags and falls
+// back to non-zero aggregates for providers like Kimi that only
+// expose truthful session-level totals in current Task 1 paths.
+func (s ParsedSession) AggregateTokenPresence() (bool, bool) {
+	if s.aggregateTokenPresenceKnown {
+		return s.HasTotalOutputTokens, s.HasPeakContextTokens
+	}
+
+	return s.HasTotalOutputTokens || s.TotalOutputTokens > 0,
+		s.HasPeakContextTokens || s.PeakContextTokens > 0
+}
+
+// TokenCoverage reports the truthful aggregate/session coverage
+// after combining session-level aggregate presence with per-message
+// token presence.
+func (s ParsedSession) TokenCoverage(
+	msgs []ParsedMessage,
+) (bool, bool) {
+	hasTotal, hasPeak := s.AggregateTokenPresence()
+	for _, m := range msgs {
+		msgHasCtx, msgHasOut := m.TokenPresence()
+		hasTotal = hasTotal || msgHasOut
+		hasPeak = hasPeak || msgHasCtx
+	}
+	return hasTotal, hasPeak
 }
 
 // ParseResult pairs a parsed session with its messages.

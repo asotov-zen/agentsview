@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 )
 
@@ -28,13 +29,12 @@ type Result struct {
 }
 
 // ValidAgents lists the supported agent names.
-// Copilot is excluded because its CLI does not support a
-// verified read-only/no-tools mode equivalent to the other
-// agents (--disable-builtin-mcps only blocks MCP tools).
 var ValidAgents = map[string]bool{
-	"claude": true,
-	"codex":  true,
-	"gemini": true,
+	"claude":  true,
+	"codex":   true,
+	"copilot": true,
+	"gemini":  true,
+	"kiro": true,
 }
 
 // GenerateFunc is the signature for insight generation,
@@ -80,7 +80,7 @@ func GenerateStream(
 		)
 	}
 
-	path, err := exec.LookPath(agent)
+	path, err := exec.LookPath(agentBinary(agent))
 	if err != nil {
 		return Result{}, fmt.Errorf(
 			"%s CLI not found: %w", agent, err,
@@ -90,8 +90,12 @@ func GenerateStream(
 	switch agent {
 	case "codex":
 		return generateCodex(ctx, path, prompt, onLog)
+	case "copilot":
+		return generateCopilot(ctx, path, prompt, onLog)
 	case "gemini":
 		return generateGemini(ctx, path, prompt, onLog)
+	case "kiro":
+		return generateKiro(ctx, path, prompt, onLog)
 	default:
 		return generateClaude(ctx, path, prompt, onLog)
 	}
@@ -403,6 +407,83 @@ func parseCodexStream(
 	return strings.Join(messages, "\n"), nil
 }
 
+// generateCopilot invokes `copilot -p <prompt> --silent`.
+// The prompt is passed as the -p argument (copilot does not
+// read prompts from stdin). Output is plain text on stdout.
+func generateCopilot(
+	ctx context.Context, path, prompt string, onLog LogFunc,
+) (Result, error) {
+	cmd := exec.CommandContext(
+		ctx, path,
+		"-p", prompt,
+		"--silent",
+		"--no-custom-instructions",
+		"--no-ask-user",
+		"--disable-builtin-mcps",
+	)
+	cmd.Env = agentEnv()
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return Result{}, fmt.Errorf(
+			"create stdout pipe: %w", err,
+		)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return Result{}, fmt.Errorf(
+			"create stderr pipe: %w", err,
+		)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return Result{}, fmt.Errorf(
+			"start copilot: %w", err,
+		)
+	}
+
+	stderrDone := collectStreamLines(
+		stderrPipe, "stderr", onLog,
+	)
+	// Read stdout raw to preserve blank lines in plain
+	// text output (collectStreamLines drops empty lines).
+	stdoutBytes, readErr := io.ReadAll(stdoutPipe)
+	stderrText := <-stderrDone
+	runErr := cmd.Wait()
+
+	if readErr != nil {
+		return Result{}, fmt.Errorf(
+			"read copilot stdout: %w", readErr,
+		)
+	}
+
+	emitLog(onLog, "stdout", string(stdoutBytes))
+
+	if runErr != nil && ctx.Err() != nil {
+		return Result{}, fmt.Errorf(
+			"copilot CLI cancelled: %w", ctx.Err(),
+		)
+	}
+	if runErr != nil {
+		return Result{}, fmt.Errorf(
+			"copilot CLI failed: %w\nstderr: %s",
+			runErr, stderrText,
+		)
+	}
+
+	content := strings.TrimSpace(string(stdoutBytes))
+	if content == "" {
+		return Result{}, fmt.Errorf(
+			"copilot returned empty result",
+		)
+	}
+
+	return Result{
+		Content: content,
+		Agent:   "copilot",
+	}, nil
+}
+
 // generateGemini invokes `gemini --output-format stream-json`
 // and parses the JSONL stream for result/assistant messages.
 func generateGemini(
@@ -554,4 +635,97 @@ func parseStreamJSON(
 		return strings.Join(assistantMsgs, "\n"), nil
 	}
 	return "", nil
+}
+
+// agentBinary maps an agent name to its CLI binary name.
+func agentBinary(agent string) string {
+	if agent == "kiro" {
+		return "kiro-cli"
+	}
+	return agent
+}
+
+// ansiRE matches ANSI escape sequences.
+var ansiRE = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
+
+// generateKiro invokes `kiro-cli chat --no-interactive` with
+// the prompt on stdin and strips ANSI escape codes from output.
+//
+// Note: kiro-cli does not have a hard no-tools/read-only mode
+// like Claude's --tools "" or Codex's --sandbox read-only.
+// --trust-tools= disables tool trust prompts but does not
+// prevent tool execution. Use only with trusted session data.
+// The working directory is set to os.TempDir() to limit
+// exposure if tools are triggered.
+func generateKiro(
+	ctx context.Context, path, prompt string, onLog LogFunc,
+) (Result, error) {
+	cmd := exec.CommandContext(
+		ctx, path,
+		"chat",
+		"--no-interactive",
+		"--trust-tools=",
+		"--wrap", "never",
+	)
+	cmd.Env = agentEnv()
+	cmd.Dir = os.TempDir()
+	cmd.Stdin = strings.NewReader(prompt)
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return Result{}, fmt.Errorf("create stdout pipe: %w", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return Result{}, fmt.Errorf("create stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return Result{}, fmt.Errorf("start kiro-cli: %w", err)
+	}
+
+	stderrDone := collectStreamLines(stderrPipe, "stderr", onLog)
+	stdoutBytes, readErr := io.ReadAll(stdoutPipe)
+	stderrText := <-stderrDone
+	runErr := cmd.Wait()
+
+	if readErr != nil {
+		return Result{}, fmt.Errorf("read kiro stdout: %w", readErr)
+	}
+
+	emitLog(onLog, "stdout", string(stdoutBytes))
+
+	if runErr != nil && ctx.Err() != nil {
+		return Result{}, fmt.Errorf("kiro-cli cancelled: %w", ctx.Err())
+	}
+	if runErr != nil {
+		return Result{}, fmt.Errorf(
+			"kiro-cli failed: %w\nstderr: %s", runErr, stderrText,
+		)
+	}
+
+	// Strip ANSI escape codes and the trust/timing banners.
+	clean := ansiRE.ReplaceAllString(string(stdoutBytes), "")
+	var lines []string
+	for line := range strings.SplitSeq(clean, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "Agents can sometimes") ||
+			strings.HasPrefix(trimmed, "Learn more at") ||
+			strings.HasPrefix(trimmed, "▸ Time:") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	content := strings.TrimSpace(strings.Join(lines, "\n"))
+	if content == "" {
+		return Result{}, fmt.Errorf("kiro returned empty result")
+	}
+
+	return Result{
+		Content: content,
+		Agent:   "kiro",
+	}, nil
 }

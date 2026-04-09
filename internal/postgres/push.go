@@ -42,6 +42,19 @@ type PushResult struct {
 // bypassed and every candidate session's messages are
 // re-pushed unconditionally.
 //
+// When project filters are set (via SyncOptions), only
+// matching sessions are pushed. Filtered pushes do not
+// advance the global watermark (last_push_at) because the
+// watermark covers all projects — advancing it would cause
+// unfiltered sessions to be skipped. Instead, filtered
+// pushes rely on fingerprints for incrementality: each run
+// re-queries all sessions since the last unfiltered push
+// and skips those whose fingerprint hasn't changed. The
+// query window grows between unfiltered pushes, but
+// fingerprint matching keeps the actual PG writes minimal.
+// Run an occasional unfiltered push (or use --all-projects)
+// to advance the watermark and bound the query window.
+//
 // Known limitation: sessions that are permanently deleted
 // from SQLite (via prune) are not propagated as deletions
 // to PG because the local rows no longer exist at push time.
@@ -77,6 +90,14 @@ func (s *Sync) Push(
 		); err != nil {
 			return result, err
 		}
+		// When a filtered full push runs, clear persisted
+		// watermark and boundary state so the next
+		// unfiltered push also starts from scratch.
+		if s.isFiltered() {
+			if err := clearPushState(s.local); err != nil {
+				return result, err
+			}
+		}
 	}
 
 	// Coherence check: if the local watermark says we've
@@ -106,13 +127,21 @@ func (s *Sync) Push(
 			); err != nil {
 				return result, err
 			}
+			// Filtered push against a reset PG: clear
+			// watermark and boundary state so the next
+			// unfiltered push also starts from scratch.
+			if s.isFiltered() {
+				if err := clearPushState(s.local); err != nil {
+					return result, err
+				}
+			}
 		}
 	}
 
 	cutoff := time.Now().UTC().Format(LocalSyncTimestampLayout)
 
 	allSessions, err := s.local.ListSessionsModifiedBetween(
-		ctx, lastPush, cutoff,
+		ctx, lastPush, cutoff, s.projects, s.excludeProjects,
 	)
 	if err != nil {
 		return result, fmt.Errorf(
@@ -152,7 +181,7 @@ func (s *Sync) Push(
 			)
 		}
 		boundarySessions, err := s.local.ListSessionsModifiedBetween(
-			ctx, windowStart, lastPush,
+			ctx, windowStart, lastPush, s.projects, s.excludeProjects,
 		)
 		if err != nil {
 			return result, fmt.Errorf(
@@ -196,10 +225,29 @@ func (s *Sync) Push(
 	})
 
 	if len(sessions) == 0 {
-		if err := finalizePushState(
-			s.local, cutoff, sessions, nil,
-		); err != nil {
-			return result, err
+		if s.isFiltered() {
+			// Filtered pushes must not advance the global
+			// watermark but should still update fingerprints
+			// so repeated filtered runs stay incremental.
+			// Use cutoff as the boundary key when lastPush
+			// is empty (--full/PG reset) so that the next
+			// filtered run can match fingerprints.
+			boundaryKey := lastPush
+			if boundaryKey == "" {
+				boundaryKey = cutoff
+			}
+			if err := writePushBoundaryState(
+				s.local, boundaryKey, sessions,
+				priorFingerprints,
+			); err != nil {
+				return result, err
+			}
+		} else {
+			if err := finalizePushState(
+				s.local, cutoff, sessions, nil,
+			); err != nil {
+				return result, err
+			}
 		}
 		result.Duration = time.Since(start)
 		return result, nil
@@ -241,22 +289,44 @@ func (s *Sync) Push(
 		}
 	}
 
-	// When all sessions succeeded, advance the watermark to
-	// cutoff. When some failed, keep the watermark at lastPush
-	// so the failed sessions (plus any already-pushed ones) are
-	// re-evaluated next time. Already-pushed sessions are
-	// fingerprint-matched and skipped cheaply.
-	finalizeCutoff := cutoff
-	var mergedFingerprints map[string]string
-	if result.Errors > 0 {
-		finalizeCutoff = lastPush
-		mergedFingerprints = priorFingerprints
-	}
-	if err := finalizePushState(
-		s.local, finalizeCutoff, pushed,
-		mergedFingerprints,
-	); err != nil {
-		return result, err
+	if s.isFiltered() {
+		// Filtered pushes update fingerprints for pushed
+		// sessions so subsequent filtered runs stay
+		// incremental, but do not advance the global
+		// watermark past sessions from other projects.
+		// Use cutoff as the boundary key when lastPush is
+		// empty (--full/PG reset) so the next filtered
+		// run can match fingerprints instead of
+		// re-pushing everything.
+		boundaryKey := lastPush
+		if boundaryKey == "" {
+			boundaryKey = cutoff
+		}
+		if err := writePushBoundaryState(
+			s.local, boundaryKey, pushed,
+			priorFingerprints,
+		); err != nil {
+			return result, err
+		}
+	} else {
+		// When all sessions succeeded, advance the watermark
+		// to cutoff. When some failed, keep the watermark at
+		// lastPush so the failed sessions (plus any
+		// already-pushed ones) are re-evaluated next time.
+		// Already-pushed sessions are fingerprint-matched and
+		// skipped cheaply.
+		finalizeCutoff := cutoff
+		var mergedFingerprints map[string]string
+		if result.Errors > 0 {
+			finalizeCutoff = lastPush
+			mergedFingerprints = priorFingerprints
+		}
+		if err := finalizePushState(
+			s.local, finalizeCutoff, pushed,
+			mergedFingerprints,
+		); err != nil {
+			return result, err
+		}
 	}
 
 	result.Duration = time.Since(start)
@@ -386,6 +456,29 @@ func finalizePushState(
 	return writePushBoundaryState(
 		local, cutoff, sessions, priorFingerprints,
 	)
+}
+
+// clearPushState resets the watermark and boundary state so that
+// the next push starts from scratch. Used when a filtered push
+// runs --full or detects a PG reset, to avoid leaving stale
+// state that would cause the next unfiltered push to skip
+// sessions.
+func clearPushState(local syncStateStore) error {
+	if err := local.SetSyncState(
+		lastPushBoundaryStateKey, "",
+	); err != nil {
+		return fmt.Errorf(
+			"clearing boundary state: %w", err,
+		)
+	}
+	if err := local.SetSyncState(
+		"last_push_at", "",
+	); err != nil {
+		return fmt.Errorf(
+			"clearing last_push_at: %w", err,
+		)
+	}
+	return nil
 }
 
 func readBoundaryAndFingerprints(
@@ -522,6 +615,10 @@ func sessionPushFingerprint(sess db.Session) string {
 		stringValue(sess.DeletedAt),
 		fmt.Sprintf("%d", sess.MessageCount),
 		fmt.Sprintf("%d", sess.UserMessageCount),
+		fmt.Sprintf("%d", sess.TotalOutputTokens),
+		fmt.Sprintf("%d", sess.PeakContextTokens),
+		fmt.Sprintf("%t", sess.HasTotalOutputTokens),
+		fmt.Sprintf("%t", sess.HasPeakContextTokens),
 		stringValue(sess.ParentSessionID),
 		sess.RelationshipType,
 		stringValue(sess.FileHash),
@@ -586,18 +683,25 @@ func (s *Sync) pushSession(
 	ctx context.Context, tx *sql.Tx, sess db.Session,
 ) error {
 	createdAt, _ := ParseSQLiteTimestamp(sess.CreatedAt)
+	isAutomated := sess.UserMessageCount <= 1 &&
+		sess.FirstMessage != nil &&
+		db.IsAutomatedSession(*sess.FirstMessage)
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO sessions (
 			id, machine, project, agent,
 			first_message, display_name,
 			created_at, started_at, ended_at, deleted_at,
 			message_count, user_message_count,
+			total_output_tokens, peak_context_tokens,
+			has_total_output_tokens, has_peak_context_tokens,
+			is_automated,
 			parent_session_id, relationship_type,
 			updated_at
 		) VALUES (
 			$1, $2, $3, $4, $5, $6,
 			$7, $8, $9, $10,
-			$11, $12, $13, $14, NOW()
+			$11, $12, $13, $14,
+			$15, $16, $17, $18, $19, NOW()
 		)
 		ON CONFLICT (id) DO UPDATE SET
 			machine = EXCLUDED.machine,
@@ -611,6 +715,11 @@ func (s *Sync) pushSession(
 			deleted_at = EXCLUDED.deleted_at,
 			message_count = EXCLUDED.message_count,
 			user_message_count = EXCLUDED.user_message_count,
+			total_output_tokens = EXCLUDED.total_output_tokens,
+			peak_context_tokens = EXCLUDED.peak_context_tokens,
+			has_total_output_tokens = EXCLUDED.has_total_output_tokens,
+			has_peak_context_tokens = EXCLUDED.has_peak_context_tokens,
+			is_automated = EXCLUDED.is_automated,
 			parent_session_id = EXCLUDED.parent_session_id,
 			relationship_type = EXCLUDED.relationship_type,
 			updated_at = NOW()
@@ -625,6 +734,11 @@ func (s *Sync) pushSession(
 			OR sessions.deleted_at IS DISTINCT FROM EXCLUDED.deleted_at
 			OR sessions.message_count IS DISTINCT FROM EXCLUDED.message_count
 			OR sessions.user_message_count IS DISTINCT FROM EXCLUDED.user_message_count
+			OR sessions.total_output_tokens IS DISTINCT FROM EXCLUDED.total_output_tokens
+			OR sessions.peak_context_tokens IS DISTINCT FROM EXCLUDED.peak_context_tokens
+			OR sessions.has_total_output_tokens IS DISTINCT FROM EXCLUDED.has_total_output_tokens
+			OR sessions.has_peak_context_tokens IS DISTINCT FROM EXCLUDED.has_peak_context_tokens
+			OR sessions.is_automated IS DISTINCT FROM EXCLUDED.is_automated
 			OR sessions.parent_session_id IS DISTINCT FROM EXCLUDED.parent_session_id
 			OR sessions.relationship_type IS DISTINCT FROM EXCLUDED.relationship_type`,
 		sess.ID, s.machine,
@@ -637,6 +751,9 @@ func (s *Sync) pushSession(
 		nilStrTS(sess.EndedAt),
 		nilStrTS(sess.DeletedAt),
 		sess.MessageCount, sess.UserMessageCount,
+		sess.TotalOutputTokens, sess.PeakContextTokens,
+		sess.HasTotalOutputTokens, sess.HasPeakContextTokens,
+		isAutomated,
 		nilStr(sess.ParentSessionID),
 		sess.RelationshipType,
 	)
@@ -661,6 +778,14 @@ func (s *Sync) pushMessages(
 	}
 	if localCount == 0 {
 		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM tool_result_events WHERE session_id = $1`,
+			sessionID,
+		); err != nil {
+			return 0, fmt.Errorf(
+				"deleting stale pg tool_result_events: %w", err,
+			)
+		}
+		if _, err := tx.ExecContext(ctx,
 			`DELETE FROM tool_calls WHERE session_id = $1`,
 			sessionID,
 		); err != nil {
@@ -681,19 +806,26 @@ func (s *Sync) pushMessages(
 
 	var pgCount int
 	var pgContentSum, pgContentMax, pgContentMin int64
+	// Exact string fingerprint for the system-message ordinal set:
+	// STRING_AGG produces e.g. "0,2,5" — impossible to collide for
+	// distinct ordinal sets (unlike SUM or SUM+SUM-of-squares).
+	var pgSystemFP sql.NullString
 	var pgToolCallCount int
 	var pgTCContentSum int64
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*),
 			COALESCE(SUM(content_length), 0),
 			COALESCE(MAX(content_length), 0),
-			COALESCE(MIN(content_length), 0)
+			COALESCE(MIN(content_length), 0),
+			STRING_AGG(ordinal::text, ',' ORDER BY ordinal)
+				FILTER (WHERE is_system)
 		 FROM messages
 		 WHERE session_id = $1`,
 		sessionID,
 	).Scan(
 		&pgCount, &pgContentSum,
 		&pgContentMax, &pgContentMin,
+		&pgSystemFP,
 	); err != nil {
 		return 0, fmt.Errorf(
 			"counting pg messages: %w", err,
@@ -719,6 +851,12 @@ func (s *Sync) pushMessages(
 				err,
 			)
 		}
+		localSysFP, err := s.local.SystemMessageFingerprint(sessionID)
+		if err != nil {
+			return 0, fmt.Errorf(
+				"computing local system message fingerprint: %w", err,
+			)
+		}
 		localTCCount, err := s.local.ToolCallCount(sessionID)
 		if err != nil {
 			return 0, fmt.Errorf(
@@ -732,15 +870,37 @@ func (s *Sync) pushMessages(
 					"fingerprint: %w", err,
 			)
 		}
+		localTokenFP, err := s.local.MessageTokenFingerprint(sessionID)
+		if err != nil {
+			return 0, fmt.Errorf(
+				"computing local token fingerprint: %w", err,
+			)
+		}
+		pgTokenFP, err := pgMessageTokenFingerprint(ctx, tx, sessionID)
+		if err != nil {
+			return 0, fmt.Errorf(
+				"computing pg token fingerprint: %w", err,
+			)
+		}
 		if localSum == pgContentSum &&
 			localMax == pgContentMax &&
 			localMin == pgContentMin &&
+			localSysFP == pgSystemFP.String &&
 			localTCCount == pgToolCallCount &&
-			localTCSum == pgTCContentSum {
+			localTCSum == pgTCContentSum &&
+			localTokenFP == pgTokenFP {
 			return 0, nil
 		}
 	}
 
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM tool_result_events
+		WHERE session_id = $1
+	`, sessionID); err != nil {
+		return 0, fmt.Errorf(
+			"deleting pg tool_result_events: %w", err,
+		)
+	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM tool_calls
 		WHERE session_id = $1
@@ -794,11 +954,54 @@ func (s *Sync) pushMessages(
 		); err != nil {
 			return count, err
 		}
+		if err := bulkInsertToolResultEvents(
+			ctx, tx, sessionID, msgs,
+		); err != nil {
+			return count, err
+		}
 		count += len(msgs)
 		startOrdinal = nextOrdinal
 	}
 
 	return count, nil
+}
+
+func pgMessageTokenFingerprint(
+	ctx context.Context, tx *sql.Tx, sessionID string,
+) (string, error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT ordinal, model, token_usage, context_tokens,
+			output_tokens, has_context_tokens, has_output_tokens
+		 FROM messages
+		 WHERE session_id = $1
+		 ORDER BY ordinal ASC`,
+		sessionID,
+	)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var b strings.Builder
+	for rows.Next() {
+		var ordinal, contextTokens, outputTokens int
+		var model, tokenUsage string
+		var hasContextTokens, hasOutputTokens bool
+		if err := rows.Scan(
+			&ordinal, &model, &tokenUsage, &contextTokens,
+			&outputTokens, &hasContextTokens, &hasOutputTokens,
+		); err != nil {
+			return "", err
+		}
+		fmt.Fprintf(&b, "%d|%d:%s|%d:%s|%d|%d|%t|%t;",
+			ordinal,
+			len(model), model,
+			len(tokenUsage), tokenUsage,
+			contextTokens, outputTokens,
+			hasContextTokens, hasOutputTokens,
+		)
+	}
+	return b.String(), rows.Err()
 }
 
 const msgInsertBatch = 100
@@ -816,17 +1019,20 @@ func bulkInsertMessages(
 		b.WriteString(`INSERT INTO messages (
 			session_id, ordinal, role, content,
 			timestamp, has_thinking, has_tool_use,
-			content_length) VALUES `)
-		args := make([]any, 0, len(batch)*8)
+			content_length, is_system, model, token_usage,
+			context_tokens, output_tokens,
+			has_context_tokens, has_output_tokens) VALUES `)
+		args := make([]any, 0, len(batch)*15)
 		for j, m := range batch {
 			if j > 0 {
 				b.WriteByte(',')
 			}
-			p := j*8 + 1
+			p := j*15 + 1
 			fmt.Fprintf(&b,
-				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
 				p, p+1, p+2, p+3,
-				p+4, p+5, p+6, p+7,
+				p+4, p+5, p+6, p+7, p+8,
+				p+9, p+10, p+11, p+12, p+13, p+14,
 			)
 			var ts any
 			if m.Timestamp != "" {
@@ -840,7 +1046,10 @@ func bulkInsertMessages(
 				sessionID, m.Ordinal, m.Role,
 				sanitizePG(m.Content), ts,
 				m.HasThinking,
-				m.HasToolUse, m.ContentLength,
+				m.HasToolUse, m.ContentLength, m.IsSystem,
+				m.Model, string(m.TokenUsage),
+				m.ContextTokens, m.OutputTokens,
+				m.HasContextTokens, m.HasOutputTokens,
 			)
 		}
 		if _, err := tx.ExecContext(
@@ -919,6 +1128,78 @@ func bulkInsertToolCalls(
 			return fmt.Errorf(
 				"bulk inserting tool_calls: %w", err,
 			)
+		}
+	}
+	return nil
+}
+
+func bulkInsertToolResultEvents(
+	ctx context.Context, tx *sql.Tx,
+	sessionID string, msgs []db.Message,
+) error {
+	type evRow struct {
+		ordinal int
+		index   int
+		ev      db.ToolResultEvent
+	}
+	var rows []evRow
+	for _, m := range msgs {
+		for i, tc := range m.ToolCalls {
+			for _, ev := range tc.ResultEvents {
+				rows = append(rows, evRow{m.Ordinal, i, ev})
+			}
+		}
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+
+	const evBatch = 100
+	for i := 0; i < len(rows); i += evBatch {
+		end := min(i+evBatch, len(rows))
+		batch := rows[i:end]
+
+		var b strings.Builder
+		b.WriteString(`INSERT INTO tool_result_events (
+			session_id, tool_call_message_ordinal, call_index,
+			tool_use_id, agent_id, subagent_session_id,
+			source, status, content, content_length,
+			timestamp, event_index) VALUES `)
+		args := make([]any, 0, len(batch)*12)
+		for j, r := range batch {
+			if j > 0 {
+				b.WriteByte(',')
+			}
+			p := j*12 + 1
+			fmt.Fprintf(&b,
+				"($%d,$%d,$%d,$%d,$%d,$%d,"+
+					"$%d,$%d,$%d,$%d,$%d,$%d)",
+				p, p+1, p+2, p+3, p+4, p+5,
+				p+6, p+7, p+8, p+9, p+10, p+11,
+			)
+			var ts any
+			if r.ev.Timestamp != "" {
+				if t, ok := ParseSQLiteTimestamp(r.ev.Timestamp); ok {
+					ts = t
+				}
+			}
+			args = append(args,
+				sessionID,
+				r.ordinal,
+				r.index,
+				nilIfEmpty(r.ev.ToolUseID),
+				nilIfEmpty(r.ev.AgentID),
+				nilIfEmpty(r.ev.SubagentSessionID),
+				sanitizePG(r.ev.Source),
+				sanitizePG(r.ev.Status),
+				sanitizePG(r.ev.Content),
+				r.ev.ContentLength,
+				ts,
+				r.ev.EventIndex,
+			)
+		}
+		if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
+			return fmt.Errorf("bulk inserting tool_result_events: %w", err)
 		}
 	}
 	return nil

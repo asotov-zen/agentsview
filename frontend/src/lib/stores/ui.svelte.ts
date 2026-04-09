@@ -1,5 +1,12 @@
+import {
+  SIDEBAR_WIDTH_DEFAULT,
+  SIDEBAR_WIDTH_KEY,
+  clampStoredSidebarWidth,
+} from "../components/layout/sidebar-width.js";
+
 type Theme = "light" | "dark";
 export type MessageLayout = "default" | "compact" | "stream";
+export type TranscriptMode = "normal" | "focused";
 type ModalType =
   | "about"
   | "commandPalette"
@@ -7,6 +14,7 @@ type ModalType =
   | "publish"
   | "resync"
   | "update"
+  | "confirmDelete"
   | null;
 
 /** Block types that can be toggled visible/hidden. */
@@ -26,6 +34,8 @@ export const ALL_BLOCK_TYPES: BlockType[] = [
 ];
 
 const BLOCK_FILTER_KEY = "agentsview-block-filters";
+const TRANSCRIPT_MODE_KEY = "agentsview-transcript-mode";
+const MINIMAP_KEY = "agentsview-activity-minimap";
 
 function readBlockFilters(): Set<BlockType> {
   try {
@@ -48,6 +58,10 @@ function readBlockFilters(): Set<BlockType> {
 
 const LAYOUT_KEY = "agentsview-message-layout";
 const ZOOM_KEY = "agentsview-zoom-level";
+const VALID_TRANSCRIPT_MODES: TranscriptMode[] = [
+  "normal",
+  "focused",
+];
 
 const IS_DESKTOP =
   typeof window !== "undefined" &&
@@ -104,17 +118,62 @@ function readStoredLayout(): MessageLayout {
   return "default";
 }
 
+function readStoredTranscriptMode(): TranscriptMode {
+  try {
+    const raw = localStorage?.getItem(TRANSCRIPT_MODE_KEY);
+    if (
+      raw &&
+      VALID_TRANSCRIPT_MODES.includes(raw as TranscriptMode)
+    ) {
+      return raw as TranscriptMode;
+    }
+  } catch {
+    // ignore
+  }
+  return "normal";
+}
+
+function readStoredSidebarWidth(): number {
+  try {
+    return clampStoredSidebarWidth(
+      localStorage?.getItem(SIDEBAR_WIDTH_KEY),
+    );
+  } catch {
+    return SIDEBAR_WIDTH_DEFAULT;
+  }
+}
+
+function readStoredBool(key: string, fallback: boolean): boolean {
+  try {
+    const raw = localStorage?.getItem(key);
+    if (raw === "true") return true;
+    if (raw === "false") return false;
+  } catch {
+    // ignore
+  }
+  return fallback;
+}
 class UIStore {
   theme: Theme = $state(readStoredTheme() || "light");
   showSystem: boolean = $state(false);
   sortNewestFirst: boolean = $state(false);
   messageLayout: MessageLayout = $state(readStoredLayout());
+  transcriptMode: TranscriptMode = $state(
+    readStoredTranscriptMode(),
+  );
+  sidebarWidth: number = $state(readStoredSidebarWidth());
   activeModal: ModalType = $state(null);
   selectedOrdinal: number | null = $state(null);
   pendingScrollOrdinal: number | null = $state(null);
   pendingScrollSession: string | null = $state(null);
 
   zoomLevel: number = $state(readStoredZoom());
+
+  sidebarOpen: boolean = $state(true);
+  isMobileViewport: boolean = $state(false);
+  activityMinimapOpen: boolean = $state(
+    readStoredBool(MINIMAP_KEY, false),
+  );
 
   /** Set of block types currently visible. */
   visibleBlocks: Set<BlockType> = $state(readBlockFilters());
@@ -149,6 +208,28 @@ class UIStore {
       });
 
       $effect(() => {
+        try {
+          localStorage?.setItem(
+            TRANSCRIPT_MODE_KEY,
+            this.transcriptMode,
+          );
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(
+            SIDEBAR_WIDTH_KEY,
+            String(this.sidebarWidth),
+          );
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
         if (!IS_DESKTOP) return;
         // "zoom" is non-standard but supported in WebKit/Chromium
         (
@@ -164,6 +245,33 @@ class UIStore {
           // ignore
         }
       });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(
+            MINIMAP_KEY,
+            String(this.activityMinimapOpen),
+          );
+        } catch {
+          // ignore
+        }
+      });
+
+      // Initialize sidebar based on viewport width
+      if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
+        const mq = window.matchMedia("(min-width: 768px)");
+        this.sidebarOpen = mq.matches;
+        this.isMobileViewport = !mq.matches;
+        const onChange = (e: MediaQueryListEvent) => {
+          this.sidebarOpen = e.matches;
+          this.isMobileViewport = !e.matches;
+        };
+        if (mq.addEventListener) {
+          mq.addEventListener("change", onChange);
+        } else {
+          mq.addListener(onChange);
+        }
+      }
     });
 
     // Allow parent windows to control theme via postMessage
@@ -252,12 +360,26 @@ class UIStore {
     this.messageLayout = layout;
   }
 
+  setTranscriptMode(mode: TranscriptMode) {
+    this.transcriptMode = mode;
+  }
+
+  setSidebarWidth(width: number) {
+    this.sidebarWidth = clampStoredSidebarWidth(width);
+  }
+
   selectOrdinal(ordinal: number) {
     this.selectedOrdinal = ordinal;
   }
 
   clearSelection() {
     this.selectedOrdinal = null;
+  }
+
+  clearScrollState() {
+    this.selectedOrdinal = null;
+    this.pendingScrollOrdinal = null;
+    this.pendingScrollSession = null;
   }
 
   scrollToOrdinal(ordinal: number, sessionId?: string) {
@@ -282,6 +404,18 @@ class UIStore {
 
   resetZoom() {
     this.zoomLevel = ZOOM_DEFAULT;
+  }
+
+  toggleSidebar() {
+    this.sidebarOpen = !this.sidebarOpen;
+  }
+
+  closeSidebar() {
+    this.sidebarOpen = false;
+  }
+
+  toggleActivityMinimap() {
+    this.activityMinimapOpen = !this.activityMinimapOpen;
   }
 
   closeAll() {

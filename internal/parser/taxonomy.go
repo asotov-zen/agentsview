@@ -31,6 +31,8 @@ func NormalizeToolCategory(rawName string) string {
 		return "Bash"
 	case "apply_patch":
 		return "Edit"
+	case "spawn_agent":
+		return "Task"
 
 	// Gemini tools
 	case "read_file", "list_directory":
@@ -123,6 +125,10 @@ func NormalizeToolCategory(rawName string) string {
 		return "Task"
 	case "zencoder-rag-mcp__web_search":
 		return "Read"
+
+	// ChatGPT tools
+	case "code_interpreter":
+		return "Bash"
 
 	default:
 		// MCP tools may carry a server prefix (e.g.

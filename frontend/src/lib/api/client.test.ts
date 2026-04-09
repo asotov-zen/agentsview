@@ -568,6 +568,14 @@ describe("query serialization", () => {
         },
         expected: "/api/v1/sessions",
       },
+      {
+        name: "preserves comma-separated machine filters",
+        params: {
+          machine: "host-a,host-b,host-c",
+        },
+        expected:
+          "/api/v1/sessions?machine=host-a%2Chost-b%2Chost-c",
+      },
     ];
 
     for (const { name, params, expected } of cases) {
@@ -588,6 +596,16 @@ describe("query serialization", () => {
 
     it("omits empty project filter", async () => {
       await search("hello", { project: "" });
+      expect(lastUrl()).toBe("/api/v1/search?q=hello");
+    });
+
+    it("includes sort param when provided", async () => {
+      await search("hello", { sort: "recency" });
+      expect(lastUrl()).toBe("/api/v1/search?q=hello&sort=recency");
+    });
+
+    it("omits sort param when not provided", async () => {
+      await search("hello");
       expect(lastUrl()).toBe("/api/v1/search?q=hello");
     });
 

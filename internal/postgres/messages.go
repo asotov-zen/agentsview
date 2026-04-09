@@ -30,7 +30,9 @@ func (s *Store) GetMessages(
 	query := fmt.Sprintf(`
 		SELECT session_id, ordinal, role, content,
 			timestamp, has_thinking, has_tool_use,
-			content_length
+			content_length, is_system, model, token_usage,
+			context_tokens, output_tokens,
+			has_context_tokens, has_output_tokens
 		FROM messages
 		WHERE session_id = $1 AND ordinal %s $2
 		ORDER BY ordinal %s
@@ -64,7 +66,9 @@ func (s *Store) GetAllMessages(
 	rows, err := s.pg.QueryContext(ctx, `
 		SELECT session_id, ordinal, role, content,
 			timestamp, has_thinking, has_tool_use,
-			content_length
+			content_length, is_system, model, token_usage,
+			context_tokens, output_tokens,
+			has_context_tokens, has_output_tokens
 		FROM messages
 		WHERE session_id = $1
 		ORDER BY ordinal ASC`, sessionID)
@@ -85,48 +89,6 @@ func (s *Store) GetAllMessages(
 	return msgs, nil
 }
 
-// GetMinimap returns lightweight metadata for all messages
-// in a session.
-func (s *Store) GetMinimap(
-	ctx context.Context, sessionID string,
-) ([]db.MinimapEntry, error) {
-	return s.GetMinimapFrom(ctx, sessionID, 0)
-}
-
-// GetMinimapFrom returns lightweight metadata for messages
-// starting at ordinal >= from.
-func (s *Store) GetMinimapFrom(
-	ctx context.Context, sessionID string, from int,
-) ([]db.MinimapEntry, error) {
-	rows, err := s.pg.QueryContext(ctx, `
-		SELECT ordinal, role, content_length,
-			has_thinking, has_tool_use
-		FROM messages
-		WHERE session_id = $1 AND ordinal >= $2
-		ORDER BY ordinal ASC`, sessionID, from)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"querying minimap: %w", err,
-		)
-	}
-	defer rows.Close()
-
-	entries := []db.MinimapEntry{}
-	for rows.Next() {
-		var e db.MinimapEntry
-		if err := rows.Scan(
-			&e.Ordinal, &e.Role, &e.ContentLength,
-			&e.HasThinking, &e.HasToolUse,
-		); err != nil {
-			return nil, fmt.Errorf(
-				"scanning minimap entry: %w", err,
-			)
-		}
-		entries = append(entries, e)
-	}
-	return entries, rows.Err()
-}
-
 // SearchSession performs ILIKE substring search within a single
 // session's messages, returning matching ordinals.
 func (s *Store) SearchSession(
@@ -143,6 +105,8 @@ func (s *Store) SearchSession(
 			ON tc.session_id = m.session_id
 			AND tc.message_ordinal = m.ordinal
 		WHERE m.session_id = $1
+			AND m.is_system = FALSE
+			AND `+db.SystemPrefixSQL("m.content", "m.role")+`
 			AND (m.content ILIKE $2
 				OR tc.result_content ILIKE $2)
 		ORDER BY m.ordinal ASC`,
@@ -189,7 +153,9 @@ func stripFTSQuotes(v string) string {
 	return v
 }
 
-// Search performs ILIKE-based search across messages.
+// Search performs ILIKE-based full-text search across messages,
+// grouped to one result per session via DISTINCT ON, UNION'd with a
+// session name (display_name / first_message) branch.
 func (s *Store) Search(
 	ctx context.Context, f db.SearchFilter,
 ) (db.SearchPage, error) {
@@ -202,47 +168,114 @@ func (s *Store) Search(
 		return db.SearchPage{}, nil
 	}
 
-	whereClauses := []string{
-		`m.content ILIKE '%' || $1 || '%' ESCAPE E'\\'`,
-		"s.deleted_at IS NULL",
+	// Validate Sort before interpolating into ORDER BY.
+	// session_id ASC is a deterministic tie-breaker for both modes,
+	// preventing pagination instability when sort keys are equal.
+	// NULLS LAST ensures sessions with NULL timestamps sort after
+	// sessions with real timestamps under DESC ordering.
+	// match_priority: 1 = message content match, 2 = name-only match.
+	// This ensures content matches always rank above name-only fallbacks
+	// regardless of match_pos (name-only rows have match_pos=0 which would
+	// otherwise sort them before content matches under match_pos ASC alone).
+	// match_priority: 1 = message content match, 2 = name-only match.
+	// Only applied in relevance mode so content matches rank above name-only
+	// fallbacks. Recency mode orders purely by time so the newest session
+	// wins regardless of match type.
+	outerOrderBy := "match_priority ASC, match_pos ASC, session_ended_at DESC NULLS LAST, session_id ASC"
+	if f.Sort == "recency" {
+		outerOrderBy = "session_ended_at DESC NULLS LAST, session_id ASC"
 	}
+
+	// $1 = escaped ILIKE pattern (for WHERE clause)
+	// $2 = raw search term (for POSITION — case folded in expression)
 	args := []any{escapeLike(searchTerm), searchTerm}
 	argIdx := 3
 
+	msgProjectClause := ""
+	nameProjectClause := ""
 	if f.Project != "" {
-		whereClauses = append(
-			whereClauses,
-			fmt.Sprintf("s.project = $%d", argIdx),
-		)
+		msgProjectClause = fmt.Sprintf("AND s.project = $%d", argIdx)
+		nameProjectClause = fmt.Sprintf("AND s.project = $%d", argIdx)
 		args = append(args, f.Project)
 		argIdx++
 	}
 
 	query := fmt.Sprintf(`
-		SELECT m.session_id, s.project, m.ordinal,
-			m.role,
-			COALESCE(
-				TO_CHAR(m.timestamp AT TIME ZONE 'UTC',
-					'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
-				''
-			),
-			CASE WHEN POSITION(
-				LOWER($2) IN LOWER(m.content)) > 100
-				THEN '...' || SUBSTRING(m.content
-					FROM GREATEST(1, POSITION(
-						LOWER($2) IN LOWER(m.content)
-					) - 50) FOR 200) || '...'
-				ELSE SUBSTRING(m.content FROM 1 FOR 200)
-					|| CASE WHEN LENGTH(m.content) > 200
-						THEN '...' ELSE '' END
-			END AS snippet,
-			1.0 AS rank
-		FROM messages m
-		JOIN sessions s ON m.session_id = s.id
-		WHERE %s
-		ORDER BY m.timestamp DESC NULLS LAST, m.session_id, m.ordinal
+		WITH msg_matches AS (
+			SELECT DISTINCT ON (m.session_id)
+				m.session_id,
+				s.project,
+				s.agent,
+				COALESCE(s.display_name, s.first_message, '') AS name,
+				COALESCE(s.ended_at, s.started_at) AS session_ended_at,
+				m.ordinal,
+				POSITION(LOWER($2) IN LOWER(m.content)) AS match_pos,
+				CASE
+					WHEN POSITION(LOWER($2) IN LOWER(m.content)) > 100
+						THEN '...' || SUBSTRING(m.content
+							FROM GREATEST(1, POSITION(
+								LOWER($2) IN LOWER(m.content)
+							) - 50) FOR 200) || '...'
+					ELSE SUBSTRING(m.content FROM 1 FOR 200)
+						|| CASE WHEN LENGTH(m.content) > 200
+							THEN '...' ELSE '' END
+				END AS snippet
+			FROM messages m
+			JOIN sessions s ON m.session_id = s.id
+			WHERE m.content ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
+				AND s.deleted_at IS NULL
+				AND m.is_system = FALSE
+				AND `+db.SystemPrefixSQL("m.content", "m.role")+`
+				%s
+			ORDER BY m.session_id,
+				POSITION(LOWER($2) IN LOWER(m.content)) ASC,
+				m.ordinal ASC
+		),
+		name_matches AS (
+			SELECT
+				s.id AS session_id,
+				s.project,
+				s.agent,
+				COALESCE(s.display_name, s.first_message, '') AS name,
+				COALESCE(s.ended_at, s.started_at) AS session_ended_at,
+				-1 AS ordinal,
+				0 AS match_pos,
+				CASE
+					WHEN s.display_name ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
+						THEN COALESCE(s.display_name, '')
+					WHEN s.first_message ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
+						THEN COALESCE(s.first_message, '')
+					ELSE COALESCE(s.display_name, s.first_message, '')
+				END AS snippet
+			FROM sessions s
+			WHERE (s.display_name ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
+				OR s.first_message ILIKE '%%' || $1 || '%%' ESCAPE E'\\')
+				AND s.deleted_at IS NULL
+				AND EXISTS (
+					SELECT 1 FROM messages mx
+					WHERE mx.session_id = s.id
+					  AND mx.is_system = FALSE
+					  AND `+db.SystemPrefixSQL("mx.content", "mx.role")+`
+				)
+				AND s.id NOT IN (SELECT session_id FROM msg_matches)
+				%s
+		)
+		-- rank is a constant 1.0 because PostgreSQL ILIKE has no
+	-- relevance scoring engine (unlike SQLite FTS5). Ordering
+	-- uses match_pos and session_ended_at instead.
+	SELECT session_id, project, agent, name,
+			session_ended_at, ordinal,
+			snippet, 1.0 AS rank, match_pos
+		FROM (
+			SELECT *, 1 AS match_priority FROM msg_matches
+			UNION ALL
+			SELECT *, 2 AS match_priority FROM name_matches
+		) combined
+		ORDER BY %s
 		LIMIT $%d OFFSET $%d`,
-		strings.Join(whereClauses, " AND "),
+		msgProjectClause,
+		nameProjectClause,
+		outerOrderBy,
 		argIdx, argIdx+1,
 	)
 	args = append(args, f.Limit+1, f.Cursor)
@@ -257,14 +290,20 @@ func (s *Store) Search(
 	results := []db.SearchResult{}
 	for rows.Next() {
 		var r db.SearchResult
+		var endedAt *time.Time
+		var matchPos int
 		if err := rows.Scan(
-			&r.SessionID, &r.Project, &r.Ordinal,
-			&r.Role, &r.Timestamp, &r.Snippet, &r.Rank,
+			&r.SessionID, &r.Project, &r.Agent, &r.Name,
+			&endedAt, &r.Ordinal,
+			&r.Snippet, &r.Rank, &matchPos,
 		); err != nil {
 			return db.SearchPage{},
 				fmt.Errorf(
 					"scanning search result: %w", err,
 				)
+		}
+		if endedAt != nil {
+			r.SessionEndedAt = FormatISO8601(*endedAt)
 		}
 		results = append(results, r)
 	}
@@ -305,6 +344,11 @@ func (s *Store) attachToolCalls(
 		); err != nil {
 			return err
 		}
+	}
+	if err := s.attachToolResultEvents(
+		ctx, msgs, ordToIdx, sessionID, ordinals,
+	); err != nil {
+		return err
 	}
 	return nil
 }
@@ -373,6 +417,96 @@ func (s *Store) attachToolCallsBatch(
 	return rows.Err()
 }
 
+func (s *Store) attachToolResultEvents(
+	ctx context.Context,
+	msgs []db.Message,
+	ordToIdx map[int]int,
+	sessionID string,
+	ordinals []int,
+) error {
+	for i := 0; i < len(ordinals); i += attachToolCallBatchSize {
+		end := min(i+attachToolCallBatchSize, len(ordinals))
+		if err := s.attachToolResultEventsBatch(
+			ctx, msgs, ordToIdx, sessionID, ordinals[i:end],
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) attachToolResultEventsBatch(
+	ctx context.Context,
+	msgs []db.Message,
+	ordToIdx map[int]int,
+	sessionID string,
+	ordinals []int,
+) error {
+	if len(ordinals) == 0 {
+		return nil
+	}
+
+	args := []any{sessionID}
+	phs := make([]string, len(ordinals))
+	for i, ord := range ordinals {
+		args = append(args, ord)
+		phs[i] = fmt.Sprintf("$%d", i+2)
+	}
+
+	query := fmt.Sprintf(`
+		SELECT tool_call_message_ordinal, call_index,
+			COALESCE(tool_use_id, ''),
+			COALESCE(agent_id, ''),
+			COALESCE(subagent_session_id, ''),
+			source, status, content, content_length,
+			timestamp, event_index
+		FROM tool_result_events
+		WHERE session_id = $1
+			AND tool_call_message_ordinal IN (%s)
+		ORDER BY tool_call_message_ordinal, call_index, event_index`,
+		strings.Join(phs, ","))
+
+	rows, err := s.pg.QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("querying tool_result_events: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			msgOrdinal int
+			callIndex  int
+			ev         db.ToolResultEvent
+			ts         *time.Time
+		)
+		if err := rows.Scan(
+			&msgOrdinal, &callIndex,
+			&ev.ToolUseID, &ev.AgentID,
+			&ev.SubagentSessionID,
+			&ev.Source, &ev.Status,
+			&ev.Content, &ev.ContentLength,
+			&ts, &ev.EventIndex,
+		); err != nil {
+			return fmt.Errorf("scanning tool_result_event: %w", err)
+		}
+		if ts != nil {
+			ev.Timestamp = FormatISO8601(*ts)
+		}
+		idx, ok := ordToIdx[msgOrdinal]
+		if !ok {
+			continue
+		}
+		if callIndex < 0 || callIndex >= len(msgs[idx].ToolCalls) {
+			continue
+		}
+		msgs[idx].ToolCalls[callIndex].ResultEvents = append(
+			msgs[idx].ToolCalls[callIndex].ResultEvents,
+			ev,
+		)
+	}
+	return rows.Err()
+}
+
 // scanPGMessages scans message rows from PostgreSQL,
 // converting TIMESTAMPTZ to string.
 func scanPGMessages(rows interface {
@@ -385,10 +519,14 @@ func scanPGMessages(rows interface {
 	for rows.Next() {
 		var m db.Message
 		var ts *time.Time
+		var tokenUsage string
 		if err := rows.Scan(
 			&m.SessionID, &m.Ordinal, &m.Role,
 			&m.Content, &ts, &m.HasThinking,
-			&m.HasToolUse, &m.ContentLength,
+			&m.HasToolUse, &m.ContentLength, &m.IsSystem,
+			&m.Model, &tokenUsage,
+			&m.ContextTokens, &m.OutputTokens,
+			&m.HasContextTokens, &m.HasOutputTokens,
 		); err != nil {
 			return nil, fmt.Errorf(
 				"scanning message: %w", err,
@@ -396,6 +534,9 @@ func scanPGMessages(rows interface {
 		}
 		if ts != nil {
 			m.Timestamp = FormatISO8601(*ts)
+		}
+		if tokenUsage != "" {
+			m.TokenUsage = []byte(tokenUsage)
 		}
 		msgs = append(msgs, m)
 	}

@@ -17,6 +17,7 @@ const (
 	copilotEventAssistantMsg    = "assistant.message"
 	copilotEventToolComplete    = "tool.execution_complete"
 	copilotEventAssistantReason = "assistant.reasoning"
+	copilotEventModelChange     = "session.model_change"
 )
 
 // copilotSessionBuilder accumulates state while scanning a
@@ -30,6 +31,7 @@ type copilotSessionBuilder struct {
 	project      string
 	cwd          string
 	ordinal      int
+	currentModel string
 }
 
 func newCopilotSessionBuilder() *copilotSessionBuilder {
@@ -61,6 +63,10 @@ func (b *copilotSessionBuilder) processLine(line string) {
 		b.handleToolComplete(data, ts)
 	case copilotEventAssistantReason:
 		b.handleAssistantReasoning()
+	case copilotEventModelChange:
+		if v := data.Get("newModel"); v.Exists() {
+			b.currentModel = v.Str
+		}
 	}
 }
 
@@ -167,6 +173,7 @@ func (b *copilotSessionBuilder) handleAssistantMessage(
 		HasToolUse:    hasToolUse,
 		ContentLength: len(displayContent),
 		ToolCalls:     toolCalls,
+		Model:         b.currentModel,
 	})
 	b.ordinal++
 }

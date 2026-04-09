@@ -3,6 +3,7 @@ package sync_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -198,6 +199,23 @@ func (e *testEnv) writeCursorSession(
 	)
 }
 
+// writeNestedCursorSession creates a Cursor transcript file under
+// the nested layout <project>/agent-transcripts/<session>/<session><ext>.
+func (e *testEnv) writeNestedCursorSession(
+	t *testing.T, cursorDir, project, sessionID, ext,
+	content string,
+) string {
+	t.Helper()
+	return e.writeSession(
+		t, cursorDir,
+		filepath.Join(
+			project, "agent-transcripts", sessionID,
+			sessionID+ext,
+		),
+		content,
+	)
+}
+
 func TestSyncEngineIntegration(t *testing.T) {
 	env := setupTestEnv(t)
 
@@ -274,7 +292,7 @@ func TestSyncEngineWorktreesShareProject(t *testing.T) {
 	assertSessionProject(t, env.db, "main-repo", "agentsview")
 	assertSessionProject(t, env.db, "worktree-repo", "agentsview")
 
-	projects, err := env.db.GetProjects(context.Background(), false)
+	projects, err := env.db.GetProjects(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("GetProjects: %v", err)
 	}
@@ -1751,6 +1769,67 @@ func TestSyncEngineMultiCursorDir(t *testing.T) {
 	}
 }
 
+func TestSyncPathsCursorNestedLayout(t *testing.T) {
+	env := setupTestEnv(t)
+
+	path := env.writeNestedCursorSession(
+		t, env.cursorDir,
+		"Users-alice-code-nested-proj",
+		"nested-sync", ".jsonl",
+		"user:\nHello nested cursor\nassistant:\nHi there!\n",
+	)
+
+	env.engine.SyncPaths([]string{path})
+
+	assertSessionProject(
+		t, env.db, "cursor:nested-sync", "nested_proj",
+	)
+	assertSessionMessageCount(
+		t, env.db, "cursor:nested-sync", 2,
+	)
+}
+
+func TestSyncSingleSessionCursorNestedLayoutPreservesProject(
+	t *testing.T,
+) {
+	env := setupTestEnv(t)
+
+	path := env.writeNestedCursorSession(
+		t, env.cursorDir,
+		"Users-alice-code-nested-proj",
+		"nested-resync", ".jsonl",
+		"user:\nHello nested cursor\nassistant:\nHi there!\n",
+	)
+
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1, Synced: 1, Skipped: 0,
+	})
+	assertSessionProject(
+		t, env.db, "cursor:nested-resync", "nested_proj",
+	)
+
+	updated := "user:\nHello nested cursor\n" +
+		"assistant:\nHi there!\n" +
+		"user:\nFollow-up\n" +
+		"assistant:\nGot it.\n"
+	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if err := env.engine.SyncSingleSession(
+		"cursor:nested-resync",
+	); err != nil {
+		t.Fatalf("SyncSingleSession: %v", err)
+	}
+
+	assertSessionProject(
+		t, env.db, "cursor:nested-resync", "nested_proj",
+	)
+	assertSessionMessageCount(
+		t, env.db, "cursor:nested-resync", 4,
+	)
+}
+
 func TestSyncForkDetection(t *testing.T) {
 	env := setupTestEnv(t)
 
@@ -2879,9 +2958,26 @@ func TestIncrementalSync_ClaudeAppend(t *testing.T) {
 	origHash := *full.FileHash
 
 	// Append an assistant response.
-	appended := testjsonl.ClaudeAssistantJSON(
-		"world", tsZeroS5,
-	) + "\n"
+	appendedJSON, err := json.Marshal(map[string]any{
+		"type":      "assistant",
+		"timestamp": tsZeroS5,
+		"message": map[string]any{
+			"model": "claude-sonnet-4-20250514",
+			"usage": map[string]any{
+				"input_tokens":                100,
+				"cache_creation_input_tokens": 200,
+				"cache_read_input_tokens":     200,
+				"output_tokens":               200,
+			},
+			"content": []map[string]any{
+				{"type": "text", "text": "world"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal assistant fixture: %v", err)
+	}
+	appended := string(appendedJSON) + "\n"
 	f, err := os.OpenFile(
 		path, os.O_APPEND|os.O_WRONLY, 0o644,
 	)
@@ -2927,6 +3023,34 @@ func TestIncrementalSync_ClaudeAppend(t *testing.T) {
 			"file_hash = %v, want %q (preserved)",
 			updated.FileHash, origHash,
 		)
+	}
+	if !updated.HasTotalOutputTokens {
+		t.Error("HasTotalOutputTokens = false, want true")
+	}
+	if !updated.HasPeakContextTokens {
+		t.Error("HasPeakContextTokens = false, want true")
+	}
+	if updated.TotalOutputTokens != 200 {
+		t.Errorf("TotalOutputTokens = %d, want 200",
+			updated.TotalOutputTokens)
+	}
+	if updated.PeakContextTokens != 500 {
+		t.Errorf("PeakContextTokens = %d, want 500",
+			updated.PeakContextTokens)
+	}
+	if !msgs[1].HasContextTokens {
+		t.Error("assistant HasContextTokens = false, want true")
+	}
+	if !msgs[1].HasOutputTokens {
+		t.Error("assistant HasOutputTokens = false, want true")
+	}
+	if msgs[1].OutputTokens != 200 {
+		t.Errorf("assistant OutputTokens = %d, want 200",
+			msgs[1].OutputTokens)
+	}
+	if msgs[1].ContextTokens != 500 {
+		t.Errorf("assistant ContextTokens = %d, want 500",
+			msgs[1].ContextTokens)
 	}
 }
 
@@ -2986,6 +3110,92 @@ func TestIncrementalSync_CodexAppend(t *testing.T) {
 				i, m.SessionID,
 			)
 		}
+	}
+}
+
+func TestIncrementalSync_CodexSubagentAppendFallsBackToFullParse(t *testing.T) {
+	env := setupTestEnv(t)
+
+	childID := "019c9c96-6ee7-77c0-ba4c-380f844289d5"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			"inc-cx-sub", "/tmp/proj",
+			"codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "run child", tsEarlyS1),
+		testjsonl.CodexFunctionCallWithCallIDJSON("spawn_agent", "call_spawn", map[string]any{
+			"agent_type": "awaiter",
+			"message":    "run it",
+		}, tsEarlyS5),
+		testjsonl.CodexFunctionCallOutputJSON("call_spawn", `{"agent_id":"`+childID+`","nickname":"Fennel"}`, "2024-01-01T10:01:00Z"),
+	)
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-20240101-inc-cx-sub.jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	assertSessionMessageCount(
+		t, env.db, "codex:inc-cx-sub", 2,
+	)
+
+	appended := testjsonl.JoinJSONL(
+		testjsonl.CodexFunctionCallWithCallIDJSON("wait", "call_wait", map[string]any{
+			"ids": []string{childID},
+		}, "2024-01-01T10:01:06Z"),
+		testjsonl.CodexFunctionCallOutputJSON("call_wait",
+			"{\"status\":{\""+childID+"\":{\"completed\":\"Finished successfully\"}}}",
+			"2024-01-01T10:01:07Z",
+		),
+	)
+	f, err := os.OpenFile(
+		path, os.O_APPEND|os.O_WRONLY, 0o644,
+	)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	_, err = f.WriteString(appended)
+	f.Close()
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	// SyncPaths hits the incremental Codex path first. The appended
+	// wait call is an explicit full-parse fallback case and should
+	// still produce the final parsed state successfully.
+	env.engine.SyncPaths([]string{path})
+
+	assertSessionMessageCount(
+		t, env.db, "codex:inc-cx-sub", 3,
+	)
+	msgs := fetchMessages(t, env.db, "codex:inc-cx-sub")
+	if len(msgs) != 3 {
+		t.Fatalf("messages len = %d, want 3", len(msgs))
+	}
+	if len(msgs[2].ToolCalls) != 1 {
+		t.Fatalf("tool calls len = %d, want 1", len(msgs[2].ToolCalls))
+	}
+	waitCall := msgs[2].ToolCalls[0]
+	if waitCall.ToolName != "wait" {
+		t.Fatalf("tool name = %q, want %q", waitCall.ToolName, "wait")
+	}
+	if len(waitCall.ResultEvents) != 1 {
+		t.Fatalf("result events len = %d, want 1", len(waitCall.ResultEvents))
+	}
+	if waitCall.ResultEvents[0].AgentID != childID {
+		t.Fatalf("event agent_id = %q, want %q", waitCall.ResultEvents[0].AgentID, childID)
+	}
+	if waitCall.ResultEvents[0].Content != "Finished successfully" {
+		t.Fatalf(
+			"event content = %q, want %q",
+			waitCall.ResultEvents[0].Content, "Finished successfully",
+		)
+	}
+	if waitCall.ResultContent != "Finished successfully" {
+		t.Fatalf(
+			"result_content = %q, want %q",
+			waitCall.ResultContent, "Finished successfully",
+		)
 	}
 }
 

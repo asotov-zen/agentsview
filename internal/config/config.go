@@ -56,10 +56,12 @@ type ProxyConfig struct {
 
 // PGConfig holds PostgreSQL connection settings.
 type PGConfig struct {
-	URL           string `toml:"url" json:"url"`
-	Schema        string `toml:"schema" json:"schema"`
-	MachineName   string `toml:"machine_name" json:"machine_name"`
-	AllowInsecure bool   `toml:"allow_insecure" json:"allow_insecure"`
+	URL             string   `toml:"url" json:"url"`
+	Schema          string   `toml:"schema" json:"schema"`
+	MachineName     string   `toml:"machine_name" json:"machine_name"`
+	AllowInsecure   bool     `toml:"allow_insecure" json:"allow_insecure"`
+	Projects        []string `toml:"projects" json:"projects,omitempty"`
+	ExcludeProjects []string `toml:"exclude_projects" json:"exclude_projects,omitempty"`
 }
 
 // Config holds all application configuration.
@@ -78,6 +80,8 @@ type Config struct {
 	AuthToken            string         `json:"auth_token,omitempty" toml:"auth_token"`
 	RemoteAccess         bool           `json:"remote_access" toml:"remote_access"`
 	NoBrowser            bool           `json:"no_browser" toml:"no_browser"`
+	DisableUpdateCheck   bool           `json:"disable_update_check" toml:"disable_update_check"`
+	NoSync               bool           `json:"-" toml:"-"`
 	PG                   PGConfig       `json:"pg,omitempty" toml:"pg"`
 	WriteTimeout         time.Duration  `json:"-" toml:"-"`
 
@@ -164,6 +168,45 @@ func Load(fs *flag.FlagSet) (Config, error) {
 	if err != nil {
 		return cfg, err
 	}
+	applyFlags(&cfg, fs)
+	if err := finalize(&cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+// LoadPGServe builds a Config for `pg serve` by preserving
+// shared and PG settings from defaults/env/config file while
+// resetting serve-specific network/browser settings to defaults.
+// Only explicitly provided serve flags are applied on top.
+func LoadPGServe(fs *flag.FlagSet) (Config, error) {
+	cfg, err := Default()
+	if err != nil {
+		return cfg, err
+	}
+	cfg.loadEnv()
+	if err := cfg.loadFile(); err != nil {
+		return cfg, fmt.Errorf("loading config file: %w", err)
+	}
+	if err := cfg.ensureCursorSecret(); err != nil {
+		return cfg, fmt.Errorf("ensuring cursor secret: %w", err)
+	}
+	cfg.DBPath = filepath.Join(cfg.DataDir, "sessions.db")
+
+	// pg serve intentionally ignores persisted normal serve/public/proxy
+	// settings so an existing SQLite-backed serve deployment cannot silently
+	// reconfigure the PG-backed server. Until a dedicated pg-serve config
+	// namespace exists, only explicit pg-serve flags should shape its
+	// network/proxy behavior.
+	cfg.Host = "127.0.0.1"
+	cfg.Port = 8080
+	cfg.PublicURL = ""
+	cfg.PublicOrigins = nil
+	cfg.Proxy = ProxyConfig{}
+	cfg.RemoteAccess = false
+	cfg.NoBrowser = false
+	cfg.HostExplicit = false
+
 	applyFlags(&cfg, fs)
 	if err := finalize(&cfg); err != nil {
 		return cfg, err
@@ -259,6 +302,7 @@ func (c *Config) loadFile() error {
 		Terminal                       TerminalConfig `toml:"terminal"`
 		AuthToken                      string         `toml:"auth_token"`
 		RemoteAccess                   bool           `toml:"remote_access"`
+		DisableUpdateCheck             bool           `toml:"disable_update_check"`
 		PG                             PGConfig       `toml:"pg"`
 	}
 	if _, err := toml.DecodeFile(path, &file); err != nil {
@@ -295,6 +339,7 @@ func (c *Config) loadFile() error {
 		c.AuthToken = file.AuthToken
 	}
 	c.RemoteAccess = file.RemoteAccess
+	c.DisableUpdateCheck = file.DisableUpdateCheck
 	// Merge pg field-by-field so env vars override only
 	// the fields they set, preserving config-file settings.
 	if file.PG.URL != "" && c.PG.URL == "" {
@@ -308,6 +353,12 @@ func (c *Config) loadFile() error {
 	}
 	if file.PG.AllowInsecure {
 		c.PG.AllowInsecure = true
+	}
+	if file.PG.Projects != nil && c.PG.Projects == nil {
+		c.PG.Projects = file.PG.Projects
+	}
+	if file.PG.ExcludeProjects != nil && c.PG.ExcludeProjects == nil {
+		c.PG.ExcludeProjects = file.PG.ExcludeProjects
 	}
 
 	// Parse config-file dir arrays for agents that have a
@@ -429,6 +480,9 @@ func (c *Config) loadEnv() {
 	if v := os.Getenv("AGENTSVIEW_PG_MACHINE"); v != "" {
 		c.PG.MachineName = v
 	}
+	if v := os.Getenv("AGENTSVIEW_DISABLE_UPDATE_CHECK"); v != "" {
+		c.DisableUpdateCheck = v == "1" || v == "true"
+	}
 }
 
 type stringListFlag []string
@@ -495,6 +549,14 @@ func RegisterServeFlags(fs *flag.FlagSet) {
 		"no-browser", false,
 		"Don't open browser on startup",
 	)
+	fs.Bool(
+		"no-sync", false,
+		"Skip initial sync and disable background sync/file watching",
+	)
+	fs.Bool(
+		"no-update-check", false,
+		"Disable the update check API endpoint",
+	)
 }
 
 // applyFlags copies explicitly-set flags from fs into cfg.
@@ -530,6 +592,10 @@ func applyFlags(cfg *Config, fs *flag.FlagSet) {
 			cfg.Proxy.AllowedSubnets = splitFlagList(f.Value.String())
 		case "no-browser":
 			cfg.NoBrowser = f.Value.String() == "true"
+		case "no-sync":
+			cfg.NoSync = f.Value.String() == "true"
+		case "no-update-check":
+			cfg.DisableUpdateCheck = f.Value.String() == "true"
 		}
 	})
 }
