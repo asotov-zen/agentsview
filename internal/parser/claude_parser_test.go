@@ -147,14 +147,14 @@ func TestParseClaudeSession_SkippedMessages(t *testing.T) {
 			testjsonl.ClaudeUserJSON("real user message", "2024-01-01T00:00:07Z"),
 		)
 		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
-		assert.Equal(t, 8, sess.MessageCount)
+		assert.Equal(t, 6, sess.MessageCount)
 		assert.Equal(t, 1, sess.UserMessageCount)
-		// First 7 messages are system, last is regular.
-		for i := range 7 {
+		// First 5 messages are system, last is regular.
+		for i := range 5 {
 			assert.True(t, msgs[i].IsSystem, "msgs[%d] should be system", i)
 		}
-		assert.False(t, msgs[7].IsSystem)
-		assert.Equal(t, "real user message", msgs[7].Content)
+		assert.False(t, msgs[5].IsSystem)
+		assert.Equal(t, "real user message", msgs[5].Content)
 		assert.Equal(t, "real user message", sess.FirstMessage)
 	})
 

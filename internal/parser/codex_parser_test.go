@@ -1176,7 +1176,8 @@ func TestParseCodexSessionFrom_SystemMessageDoesNotRequireFullParse(t *testing.T
 
 	newMsgs, endedAt, _, err := ParseCodexSessionFrom(path, offset, 1, false)
 	require.NoError(t, err)
-	assert.Equal(t, 0, len(newMsgs))
+	assert.Equal(t, 1, len(newMsgs))
+	assert.True(t, newMsgs[0].IsSystem)
 	assert.False(t, endedAt.IsZero())
 }
 
