@@ -25,13 +25,23 @@
     return `${(v * 100).toFixed(1)}%`;
   }
 
-  const totalTokens = $derived.by(() => {
-    const s = usage.summary;
-    if (!s) return 0;
-    const t = s.totals;
-    return t.inputTokens + t.outputTokens
-      + t.cacheCreationTokens + t.cacheReadTokens;
-  });
+  const inputTokens = $derived(
+    usage.summary?.totals.inputTokens ?? 0,
+  );
+
+  const outputTokens = $derived(
+    usage.summary?.totals.outputTokens ?? 0,
+  );
+
+  // "cached" here means input tokens that were actually
+  // served from cache, i.e. cacheReadTokens. Cache-creation
+  // tokens are cache writes — fresh input paying the
+  // cache-write surcharge rather than being replayed from
+  // cache — so folding them in would overstate cache usage
+  // on workloads that only warm the cache.
+  const cachedTokens = $derived(
+    usage.summary?.totals.cacheReadTokens ?? 0,
+  );
 
   const dailyBurn = $derived.by(() => {
     const s = usage.summary;
@@ -79,8 +89,14 @@
       featured: true,
     },
     {
-      label: "Tokens",
-      value: () => fmtTokens(totalTokens),
+      label: "Input Tokens",
+      value: () => fmtTokens(inputTokens),
+      sub: () =>
+        cachedTokens > 0 ? `+${fmtTokens(cachedTokens)} cached` : "",
+    },
+    {
+      label: "Output Tokens",
+      value: () => fmtTokens(outputTokens),
     },
     {
       label: "Daily Burn",

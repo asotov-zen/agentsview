@@ -50,9 +50,16 @@ type Engine struct {
 	skipCache map[string]int64
 }
 
+// codexExecMigrationKey is the pg_sync_state flag that
+// records whether the one-time cleanup of legacy codex_exec
+// skip cache entries has already run on this database.
+const codexExecMigrationKey = "codex_exec_legacy_migration_v1"
+
 // NewEngine creates a sync engine. It pre-populates the
 // in-memory skip cache from the database so that files
-// skipped in a prior run are not re-parsed on startup.
+// skipped in a prior run are not re-parsed on startup, and
+// migrates legacy codex_exec skip entries on first run under
+// the new bulk-sync behavior.
 func NewEngine(
 	database *db.DB, cfg EngineConfig,
 ) *Engine {
@@ -62,6 +69,8 @@ func NewEngine(
 	} else {
 		log.Printf("loading skip cache: %v", err)
 	}
+
+	migrateLegacyCodexExecSkips(database, skipCache)
 
 	dirs := make(map[parser.AgentType][]string, len(cfg.AgentDirs))
 	for k, v := range cfg.AgentDirs {
@@ -74,6 +83,72 @@ func NewEngine(
 		machine:                 cfg.Machine,
 		blockedResultCategories: blockedCategorySet(cfg.BlockedResultCategories),
 		skipCache:               skipCache,
+	}
+}
+
+// migrateLegacyCodexExecSkips removes skip cache entries
+// created by older agentsview builds that excluded Codex exec
+// sessions from bulk sync. The scrub runs once per database:
+// a `pg_sync_state` flag is set after the first successful
+// pass so subsequent process starts do not re-scan files.
+// New skip entries for real parse errors on exec files are
+// untouched here and honored normally on later syncs.
+//
+// The cleanup builds a rebuilt snapshot and writes it through
+// the atomic ReplaceSkippedFiles, then only mutates the
+// in-memory map and records the done flag after the persist
+// succeeds. A partial failure leaves both the DB and the
+// in-memory cache in their prior state so the migration is
+// retried on the next startup rather than being falsely
+// marked complete.
+func migrateLegacyCodexExecSkips(
+	database *db.DB, skipCache map[string]int64,
+) {
+	done, err := database.GetSyncState(codexExecMigrationKey)
+	if err != nil {
+		log.Printf("codex exec migration: %v", err)
+		return
+	}
+	if done != "" {
+		return
+	}
+
+	cleaned := make(map[string]int64, len(skipCache))
+	var legacy []string
+	for path, mtime := range skipCache {
+		if strings.HasSuffix(path, ".jsonl") &&
+			parser.IsCodexExecSessionFile(path) {
+			legacy = append(legacy, path)
+			continue
+		}
+		cleaned[path] = mtime
+	}
+
+	if len(legacy) > 0 {
+		if err := database.ReplaceSkippedFiles(
+			cleaned,
+		); err != nil {
+			log.Printf(
+				"codex exec migration: persist cleaned skip cache: %v",
+				err,
+			)
+			return
+		}
+		for _, p := range legacy {
+			delete(skipCache, p)
+		}
+		log.Printf(
+			"codex exec legacy migration: cleared %d skip entries",
+			len(legacy),
+		)
+	}
+
+	if err := database.SetSyncState(
+		codexExecMigrationKey, "done",
+	); err != nil {
+		log.Printf(
+			"codex exec migration: set flag: %v", err,
+		)
 	}
 }
 
@@ -1471,6 +1546,11 @@ func (e *Engine) processFile(
 
 	// Skip files cached from a previous sync (parse errors
 	// or non-interactive sessions) whose mtime is unchanged.
+	// Legacy codex_exec entries from pre-bulk-sync builds are
+	// scrubbed once at engine construction by
+	// migrateLegacyCodexExecSkips, so this check can treat
+	// the skip cache as authoritative without per-file
+	// re-validation.
 	e.skipMu.RLock()
 	cachedMtime, cached := e.skipCache[file.Path]
 	e.skipMu.RUnlock()
@@ -1807,9 +1887,6 @@ func (e *Engine) processCodex(
 	)
 	if err != nil {
 		return processResult{err: err}
-	}
-	if sess == nil {
-		return processResult{} // non-interactive
 	}
 
 	hash, err := ComputeFileHash(file.Path)
@@ -2670,9 +2747,8 @@ func (e *Engine) FindSourceFile(sessionID string) string {
 	return ""
 }
 
-// SyncSingleSession re-syncs a single session by its ID.
-// Unlike the bulk SyncAll path, this includes exec-originated
-// Codex sessions and uses the existing DB project as fallback.
+// SyncSingleSession re-syncs a single session by its ID and
+// uses the existing DB project as fallback where applicable.
 func (e *Engine) SyncSingleSession(sessionID string) error {
 	e.syncMu.Lock()
 	defer e.syncMu.Unlock()
@@ -2704,9 +2780,7 @@ func (e *Engine) SyncSingleSession(sessionID string) error {
 	// during a bulk SyncAll.
 	e.clearSkip(path)
 
-	// Reuse processFile for stat and DB-skip logic. For
-	// Claude this is the full pipeline; for Codex we need
-	// includeExec=true so we call the parser directly.
+	// Reuse processFile for stat and DB-skip logic.
 	file := parser.DiscoveredFile{
 		Path:  path,
 		Agent: agent,
@@ -2771,23 +2845,6 @@ func (e *Engine) SyncSingleSession(sessionID string) error {
 		return e.writeIncremental(res.incremental)
 	}
 
-	// For Codex, processFile uses includeExec=false which may
-	// return empty results for exec-originated sessions. Re-parse
-	// with includeExec=true when that happens.
-	if len(res.results) == 0 && agent == parser.AgentCodex {
-		execRes := e.processCodexIncludeExec(file)
-		if execRes.err != nil {
-			if res.mtime != 0 {
-				e.cacheSkip(path, res.mtime)
-			}
-			return execRes.err
-		}
-		if len(execRes.results) == 0 {
-			return nil
-		}
-		res.results = execRes.results
-	}
-
 	if len(res.results) == 0 {
 		return nil
 	}
@@ -2809,30 +2866,6 @@ func (e *Engine) SyncSingleSession(sessionID string) error {
 	}
 
 	return nil
-}
-
-// processCodexIncludeExec re-parses a Codex session with
-// exec-originated sessions included.
-func (e *Engine) processCodexIncludeExec(
-	file parser.DiscoveredFile,
-) processResult {
-	sess, msgs, err := parser.ParseCodexSession(
-		file.Path, e.machine, true,
-	)
-	if err != nil {
-		return processResult{err: err}
-	}
-	if sess == nil {
-		return processResult{}
-	}
-	if h, herr := ComputeFileHash(file.Path); herr == nil {
-		sess.File.Hash = h
-	}
-	return processResult{
-		results: []parser.ParseResult{
-			{Session: *sess, Messages: msgs},
-		},
-	}
 }
 
 // syncSingleOpenCode re-syncs a single OpenCode session.

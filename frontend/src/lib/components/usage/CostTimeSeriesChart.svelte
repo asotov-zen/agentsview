@@ -5,6 +5,10 @@
   const CHART_H = 180;
   const X_LABEL_H = 20;
   const Y_LABEL_W = 40;
+  // Reserved headroom at the top of the plot area so the
+  // maximum bar, its grid line, and the top y-axis label's
+  // ascenders do not clip against the SVG viewBox edge.
+  const TOP_PAD = 10;
   const MAX_SERIES = 5;
 
   const OTHER_COLOR = "var(--text-muted)";
@@ -138,6 +142,45 @@
 
   const BAR_WIDTH = 40;
 
+  // TICK_TARGET is the number of y-axis intervals we aim
+  // for. niceScale picks a step from the 1/2/5 × 10ⁿ set so
+  // the chosen max is always an integer multiple of the step
+  // and every tick lands on a round value. Actual interval
+  // count may come out as target ± 1 depending on where maxY
+  // falls.
+  const TICK_TARGET = 5;
+
+  function niceScale(
+    maxY: number,
+  ): { step: number; max: number } {
+    if (!Number.isFinite(maxY) || maxY <= 0) {
+      return { step: 0.25, max: 1 };
+    }
+    const rough = maxY / TICK_TARGET;
+    const exp = Math.floor(Math.log10(rough));
+    const base = Math.pow(10, exp);
+    const normalized = rough / base;
+    let mult: number;
+    if (normalized <= 1) mult = 1;
+    else if (normalized <= 2) mult = 2;
+    else if (normalized <= 5) mult = 5;
+    else mult = 10;
+    const step = mult * base;
+    const max = Math.ceil(maxY / step) * step;
+    return { step, max };
+  }
+
+  const scale = $derived(niceScale(seriesData.maxY));
+
+  // scaleY maps a data value in [0, niceMax] onto the plot
+  // area [TOP_PAD, h], inverted so 0 is at the bottom. Kept
+  // as a function so both buildPaths and yTicks use identical
+  // math and the top tick lines up with the highest bar.
+  function scaleY(val: number, max: number, h: number): number {
+    const plotH = h - TOP_PAD;
+    return h - (val / max) * plotH;
+  }
+
   function buildPaths(
     points: Point[],
     keys: string[],
@@ -160,8 +203,8 @@
       let baseline = 0;
       for (const key of keys) {
         const val = points[0]!.values[key] ?? 0;
-        const top = h - ((baseline + val) / maxY) * h;
-        const bot = h - (baseline / maxY) * h;
+        const top = scaleY(baseline + val, maxY, h);
+        const bot = scaleY(baseline, maxY, h);
         const d =
           `M${x0},${bot}` +
           `L${x0},${top}` +
@@ -191,14 +234,14 @@
       for (let i = 0; i < points.length; i++) {
         const x = Y_LABEL_W + i * xStep;
         const val = points[i]!.values[key] ?? 0;
-        const top = h - ((baselines[i]! + val) / maxY) * h;
+        const top = scaleY(baselines[i]! + val, maxY, h);
         d += i === 0 ? `M${x},${top}` : `L${x},${top}`;
       }
 
       // Close area back along baseline
       for (let i = points.length - 1; i >= 0; i--) {
         const x = Y_LABEL_W + i * xStep;
-        const base = h - (baselines[i]! / maxY) * h;
+        const base = scaleY(baselines[i]!, maxY, h);
         d += `L${x},${base}`;
       }
       d += "Z";
@@ -220,7 +263,7 @@
     buildPaths(
       seriesData.points,
       seriesData.keys,
-      seriesData.maxY,
+      scale.max,
       chartWidth,
       CHART_H,
     ),
@@ -267,14 +310,17 @@
   }
 
   const yTicks = $derived.by(() => {
-    const max = seriesData.maxY;
-    if (max <= 0) return [];
+    const { step, max } = scale;
+    if (max <= 0 || step <= 0) return [];
     const ticks: Array<{ y: number; label: string }> = [];
-    const count = 4;
+    // Step-driven loop so every tick is an integer multiple
+    // of step and the top tick equals max exactly. Rounding
+    // guards against floating-point drift on sub-unit steps.
+    const count = Math.round(max / step);
     for (let i = 0; i <= count; i++) {
-      const val = (max / count) * i;
+      const val = step * i;
       ticks.push({
-        y: CHART_H - (val / max) * CHART_H,
+        y: scaleY(val, max, CHART_H),
         label: fmtYLabel(val),
       });
     }
