@@ -32,13 +32,17 @@ import type {
   GenerateInsightRequest,
   PinsResponse,
   TrashResponse,
+  UsageSummaryResponse,
+  TopUsageSessionsResponse,
+  UsageParams,
+  UsageTopSessionsParams,
 } from "./types.js";
 import type { SessionActivityResponse } from "./types/session-activity.js";
 
 const SERVER_URL_KEY = "agentsview-server-url";
 const AUTH_TOKEN_KEY = "agentsview-auth-token";
 
-function getBase(): string {
+export function getBase(): string {
   const server = getServerUrl();
   if (server) return `${server}/api/v1`;
   // Use the <base href> tag injected by --base-path so the app
@@ -1047,8 +1051,9 @@ export async function importChatGPT(
 
 /* Pins */
 
-export function listPins(): Promise<PinsResponse> {
-  return fetchJSON("/pins");
+export function listPins(project?: string): Promise<PinsResponse> {
+  const url = project ? `/pins?project=${encodeURIComponent(project)}` : "/pins";
+  return fetchJSON(url);
 }
 
 export function listSessionPins(
@@ -1084,4 +1089,18 @@ export async function unpinMessage(
     const body = await res.text();
     throw new ApiError(res.status, apiErrorMessage(res.status, body));
   }
+}
+
+/* Usage */
+
+export function getUsageSummary(
+  params: UsageParams,
+): Promise<UsageSummaryResponse> {
+  return fetchJSON(`/usage/summary${buildQuery({ ...params })}`);
+}
+
+export function getUsageTopSessions(
+  params: UsageTopSessionsParams,
+): Promise<TopUsageSessionsResponse> {
+  return fetchJSON(`/usage/top-sessions${buildQuery({ ...params })}`);
 }

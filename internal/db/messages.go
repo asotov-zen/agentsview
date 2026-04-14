@@ -17,13 +17,15 @@ const (
 		timestamp, has_thinking, has_tool_use, is_system, content_length,
 		model_id, provider_id,
 		model, token_usage, context_tokens, output_tokens,
-		has_context_tokens, has_output_tokens`
+		has_context_tokens, has_output_tokens,
+		claude_message_id, claude_request_id`
 
 	insertMessageCols = `session_id, ordinal, role, content,
 		timestamp, has_thinking, has_tool_use, is_system, content_length,
 		model_id, provider_id,
 		model, token_usage, context_tokens, output_tokens,
-		has_context_tokens, has_output_tokens`
+		has_context_tokens, has_output_tokens,
+		claude_message_id, claude_request_id`
 
 	// DefaultMessageLimit is the default number of messages returned.
 	DefaultMessageLimit = 100
@@ -91,6 +93,8 @@ type Message struct {
 	OutputTokens     int             `json:"output_tokens"`
 	HasContextTokens bool            `json:"has_context_tokens"`
 	HasOutputTokens  bool            `json:"has_output_tokens"`
+	ClaudeMessageID  string          `json:"claude_message_id,omitempty"`
+	ClaudeRequestID  string          `json:"claude_request_id,omitempty"`
 	ToolCalls        []ToolCall      `json:"tool_calls,omitempty"`
 	ToolResults      []ToolResult    `json:"-"` // transient, for pairing
 }
@@ -264,6 +268,7 @@ func (db *DB) insertMessagesTx(
 			m.Model, string(m.TokenUsage),
 			m.ContextTokens, m.OutputTokens,
 			m.HasContextTokens, m.HasOutputTokens,
+			m.ClaudeMessageID, m.ClaudeRequestID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf(
@@ -766,6 +771,7 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 			&m.Model, &tokenUsage,
 			&m.ContextTokens, &m.OutputTokens,
 			&m.HasContextTokens, &m.HasOutputTokens,
+			&m.ClaudeMessageID, &m.ClaudeRequestID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning message: %w", err)
@@ -812,7 +818,8 @@ func (db *DB) MessageContentFingerprint(sessionID string) (sum, max, min int64, 
 func (db *DB) MessageTokenFingerprint(sessionID string) (string, error) {
 	rows, err := db.getReader().Query(
 		`SELECT ordinal, model, token_usage, context_tokens,
-			output_tokens, has_context_tokens, has_output_tokens
+			output_tokens, has_context_tokens, has_output_tokens,
+			claude_message_id, claude_request_id
 		 FROM messages
 		 WHERE session_id = ?
 		 ORDER BY ordinal ASC`,
@@ -828,18 +835,21 @@ func (db *DB) MessageTokenFingerprint(sessionID string) (string, error) {
 		var ordinal, contextTokens, outputTokens int
 		var model, tokenUsage string
 		var hasContextTokens, hasOutputTokens bool
+		var claudeMsgID, claudeReqID string
 		if err := rows.Scan(
 			&ordinal, &model, &tokenUsage, &contextTokens,
 			&outputTokens, &hasContextTokens, &hasOutputTokens,
+			&claudeMsgID, &claudeReqID,
 		); err != nil {
 			return "", err
 		}
-		fmt.Fprintf(&b, "%d|%d:%s|%d:%s|%d|%d|%t|%t;",
+		fmt.Fprintf(&b, "%d|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s;",
 			ordinal,
 			len(model), model,
 			len(tokenUsage), tokenUsage,
 			contextTokens, outputTokens,
 			hasContextTokens, hasOutputTokens,
+			claudeMsgID, claudeReqID,
 		)
 	}
 	return b.String(), rows.Err()
@@ -911,6 +921,7 @@ func (db *DB) GetMessageByOrdinal(
 		&m.Model, &tokenUsage,
 		&m.ContextTokens, &m.OutputTokens,
 		&m.HasContextTokens, &m.HasOutputTokens,
+		&m.ClaudeMessageID, &m.ClaudeRequestID,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil

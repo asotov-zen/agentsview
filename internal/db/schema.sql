@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS messages (
     output_tokens INTEGER NOT NULL DEFAULT 0,
     has_context_tokens INTEGER NOT NULL DEFAULT 0,
     has_output_tokens INTEGER NOT NULL DEFAULT 0,
+    claude_message_id TEXT NOT NULL DEFAULT '',
+    claude_request_id TEXT NOT NULL DEFAULT '',
     UNIQUE(session_id, ordinal)
 );
 
@@ -223,4 +225,15 @@ CREATE TABLE IF NOT EXISTS skipped_files (
 CREATE TABLE IF NOT EXISTS pg_sync_state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+-- Model pricing for cost calculation
+CREATE TABLE IF NOT EXISTS model_pricing (
+    model_pattern    TEXT PRIMARY KEY,
+    input_per_mtok   REAL NOT NULL DEFAULT 0,
+    output_per_mtok  REAL NOT NULL DEFAULT 0,
+    cache_creation_per_mtok REAL NOT NULL DEFAULT 0,
+    cache_read_per_mtok     REAL NOT NULL DEFAULT 0,
+    updated_at       TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );

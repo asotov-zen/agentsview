@@ -15,6 +15,7 @@ const (
 	AgentCopilot       AgentType = "copilot"
 	AgentGemini        AgentType = "gemini"
 	AgentOpenCode      AgentType = "opencode"
+	AgentOpenHands     AgentType = "openhands"
 	AgentCursor        AgentType = "cursor"
 	AgentIflow         AgentType = "iflow"
 	AgentAmp           AgentType = "amp"
@@ -27,6 +28,10 @@ const (
 	AgentChatGPT       AgentType = "chatgpt"
 	AgentKiro          AgentType = "kiro"
 	AgentKiroIDE       AgentType = "kiro-ide"
+	AgentCortex        AgentType = "cortex"
+	AgentHermes        AgentType = "hermes"
+	AgentWarp          AgentType = "warp"
+	AgentPositron      AgentType = "positron"
 )
 
 // AgentDef describes a supported coding agent's filesystem
@@ -39,6 +44,7 @@ type AgentDef struct {
 	DefaultDirs  []string // paths relative to $HOME
 	IDPrefix     string   // session ID prefix ("" for Claude)
 	WatchSubdirs []string // subdirs to watch (nil = watch root)
+	ShallowWatch bool     // true = watch root only, rely on periodic sync for subdirs
 	FileBased    bool     // false for DB-backed agents
 
 	// DiscoverFunc finds session files under a root directory.
@@ -110,9 +116,22 @@ var Registry = []AgentDef{
 		FileBased:   false,
 	},
 	{
+		Type:           AgentOpenHands,
+		DisplayName:    "OpenHands CLI",
+		EnvVar:         "OPENHANDS_CONVERSATIONS_DIR",
+		ConfigKey:      "openhands_dirs",
+		DefaultDirs:    []string{".openhands/conversations"},
+		IDPrefix:       "openhands:",
+		FileBased:      true,
+		ShallowWatch:   true,
+		DiscoverFunc:   DiscoverOpenHandsSessions,
+		FindSourceFunc: FindOpenHandsSourceFile,
+	},
+	{
 		Type:           AgentCursor,
 		DisplayName:    "Cursor",
 		EnvVar:         "CURSOR_PROJECTS_DIR",
+		ConfigKey:      "cursor_project_dirs",
 		DefaultDirs:    []string{".cursor/projects"},
 		IDPrefix:       "cursor:",
 		FileBased:      true,
@@ -123,6 +142,7 @@ var Registry = []AgentDef{
 		Type:           AgentAmp,
 		DisplayName:    "Amp",
 		EnvVar:         "AMP_DIR",
+		ConfigKey:      "amp_dirs",
 		DefaultDirs:    []string{".local/share/amp/threads"},
 		IDPrefix:       "amp:",
 		FileBased:      true,
@@ -183,6 +203,7 @@ var Registry = []AgentDef{
 		Type:           AgentPi,
 		DisplayName:    "Pi",
 		EnvVar:         "PI_DIR",
+		ConfigKey:      "pi_dirs",
 		DefaultDirs:    []string{".pi/agent/sessions"},
 		IDPrefix:       "pi:",
 		FileBased:      true,
@@ -244,6 +265,53 @@ var Registry = []AgentDef{
 		FileBased:      true,
 		DiscoverFunc:   DiscoverKiroIDESessions,
 		FindSourceFunc: FindKiroIDESourceFile,
+	},
+	{
+		Type:        AgentCortex,
+		DisplayName: "Cortex Code",
+		EnvVar:      "CORTEX_DIR",
+		ConfigKey:   "cortex_dirs",
+		DefaultDirs: []string{
+			".snowflake/cortex/conversations",
+		},
+		IDPrefix:       "cortex:",
+		FileBased:      true,
+		DiscoverFunc:   DiscoverCortexSessions,
+		FindSourceFunc: FindCortexSourceFile,
+	},
+	{
+		Type:           AgentHermes,
+		DisplayName:    "Hermes Agent",
+		EnvVar:         "HERMES_SESSIONS_DIR",
+		ConfigKey:      "hermes_sessions_dirs",
+		DefaultDirs:    []string{".hermes/sessions"},
+		IDPrefix:       "hermes:",
+		FileBased:      true,
+		DiscoverFunc:   DiscoverHermesSessions,
+		FindSourceFunc: FindHermesSourceFile,
+	},
+	{
+		Type:        AgentWarp,
+		DisplayName: "Warp",
+		EnvVar:      "WARP_DIR",
+		ConfigKey:   "warp_dirs",
+		DefaultDirs: warpDefaultDirs(),
+		IDPrefix:    "warp:",
+		FileBased:   false,
+	},
+	{
+		Type:        AgentPositron,
+		DisplayName: "Positron Assistant",
+		EnvVar:      "POSITRON_DIR",
+		ConfigKey:   "positron_dirs",
+		DefaultDirs: []string{
+			"Library/Application Support/Positron/User",
+		},
+		IDPrefix:       "positron:",
+		WatchSubdirs:   []string{"workspaceStorage"},
+		FileBased:      true,
+		DiscoverFunc:   DiscoverPositronSessions,
+		FindSourceFunc: FindPositronSourceFile,
 	},
 }
 
@@ -395,6 +463,14 @@ type ParsedMessage struct {
 	OutputTokens     int
 	HasContextTokens bool
 	HasOutputTokens  bool
+
+	// ClaudeMessageID and ClaudeRequestID hold the provider's
+	// per-response identifiers. Used for cross-file / cross-session
+	// deduplication when summing token usage, matching ccusage's
+	// `${messageId}:${requestId}` hash. Only populated by the
+	// Claude parser; empty for all other agents.
+	ClaudeMessageID string
+	ClaudeRequestID string
 
 	// tokenPresenceKnown marks per-message token coverage as
 	// parser-owned and authoritative.
