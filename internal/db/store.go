@@ -28,8 +28,7 @@ type Store interface {
 	// Messages.
 	GetMessages(ctx context.Context, sessionID string, from, limit int, asc bool) ([]Message, error)
 	GetAllMessages(ctx context.Context, sessionID string) ([]Message, error)
-	GetMinimap(ctx context.Context, sessionID string) ([]MinimapEntry, error)
-	GetMinimapFrom(ctx context.Context, sessionID string, from int) ([]MinimapEntry, error)
+	GetSessionActivity(ctx context.Context, sessionID string) (*SessionActivityResponse, error)
 
 	// Search.
 	HasFTS() bool
@@ -40,10 +39,10 @@ type Store interface {
 	GetSessionVersion(id string) (count int, fileMtime int64, ok bool)
 
 	// Metadata.
-	GetStats(ctx context.Context, excludeOneShot bool) (Stats, error)
-	GetProjects(ctx context.Context, excludeOneShot bool) ([]ProjectInfo, error)
-	GetAgents(ctx context.Context, excludeOneShot bool) ([]AgentInfo, error)
-	GetMachines(ctx context.Context, excludeOneShot bool) ([]string, error)
+	GetStats(ctx context.Context, excludeOneShot, excludeAutomated bool) (Stats, error)
+	GetProjects(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]ProjectInfo, error)
+	GetAgents(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]AgentInfo, error)
+	GetMachines(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]string, error)
 
 	// Analytics.
 	GetAnalyticsSummary(ctx context.Context, f AnalyticsFilter) (AnalyticsSummary, error)
@@ -56,6 +55,11 @@ type Store interface {
 	GetAnalyticsVelocity(ctx context.Context, f AnalyticsFilter) (VelocityResponse, error)
 	GetAnalyticsTopSessions(ctx context.Context, f AnalyticsFilter, metric string) (TopSessionsResponse, error)
 
+	// Usage (token cost).
+	GetDailyUsage(ctx context.Context, f UsageFilter) (DailyUsageResult, error)
+	GetTopSessionsByCost(ctx context.Context, f UsageFilter, limit int) ([]TopSessionEntry, error)
+	GetUsageSessionCounts(ctx context.Context, f UsageFilter) (UsageSessionCounts, error)
+
 	// Stars (local-only; PG returns ErrReadOnly).
 	StarSession(sessionID string) (bool, error)
 	UnstarSession(sessionID string) error
@@ -65,7 +69,7 @@ type Store interface {
 	// Pins (local-only; PG returns ErrReadOnly).
 	PinMessage(sessionID string, messageID int64, note *string) (int64, error)
 	UnpinMessage(sessionID string, messageID int64) error
-	ListPinnedMessages(ctx context.Context, sessionID string) ([]PinnedMessage, error)
+	ListPinnedMessages(ctx context.Context, sessionID string, project string) ([]PinnedMessage, error)
 
 	// Insights (local-only; PG returns ErrReadOnly).
 	ListInsights(ctx context.Context, f InsightFilter) ([]Insight, error)

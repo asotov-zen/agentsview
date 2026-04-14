@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { onMount } from "svelte";
   import { pins } from "../../stores/pins.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { router } from "../../stores/router.svelte.js";
@@ -8,8 +7,8 @@
   import { renderMarkdown } from "../../utils/markdown.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
 
-  onMount(() => {
-    pins.loadAll();
+  $effect(() => {
+    pins.loadAll(sessions.filters.project || undefined);
   });
 
   /** Set of expanded pin IDs. */
@@ -24,8 +23,7 @@
 
   function navigateToPin(sessionId: string, ordinal: number) {
     ui.scrollToOrdinal(ordinal, sessionId);
-    sessions.pendingNavTarget = sessionId;
-    router.navigate("sessions");
+    router.navigateToSession(sessionId);
   }
 
   function getSessionInfo(pin: import("../../api/types.js").PinnedMessage) {
@@ -87,6 +85,13 @@
 
   {#if pins.loading}
     <div class="loading-state">Loading pins...</div>
+  {:else if pins.pins.length === 0 && sessions.filters.project}
+    <div class="empty-state">
+      <p class="empty-title">No pinned messages for this project</p>
+      <p class="empty-desc">
+        Try selecting a different project or clear the project filter.
+      </p>
+    </div>
   {:else if pins.pins.length === 0}
     <div class="empty-state">
       <svg width="40" height="40" viewBox="0 0 16 16" fill="currentColor" class="empty-icon">

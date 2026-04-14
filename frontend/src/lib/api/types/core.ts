@@ -26,6 +26,9 @@ export interface Session {
   file_mtime?: number;
   total_output_tokens: number;
   peak_context_tokens: number;
+  has_total_output_tokens?: boolean;
+  has_peak_context_tokens?: boolean;
+  is_automated: boolean;
   created_at: string;
 }
 
@@ -42,16 +45,30 @@ export interface ProjectInfo {
   session_count: number;
 }
 
+/** Matches Go ToolResultEvent struct in internal/db/messages.go */
+export interface ToolResultEvent {
+  tool_use_id?: string;
+  agent_id?: string;
+  subagent_session_id?: string;
+  source: string;
+  status: string;
+  content: string;
+  content_length: number;
+  timestamp?: string;
+  event_index: number;
+}
+
 /** Matches Go ToolCall struct in internal/db/messages.go */
 export interface ToolCall {
   tool_name: string;
-  category: string;
+  category?: string;
   tool_use_id?: string;
   input_json?: string;
   skill_name?: string;
   result_content_length?: number;
   result_content?: string;
   subagent_session_id?: string;
+  result_events?: ToolResultEvent[];
 }
 
 /** Matches Go Message struct in internal/db/messages.go */
@@ -72,6 +89,8 @@ export interface Message {
   token_usage?: Record<string, number | boolean> | null;
   context_tokens: number;
   output_tokens: number;
+  has_context_tokens?: boolean;
+  has_output_tokens?: boolean;
   tool_calls?: ToolCall[];
 }
 
@@ -81,13 +100,15 @@ export type MinimapEntry = Pick<
   "ordinal" | "role" | "content_length" | "has_thinking" | "has_tool_use" | "is_system"
 >;
 
+
 /** Matches Go SearchResult struct in internal/db/search.go */
 export interface SearchResult {
   session_id: string;
   project: string;
+  agent: string;
+  name: string;
   ordinal: number;
-  role: string;
-  timestamp: string;
+  session_ended_at: string;
   snippet: string;
   rank: number;
 }
@@ -103,11 +124,6 @@ export interface Stats {
 
 export interface MessagesResponse {
   messages: Message[];
-  count: number;
-}
-
-export interface MinimapResponse {
-  entries: MinimapEntry[];
   count: number;
 }
 

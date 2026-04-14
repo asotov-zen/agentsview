@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/tidwall/gjson"
 )
@@ -354,6 +355,19 @@ func extractMessagesIflow(entries []dagEntryIflow) (
 		content := gjson.Get(e.line, "message.content")
 		text, hasThinking, hasToolUse, tcs, trs :=
 			ExtractTextContent(content)
+
+		// Convert command/skill invocation XML into readable
+		// text (e.g. "/roborev-fix 450"). If the content
+		// looks like a command envelope but can't be
+		// normalized, skip it to avoid raw XML in transcripts.
+		if e.entryType == "user" {
+			if cmdText, ok := extractCommandText(text); ok {
+				text = cmdText
+			} else if isCommandEnvelope(text) {
+				continue
+			}
+		}
+
 		if strings.TrimSpace(text) == "" && len(trs) == 0 && len(tcs) == 0 {
 			continue
 		}
@@ -435,13 +449,13 @@ func ExtractIflowProjectHints(
 // isIflowSystemMessage returns true if the content matches
 // a known system-injected user message pattern.
 func isIflowSystemMessage(content string) bool {
-	trimmed := strings.TrimSpace(content)
+	trimmed := strings.TrimLeftFunc(content, func(r rune) bool {
+		return r == '\uFEFF' || unicode.IsSpace(r)
+	})
 	prefixes := [...]string{
 		"This session is being continued",
 		"[Request interrupted",
 		"<task-notification>",
-		"<command-message>",
-		"<command-name>",
 		"<local-command-",
 		"Stop hook feedback:",
 	}

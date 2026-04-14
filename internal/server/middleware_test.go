@@ -156,6 +156,160 @@ func TestMiddlewareTimeout(t *testing.T) {
 	}
 }
 
+func TestCSPMiddlewareSetsHeaderOnNonAPIRoutes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		path          string
+		host          string
+		port          int
+		publicOrigins []string
+		bindAllIPs    map[string]bool
+		wantCSP       bool
+		wantParts     []string
+		wantAbsent    []string // substrings that must NOT appear
+	}{
+		{
+			name:    "SPA_root_gets_CSP_with_pinned_origin",
+			path:    "/",
+			host:    "127.0.0.1",
+			port:    8081,
+			wantCSP: true,
+			wantParts: []string{
+				"script-src 'self' http://127.0.0.1:8081",
+				"default-src 'self' http://127.0.0.1:8081",
+				"connect-src 'self' http://127.0.0.1:8081",
+				"ws://127.0.0.1:8081",
+				"style-src 'self' http://127.0.0.1:8081 'unsafe-inline' https://fonts.googleapis.com",
+				"font-src 'self' http://127.0.0.1:8081 data: https://fonts.gstatic.com",
+				"frame-ancestors 'none'",
+			},
+		},
+		{
+			name:    "SPA_subpath_gets_CSP",
+			path:    "/sessions/abc",
+			host:    "127.0.0.1",
+			port:    9090,
+			wantCSP: true,
+			wantParts: []string{
+				"http://127.0.0.1:9090",
+				"ws://127.0.0.1:9090",
+			},
+		},
+		{
+			name:    "API_route_no_CSP",
+			path:    "/api/v1/sessions",
+			host:    "127.0.0.1",
+			port:    8081,
+			wantCSP: false,
+		},
+		{
+			name:    "API_subpath_no_CSP",
+			path:    "/api/v1/stats",
+			host:    "127.0.0.1",
+			port:    8081,
+			wantCSP: false,
+		},
+		{
+			name:    "IPv6_loopback_brackets",
+			path:    "/",
+			host:    "::1",
+			port:    8081,
+			wantCSP: true,
+			wantParts: []string{
+				"script-src 'self' http://[::1]:8081",
+				"connect-src",
+				"ws://[::1]:8081",
+				"http://127.0.0.1:8081",
+			},
+		},
+		{
+			name: "BindAll_connect_src_includes_LAN_IPs",
+			path: "/",
+			host: "0.0.0.0",
+			port: 8080,
+			bindAllIPs: map[string]bool{
+				"127.0.0.1":   true,
+				"::1":         true,
+				"192.168.1.5": true,
+			},
+			wantCSP: true,
+			wantParts: []string{
+				// Pinned origin in all directives
+				"script-src 'self' http://0.0.0.0:8080",
+				// LAN IPs in connect-src
+				"http://192.168.1.5:8080",
+				"ws://192.168.1.5:8080",
+				"http://127.0.0.1:8080",
+				"http://localhost:8080",
+			},
+			wantAbsent: []string{
+				// LAN IPs must NOT be in script-src
+				"script-src 'self' http://0.0.0.0:8080 http://192",
+			},
+		},
+		{
+			name:          "PublicOrigin_in_connect_src_only",
+			path:          "/",
+			host:          "127.0.0.1",
+			port:          8081,
+			publicOrigins: []string{"https://view.example.com"},
+			wantCSP:       true,
+			wantParts: []string{
+				// Pinned origin in script-src
+				"script-src 'self' http://127.0.0.1:8081",
+				// Public origin in connect-src
+				"https://view.example.com",
+				"wss://view.example.com",
+			},
+			wantAbsent: []string{
+				// Public origin must NOT be in script-src
+				"script-src 'self' http://127.0.0.1:8081 https://view",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})
+			handler := cspMiddleware(tt.host, tt.port, tt.publicOrigins, tt.bindAllIPs, inner)
+
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+
+			csp := w.Header().Get("Content-Security-Policy")
+			if tt.wantCSP {
+				if csp == "" {
+					t.Fatal("expected CSP header, got empty")
+				}
+				for _, part := range tt.wantParts {
+					if !strings.Contains(csp, part) {
+						t.Errorf("CSP missing %q; got %q", part, csp)
+					}
+				}
+				for _, absent := range tt.wantAbsent {
+					if strings.Contains(csp, absent) {
+						t.Errorf("CSP should not contain %q; got %q", absent, csp)
+					}
+				}
+				xfo := w.Header().Get("X-Frame-Options")
+				if xfo != "DENY" {
+					t.Errorf("expected X-Frame-Options DENY, got %q", xfo)
+				}
+			} else {
+				if csp != "" {
+					t.Errorf("expected no CSP header on API route, got %q", csp)
+				}
+			}
+		})
+	}
+}
+
 func TestCORSMiddlewareMergesVaryHeader(t *testing.T) {
 	t.Parallel()
 

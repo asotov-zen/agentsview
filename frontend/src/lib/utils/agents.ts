@@ -10,6 +10,7 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "copilot", color: "var(--accent-amber)" },
   { name: "gemini", color: "var(--accent-rose)" },
   { name: "opencode", color: "var(--accent-purple)" },
+  { name: "openhands", color: "var(--accent-teal)", label: "OpenHands" },
   { name: "cursor", color: "var(--accent-black)" },
   { name: "amp", color: "var(--accent-coral)", label: "Amp" },
   { name: "zencoder", color: "var(--accent-red)", label: "Zencoder" },
@@ -25,6 +26,12 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     label: "OpenClaw",
   },
   { name: "iflow", color: "var(--accent-sky)", label: "iFlow" },
+  { name: "kimi", color: "var(--accent-pink)", label: "Kimi" },
+  { name: "claude-ai", color: "var(--accent-violet)", label: "Claude.ai" },
+  { name: "chatgpt", color: "var(--accent-lime)", label: "ChatGPT" },
+  { name: "kiro", color: "var(--accent-lime)", label: "Kiro" },
+  { name: "kiro-ide", color: "var(--accent-lime)", label: "Kiro IDE" },
+  { name: "cortex", color: "var(--accent-cyan)", label: "Cortex Code" }
 ];
 
 const agentColorMap = new Map(

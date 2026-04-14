@@ -3,6 +3,7 @@ package sync_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -198,6 +199,23 @@ func (e *testEnv) writeCursorSession(
 	)
 }
 
+// writeNestedCursorSession creates a Cursor transcript file under
+// the nested layout <project>/agent-transcripts/<session>/<session><ext>.
+func (e *testEnv) writeNestedCursorSession(
+	t *testing.T, cursorDir, project, sessionID, ext,
+	content string,
+) string {
+	t.Helper()
+	return e.writeSession(
+		t, cursorDir,
+		filepath.Join(
+			project, "agent-transcripts", sessionID,
+			sessionID+ext,
+		),
+		content,
+	)
+}
+
 func TestSyncEngineIntegration(t *testing.T) {
 	env := setupTestEnv(t)
 
@@ -274,7 +292,7 @@ func TestSyncEngineWorktreesShareProject(t *testing.T) {
 	assertSessionProject(t, env.db, "main-repo", "agentsview")
 	assertSessionProject(t, env.db, "worktree-repo", "agentsview")
 
-	projects, err := env.db.GetProjects(context.Background(), false)
+	projects, err := env.db.GetProjects(context.Background(), false, false)
 	if err != nil {
 		t.Fatalf("GetProjects: %v", err)
 	}
@@ -536,14 +554,14 @@ func TestSyncSingleSessionHashCodex(t *testing.T) {
 	env.assertResyncRoundTrip(t, sessionID)
 }
 
-func TestSyncSingleSessionCodexExecBypassesCache(
+func TestSyncAllImportsCodexExec(
 	t *testing.T,
 ) {
 	env := setupTestEnv(t)
 
 	uuid := "e5f6a7b8-5678-9012-cdef-123456789012"
-	// Exec-originated session: SyncAll skips these, but
-	// SyncSingleSession should still find them.
+	// Exec-originated sessions should be imported during the
+	// normal bulk sync path.
 	content := testjsonl.NewSessionBuilder().
 		AddCodexMeta(
 			tsEarly, uuid,
@@ -558,21 +576,7 @@ func TestSyncSingleSessionCodexExecBypassesCache(
 		"rollout-20240115-"+uuid+".jsonl", content,
 	)
 
-	// SyncAll skips exec-originated sessions (nil result).
 	env.engine.SyncAll(context.Background(), nil)
-	sess, _ := env.db.GetSession(
-		context.Background(), "codex:"+uuid,
-	)
-	if sess != nil {
-		t.Fatal("exec session should not appear after SyncAll")
-	}
-
-	// SyncSingleSession should bypass the skip cache and
-	// parse with includeExec=true.
-	err := env.engine.SyncSingleSession("codex:" + uuid)
-	if err != nil {
-		t.Fatalf("SyncSingleSession: %v", err)
-	}
 
 	assertSessionState(
 		t, env.db, "codex:"+uuid,
@@ -583,6 +587,145 @@ func TestSyncSingleSessionCodexExecBypassesCache(
 			}
 		},
 	)
+}
+
+func TestSyncAllImportsCodexExecFromLegacySkipCache(
+	t *testing.T,
+) {
+	env := setupTestEnv(t)
+
+	uuid := "f6a7b8c9-6789-0123-def0-234567890123"
+	content := testjsonl.NewSessionBuilder().
+		AddCodexMeta(
+			tsEarly, uuid,
+			"/home/user/code/api", "codex_exec",
+		).
+		AddCodexMessage(tsEarlyS1, "user", "run ls").
+		AddCodexMessage(tsEarlyS5, "assistant", "done").
+		String()
+
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "15"),
+		"rollout-20240115-"+uuid+".jsonl", content,
+	)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat codex session: %v", err)
+	}
+
+	if err := env.db.ReplaceSkippedFiles(map[string]int64{
+		path: info.ModTime().UnixNano(),
+	}); err != nil {
+		t.Fatalf("seed skipped files: %v", err)
+	}
+
+	// setupTestEnv already built an engine, which ran the
+	// codex exec migration against an empty skip cache and
+	// flipped the flag to "done". Reset the flag so the new
+	// engine below observes a legacy skip entry and scrubs
+	// it, matching the production upgrade path.
+	if err := env.db.SetSyncState(
+		sync.CodexExecMigrationKey, "",
+	); err != nil {
+		t.Fatalf("reset migration flag: %v", err)
+	}
+
+	env.engine = sync.NewEngine(env.db, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude:   {env.claudeDir},
+			parser.AgentCodex:    {env.codexDir},
+			parser.AgentCursor:   {env.cursorDir},
+			parser.AgentGemini:   {env.geminiDir},
+			parser.AgentOpenCode: {env.opencodeDir},
+			parser.AgentIflow:    {env.iflowDir},
+			parser.AgentAmp:      {env.ampDir},
+			parser.AgentPi:       {env.piDir},
+		},
+		Machine: "local",
+	})
+
+	env.engine.SyncAll(context.Background(), nil)
+
+	assertSessionState(
+		t, env.db, "codex:"+uuid,
+		func(sess *db.Session) {
+			if sess.Agent != "codex" {
+				t.Errorf("agent = %q, want codex",
+					sess.Agent)
+			}
+		},
+	)
+}
+
+// TestCodexExecMigrationIdempotent verifies that once the
+// codex exec skip cache migration has run, subsequent engine
+// starts do not re-scan or remove entries — even those that
+// point at codex_exec files, which legitimately get cached
+// post-migration when the parser fails on them. The flag in
+// pg_sync_state is the gate; without it a broken exec file
+// would be reopened on every startup.
+func TestCodexExecMigrationIdempotent(t *testing.T) {
+	env := setupTestEnv(t)
+
+	// setupTestEnv already built an engine that set the
+	// migration flag against an empty skip cache. Write a
+	// codex exec file and seed it into the skip cache to
+	// mimic a fresh parse-error cache entry made by a
+	// post-migration sync.
+	uuid := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	content := testjsonl.NewSessionBuilder().
+		AddCodexMeta(
+			tsEarly, uuid,
+			"/home/user/code/api", "codex_exec",
+		).
+		AddCodexMessage(tsEarlyS1, "user", "run ls").
+		String()
+
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "15"),
+		"rollout-20240115-"+uuid+".jsonl", content,
+	)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat codex session: %v", err)
+	}
+
+	if err := env.db.ReplaceSkippedFiles(map[string]int64{
+		path: info.ModTime().UnixNano(),
+	}); err != nil {
+		t.Fatalf("seed skipped files: %v", err)
+	}
+
+	// Rebuild the engine without resetting the migration
+	// flag. The migration must be a no-op: the seeded entry
+	// stays in the DB and the engine respects it on sync.
+	env.engine = sync.NewEngine(env.db, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude:   {env.claudeDir},
+			parser.AgentCodex:    {env.codexDir},
+			parser.AgentCursor:   {env.cursorDir},
+			parser.AgentGemini:   {env.geminiDir},
+			parser.AgentOpenCode: {env.opencodeDir},
+			parser.AgentIflow:    {env.iflowDir},
+			parser.AgentAmp:      {env.ampDir},
+			parser.AgentPi:       {env.piDir},
+		},
+		Machine: "local",
+	})
+
+	env.engine.SyncAll(context.Background(), nil)
+
+	loaded, err := env.db.LoadSkippedFiles()
+	if err != nil {
+		t.Fatalf("load skipped files: %v", err)
+	}
+	if _, ok := loaded[path]; !ok {
+		t.Fatalf(
+			"post-migration skip entry for %s was cleared; "+
+				"migration must be idempotent",
+			path,
+		)
+	}
 }
 
 func TestSyncEngineTombstoneClearOnMtimeChange(t *testing.T) {
@@ -1751,6 +1894,67 @@ func TestSyncEngineMultiCursorDir(t *testing.T) {
 	}
 }
 
+func TestSyncPathsCursorNestedLayout(t *testing.T) {
+	env := setupTestEnv(t)
+
+	path := env.writeNestedCursorSession(
+		t, env.cursorDir,
+		"Users-alice-code-nested-proj",
+		"nested-sync", ".jsonl",
+		"user:\nHello nested cursor\nassistant:\nHi there!\n",
+	)
+
+	env.engine.SyncPaths([]string{path})
+
+	assertSessionProject(
+		t, env.db, "cursor:nested-sync", "nested_proj",
+	)
+	assertSessionMessageCount(
+		t, env.db, "cursor:nested-sync", 2,
+	)
+}
+
+func TestSyncSingleSessionCursorNestedLayoutPreservesProject(
+	t *testing.T,
+) {
+	env := setupTestEnv(t)
+
+	path := env.writeNestedCursorSession(
+		t, env.cursorDir,
+		"Users-alice-code-nested-proj",
+		"nested-resync", ".jsonl",
+		"user:\nHello nested cursor\nassistant:\nHi there!\n",
+	)
+
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1, Synced: 1, Skipped: 0,
+	})
+	assertSessionProject(
+		t, env.db, "cursor:nested-resync", "nested_proj",
+	)
+
+	updated := "user:\nHello nested cursor\n" +
+		"assistant:\nHi there!\n" +
+		"user:\nFollow-up\n" +
+		"assistant:\nGot it.\n"
+	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if err := env.engine.SyncSingleSession(
+		"cursor:nested-resync",
+	); err != nil {
+		t.Fatalf("SyncSingleSession: %v", err)
+	}
+
+	assertSessionProject(
+		t, env.db, "cursor:nested-resync", "nested_proj",
+	)
+	assertSessionMessageCount(
+		t, env.db, "cursor:nested-resync", 4,
+	)
+}
+
 func TestSyncForkDetection(t *testing.T) {
 	env := setupTestEnv(t)
 
@@ -2879,9 +3083,26 @@ func TestIncrementalSync_ClaudeAppend(t *testing.T) {
 	origHash := *full.FileHash
 
 	// Append an assistant response.
-	appended := testjsonl.ClaudeAssistantJSON(
-		"world", tsZeroS5,
-	) + "\n"
+	appendedJSON, err := json.Marshal(map[string]any{
+		"type":      "assistant",
+		"timestamp": tsZeroS5,
+		"message": map[string]any{
+			"model": "claude-sonnet-4-20250514",
+			"usage": map[string]any{
+				"input_tokens":                100,
+				"cache_creation_input_tokens": 200,
+				"cache_read_input_tokens":     200,
+				"output_tokens":               200,
+			},
+			"content": []map[string]any{
+				{"type": "text", "text": "world"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal assistant fixture: %v", err)
+	}
+	appended := string(appendedJSON) + "\n"
 	f, err := os.OpenFile(
 		path, os.O_APPEND|os.O_WRONLY, 0o644,
 	)
@@ -2927,6 +3148,34 @@ func TestIncrementalSync_ClaudeAppend(t *testing.T) {
 			"file_hash = %v, want %q (preserved)",
 			updated.FileHash, origHash,
 		)
+	}
+	if !updated.HasTotalOutputTokens {
+		t.Error("HasTotalOutputTokens = false, want true")
+	}
+	if !updated.HasPeakContextTokens {
+		t.Error("HasPeakContextTokens = false, want true")
+	}
+	if updated.TotalOutputTokens != 200 {
+		t.Errorf("TotalOutputTokens = %d, want 200",
+			updated.TotalOutputTokens)
+	}
+	if updated.PeakContextTokens != 500 {
+		t.Errorf("PeakContextTokens = %d, want 500",
+			updated.PeakContextTokens)
+	}
+	if !msgs[1].HasContextTokens {
+		t.Error("assistant HasContextTokens = false, want true")
+	}
+	if !msgs[1].HasOutputTokens {
+		t.Error("assistant HasOutputTokens = false, want true")
+	}
+	if msgs[1].OutputTokens != 200 {
+		t.Errorf("assistant OutputTokens = %d, want 200",
+			msgs[1].OutputTokens)
+	}
+	if msgs[1].ContextTokens != 500 {
+		t.Errorf("assistant ContextTokens = %d, want 500",
+			msgs[1].ContextTokens)
 	}
 }
 
@@ -2986,6 +3235,92 @@ func TestIncrementalSync_CodexAppend(t *testing.T) {
 				i, m.SessionID,
 			)
 		}
+	}
+}
+
+func TestIncrementalSync_CodexSubagentAppendFallsBackToFullParse(t *testing.T) {
+	env := setupTestEnv(t)
+
+	childID := "019c9c96-6ee7-77c0-ba4c-380f844289d5"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			"inc-cx-sub", "/tmp/proj",
+			"codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "run child", tsEarlyS1),
+		testjsonl.CodexFunctionCallWithCallIDJSON("spawn_agent", "call_spawn", map[string]any{
+			"agent_type": "awaiter",
+			"message":    "run it",
+		}, tsEarlyS5),
+		testjsonl.CodexFunctionCallOutputJSON("call_spawn", `{"agent_id":"`+childID+`","nickname":"Fennel"}`, "2024-01-01T10:01:00Z"),
+	)
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-20240101-inc-cx-sub.jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	assertSessionMessageCount(
+		t, env.db, "codex:inc-cx-sub", 2,
+	)
+
+	appended := testjsonl.JoinJSONL(
+		testjsonl.CodexFunctionCallWithCallIDJSON("wait", "call_wait", map[string]any{
+			"ids": []string{childID},
+		}, "2024-01-01T10:01:06Z"),
+		testjsonl.CodexFunctionCallOutputJSON("call_wait",
+			"{\"status\":{\""+childID+"\":{\"completed\":\"Finished successfully\"}}}",
+			"2024-01-01T10:01:07Z",
+		),
+	)
+	f, err := os.OpenFile(
+		path, os.O_APPEND|os.O_WRONLY, 0o644,
+	)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	_, err = f.WriteString(appended)
+	f.Close()
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	// SyncPaths hits the incremental Codex path first. The appended
+	// wait call is an explicit full-parse fallback case and should
+	// still produce the final parsed state successfully.
+	env.engine.SyncPaths([]string{path})
+
+	assertSessionMessageCount(
+		t, env.db, "codex:inc-cx-sub", 3,
+	)
+	msgs := fetchMessages(t, env.db, "codex:inc-cx-sub")
+	if len(msgs) != 3 {
+		t.Fatalf("messages len = %d, want 3", len(msgs))
+	}
+	if len(msgs[2].ToolCalls) != 1 {
+		t.Fatalf("tool calls len = %d, want 1", len(msgs[2].ToolCalls))
+	}
+	waitCall := msgs[2].ToolCalls[0]
+	if waitCall.ToolName != "wait" {
+		t.Fatalf("tool name = %q, want %q", waitCall.ToolName, "wait")
+	}
+	if len(waitCall.ResultEvents) != 1 {
+		t.Fatalf("result events len = %d, want 1", len(waitCall.ResultEvents))
+	}
+	if waitCall.ResultEvents[0].AgentID != childID {
+		t.Fatalf("event agent_id = %q, want %q", waitCall.ResultEvents[0].AgentID, childID)
+	}
+	if waitCall.ResultEvents[0].Content != "Finished successfully" {
+		t.Fatalf(
+			"event content = %q, want %q",
+			waitCall.ResultEvents[0].Content, "Finished successfully",
+		)
+	}
+	if waitCall.ResultContent != "Finished successfully" {
+		t.Fatalf(
+			"result_content = %q, want %q",
+			waitCall.ResultContent, "Finished successfully",
+		)
 	}
 }
 
@@ -3077,6 +3412,109 @@ func TestSyncAllCancelledDoesNotUpdateLastSync(t *testing.T) {
 	}
 	if env.engine.LastSyncStats().Synced != lastStats.Synced {
 		t.Error("lastSyncStats was updated by cancelled sync")
+	}
+}
+
+func TestSyncAllSince_FiltersByMtime(t *testing.T) {
+	env := setupTestEnv(t)
+
+	// Seed the DB with two sessions.
+	oldContent := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "old session").
+		String()
+	oldPath := env.writeClaudeSession(
+		t, "proj-old", "old-sess.jsonl", oldContent,
+	)
+
+	newContent := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "new session").
+		String()
+	newPath := env.writeClaudeSession(
+		t, "proj-new", "new-sess.jsonl", newContent,
+	)
+
+	// Backdate the old file to simulate an unchanged prior
+	// session; keep the new file at its natural mtime.
+	longAgo := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(oldPath, longAgo, longAgo); err != nil {
+		t.Fatalf("chtimes old: %v", err)
+	}
+
+	// SyncAllSince with a cutoff 1 hour ago should only
+	// process the new file.
+	cutoff := time.Now().Add(-1 * time.Hour)
+	stats := env.engine.SyncAllSince(
+		context.Background(), cutoff, nil,
+	)
+	if stats.Synced != 1 {
+		t.Errorf("synced = %d, want 1", stats.Synced)
+	}
+
+	// Verify only the new session is in the DB.
+	page, err := env.db.ListSessions(
+		context.Background(), db.SessionFilter{Limit: 10},
+	)
+	if err != nil {
+		t.Fatalf("list sessions: %v", err)
+	}
+	if len(page.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(page.Sessions))
+	}
+
+	// Second call with zero cutoff syncs everything.
+	stats = env.engine.SyncAllSince(
+		context.Background(), time.Time{}, nil,
+	)
+	// The new file is already in the DB (skip cache);
+	// the old file should now be synced too.
+	if stats.Synced == 0 {
+		t.Error("expected second sync to pick up backdated file")
+	}
+
+	page, err = env.db.ListSessions(
+		context.Background(), db.SessionFilter{Limit: 10},
+	)
+	if err != nil {
+		t.Fatalf("list sessions: %v", err)
+	}
+	if len(page.Sessions) != 2 {
+		t.Errorf("sessions = %d, want 2", len(page.Sessions))
+	}
+
+	_ = newPath
+}
+
+func TestSyncAll_PersistsStartedAndFinishedAt(t *testing.T) {
+	env := setupTestEnv(t)
+
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "hello").
+		String()
+	env.writeClaudeSession(
+		t, "proj", "sess.jsonl", content,
+	)
+
+	before := time.Now().UTC().Add(-1 * time.Second)
+	env.engine.SyncAll(context.Background(), nil)
+	after := time.Now().UTC().Add(1 * time.Second)
+
+	startedAt := env.engine.LastSyncStartedAt()
+	if startedAt.IsZero() {
+		t.Fatal("LastSyncStartedAt is zero after sync")
+	}
+	if startedAt.Before(before) || startedAt.After(after) {
+		t.Errorf("LastSyncStartedAt %v outside [%v, %v]",
+			startedAt, before, after)
+	}
+
+	finishedRaw, err := env.db.GetSyncState(
+		"last_sync_finished_at",
+	)
+	if err != nil {
+		t.Fatalf("get finish state: %v", err)
+	}
+	if finishedRaw == "" {
+		t.Fatal("last_sync_finished_at not persisted")
 	}
 }
 

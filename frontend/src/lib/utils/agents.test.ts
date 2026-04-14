@@ -14,6 +14,7 @@ describe("KNOWN_AGENTS", () => {
       "copilot",
       "gemini",
       "opencode",
+      "openhands",
       "cursor",
       "amp",
       "zencoder",
@@ -21,6 +22,12 @@ describe("KNOWN_AGENTS", () => {
       "pi",
       "openclaw",
       "iflow",
+      "kimi",
+      "claude-ai",
+      "chatgpt",
+      "kiro",
+      "kiro-ide",
+      "cortex",
     ]);
   });
 
@@ -47,6 +54,9 @@ describe("agentColor", () => {
     );
     expect(agentColor("opencode")).toBe(
       "var(--accent-purple)",
+    );
+    expect(agentColor("openhands")).toBe(
+      "var(--accent-teal)",
     );
     expect(agentColor("cursor")).toBe(
       "var(--accent-black)",
@@ -78,6 +88,7 @@ describe("agentLabel", () => {
     expect(agentLabel("vscode-copilot")).toBe(
       "VS Code Copilot",
     );
+    expect(agentLabel("openhands")).toBe("OpenHands");
     expect(agentLabel("openclaw")).toBe("OpenClaw");
     expect(agentLabel("iflow")).toBe("iFlow");
   });
@@ -87,4 +98,3 @@ describe("agentLabel", () => {
     expect(agentLabel("gemini")).toBe("Gemini");
   });
 });
-

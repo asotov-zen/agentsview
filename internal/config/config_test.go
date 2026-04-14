@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/BurntSushi/toml"
+	"github.com/spf13/pflag"
 	"github.com/wesm/agentsview/internal/parser"
 )
 
@@ -57,6 +58,16 @@ func loadConfigFromFlags(t *testing.T, args ...string) (Config, error) {
 		return Config{}, err
 	}
 	return Load(fs)
+}
+
+func loadConfigFromPFlags(t *testing.T, args ...string) (Config, error) {
+	t.Helper()
+	fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+	RegisterServePFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return Config{}, err
+	}
+	return LoadPFlags(fs)
 }
 
 func TestLoadEnv_OverridesDataDir(t *testing.T) {
@@ -108,6 +119,20 @@ func TestLoad_DefaultsWithoutFlags(t *testing.T) {
 	}
 	if len(cfg.PublicOrigins) != 0 {
 		t.Errorf("PublicOrigins = %v, want none", cfg.PublicOrigins)
+	}
+}
+
+func TestLoadPFlags_AppliesExplicitFlags(t *testing.T) {
+	cfg, err := loadConfigFromPFlags(t, "--host", "0.0.0.0", "--port", "9090")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.Host != "0.0.0.0" {
+		t.Errorf("Host = %q, want %q", cfg.Host, "0.0.0.0")
+	}
+	if cfg.Port != 9090 {
+		t.Errorf("Port = %d, want %d", cfg.Port, 9090)
 	}
 }
 
@@ -815,6 +840,58 @@ func TestLoadFile_PGConfig(t *testing.T) {
 	}
 }
 
+func TestPGConfig_ProjectFilter(t *testing.T) {
+	dir := t.TempDir()
+	tomlPath := filepath.Join(dir, "config.toml")
+	os.WriteFile(tomlPath, []byte(`
+[pg]
+url = "postgres://localhost/test"
+projects = ["alpha", "beta"]
+`), 0o644)
+
+	cfg, err := Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DataDir = dir
+	if err := cfg.loadFile(); err != nil {
+		t.Fatalf("loadFile: %v", err)
+	}
+
+	if len(cfg.PG.Projects) != 2 {
+		t.Fatalf("Projects = %v, want [alpha beta]", cfg.PG.Projects)
+	}
+	if cfg.PG.Projects[0] != "alpha" || cfg.PG.Projects[1] != "beta" {
+		t.Errorf("Projects = %v, want [alpha beta]", cfg.PG.Projects)
+	}
+}
+
+func TestPGConfig_ExcludeProjectFilter(t *testing.T) {
+	dir := t.TempDir()
+	tomlPath := filepath.Join(dir, "config.toml")
+	os.WriteFile(tomlPath, []byte(`
+[pg]
+url = "postgres://localhost/test"
+exclude_projects = ["gamma"]
+`), 0o644)
+
+	cfg, err := Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DataDir = dir
+	if err := cfg.loadFile(); err != nil {
+		t.Fatalf("loadFile: %v", err)
+	}
+
+	if len(cfg.PG.ExcludeProjects) != 1 {
+		t.Fatalf("ExcludeProjects = %v, want [gamma]", cfg.PG.ExcludeProjects)
+	}
+	if cfg.PG.ExcludeProjects[0] != "gamma" {
+		t.Errorf("ExcludeProjects = %v, want [gamma]", cfg.PG.ExcludeProjects)
+	}
+}
+
 func TestResolvePG_Defaults(t *testing.T) {
 	cfg := Config{
 		PG: PGConfig{
@@ -924,5 +1001,26 @@ func TestResolvePG_ErrorsOnMissingBareEnvVar(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "NONEXISTENT_PG_BARE_VAR") {
 		t.Errorf("error = %v, want mention of NONEXISTENT_PG_BARE_VAR", err)
+	}
+}
+
+// ResolvePG must not reject configs with both filter lists —
+// that's a push-specific concern validated in runPGPush after
+// CLI flags are merged. status and serve use ResolvePG too and
+// shouldn't fail on push-only filter conflicts.
+func TestResolvePG_AllowsBothFilterLists(t *testing.T) {
+	cfg := Config{
+		PG: PGConfig{
+			URL:             "postgres://localhost/test",
+			Projects:        []string{"alpha"},
+			ExcludeProjects: []string{"beta"},
+		},
+	}
+	_, err := cfg.ResolvePG()
+	if err != nil {
+		t.Fatalf(
+			"ResolvePG should not reject filter conflicts: %v",
+			err,
+		)
 	}
 }

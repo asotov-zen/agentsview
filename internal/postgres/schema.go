@@ -5,15 +5,16 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/wesm/agentsview/internal/db"
+	"github.com/wesm/agentsview/internal/parser"
 )
 
-// SchemaVersion is incremented when the PG schema changes in a
-// way that requires migration logic. EnsureSchema writes it to
-// sync_metadata so future versions can detect what they're
-// working with.
-const SchemaVersion = 1
+const tokenCoverageRepairMetadataKey = "token_coverage_repair_v1"
+const tokenCoverageBackfillBatchSize = 1000
 
 // coreDDL creates the tables and indexes. It uses unqualified
 // names because Open() sets search_path to the target schema.
@@ -38,6 +39,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     user_message_count INT NOT NULL DEFAULT 0,
     parent_session_id  TEXT,
     relationship_type  TEXT NOT NULL DEFAULT '',
+    total_output_tokens INT NOT NULL DEFAULT 0,
+    peak_context_tokens INT NOT NULL DEFAULT 0,
+    has_total_output_tokens BOOLEAN NOT NULL DEFAULT FALSE,
+    has_peak_context_tokens BOOLEAN NOT NULL DEFAULT FALSE,
+    is_automated       BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -50,6 +56,15 @@ CREATE TABLE IF NOT EXISTS messages (
     has_thinking   BOOLEAN NOT NULL DEFAULT FALSE,
     has_tool_use   BOOLEAN NOT NULL DEFAULT FALSE,
     content_length INT NOT NULL DEFAULT 0,
+    is_system      BOOLEAN NOT NULL DEFAULT FALSE,
+    model          TEXT NOT NULL DEFAULT '',
+    token_usage    TEXT NOT NULL DEFAULT '',
+    context_tokens INT NOT NULL DEFAULT 0,
+    output_tokens  INT NOT NULL DEFAULT 0,
+    has_context_tokens BOOLEAN NOT NULL DEFAULT FALSE,
+    has_output_tokens  BOOLEAN NOT NULL DEFAULT FALSE,
+    claude_message_id  TEXT NOT NULL DEFAULT '',
+    claude_request_id  TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (session_id, ordinal),
     FOREIGN KEY (session_id)
         REFERENCES sessions(id) ON DELETE CASCADE
@@ -77,6 +92,33 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_dedup
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session
     ON tool_calls (session_id);
+
+CREATE TABLE IF NOT EXISTS tool_result_events (
+    id                        BIGSERIAL PRIMARY KEY,
+    session_id                TEXT NOT NULL,
+    tool_call_message_ordinal INT NOT NULL,
+    call_index                INT NOT NULL DEFAULT 0,
+    tool_use_id               TEXT,
+    agent_id                  TEXT,
+    subagent_session_id       TEXT,
+    source                    TEXT NOT NULL,
+    status                    TEXT NOT NULL,
+    content                   TEXT NOT NULL,
+    content_length            INT NOT NULL DEFAULT 0,
+    timestamp                 TIMESTAMPTZ,
+    event_index               INT NOT NULL DEFAULT 0,
+    FOREIGN KEY (session_id)
+        REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_result_events_session
+    ON tool_result_events (session_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_result_events_dedup
+    ON tool_result_events (
+        session_id, tool_call_message_ordinal,
+        call_index, event_index
+    );
 `
 
 // EnsureSchema creates the schema (if needed), then runs
@@ -103,65 +145,628 @@ func EnsureSchema(
 
 	// Idempotent column additions for forward compatibility.
 	alters := []struct {
-		stmt string
-		desc string
+		table  string
+		column string
+		stmt   string
+		desc   string
 	}{
 		{
+			"sessions", "deleted_at",
 			`ALTER TABLE sessions
 			 ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`,
 			"adding sessions.deleted_at",
 		},
 		{
+			"sessions", "created_at",
 			`ALTER TABLE sessions
 			 ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ`,
 			"adding sessions.created_at",
 		},
 		{
+			"sessions", "total_output_tokens",
+			`ALTER TABLE sessions
+			 ADD COLUMN IF NOT EXISTS total_output_tokens
+			 INT NOT NULL DEFAULT 0`,
+			"adding sessions.total_output_tokens",
+		},
+		{
+			"sessions", "peak_context_tokens",
+			`ALTER TABLE sessions
+			 ADD COLUMN IF NOT EXISTS peak_context_tokens
+			 INT NOT NULL DEFAULT 0`,
+			"adding sessions.peak_context_tokens",
+		},
+		{
+			"sessions", "has_total_output_tokens",
+			`ALTER TABLE sessions
+			 ADD COLUMN IF NOT EXISTS has_total_output_tokens
+			 BOOLEAN NOT NULL DEFAULT FALSE`,
+			"adding sessions.has_total_output_tokens",
+		},
+		{
+			"sessions", "has_peak_context_tokens",
+			`ALTER TABLE sessions
+			 ADD COLUMN IF NOT EXISTS has_peak_context_tokens
+			 BOOLEAN NOT NULL DEFAULT FALSE`,
+			"adding sessions.has_peak_context_tokens",
+		},
+		{
+			"messages", "model",
+			`ALTER TABLE messages
+			 ADD COLUMN IF NOT EXISTS model
+			 TEXT NOT NULL DEFAULT ''`,
+			"adding messages.model",
+		},
+		{
+			"messages", "token_usage",
+			`ALTER TABLE messages
+			 ADD COLUMN IF NOT EXISTS token_usage
+			 TEXT NOT NULL DEFAULT ''`,
+			"adding messages.token_usage",
+		},
+		{
+			"messages", "context_tokens",
+			`ALTER TABLE messages
+			 ADD COLUMN IF NOT EXISTS context_tokens
+			 INT NOT NULL DEFAULT 0`,
+			"adding messages.context_tokens",
+		},
+		{
+			"messages", "output_tokens",
+			`ALTER TABLE messages
+			 ADD COLUMN IF NOT EXISTS output_tokens
+			 INT NOT NULL DEFAULT 0`,
+			"adding messages.output_tokens",
+		},
+		{
+			"messages", "has_context_tokens",
+			`ALTER TABLE messages
+			 ADD COLUMN IF NOT EXISTS has_context_tokens
+			 BOOLEAN NOT NULL DEFAULT FALSE`,
+			"adding messages.has_context_tokens",
+		},
+		{
+			"messages", "has_output_tokens",
+			`ALTER TABLE messages
+			 ADD COLUMN IF NOT EXISTS has_output_tokens
+			 BOOLEAN NOT NULL DEFAULT FALSE`,
+			"adding messages.has_output_tokens",
+		},
+		{
+			"messages", "claude_message_id",
+			`ALTER TABLE messages
+			 ADD COLUMN IF NOT EXISTS claude_message_id
+			 TEXT NOT NULL DEFAULT ''`,
+			"adding messages.claude_message_id",
+		},
+		{
+			"messages", "claude_request_id",
+			`ALTER TABLE messages
+			 ADD COLUMN IF NOT EXISTS claude_request_id
+			 TEXT NOT NULL DEFAULT ''`,
+			"adding messages.claude_request_id",
+		},
+		{
+			"tool_calls", "call_index",
 			`ALTER TABLE tool_calls
 			 ADD COLUMN IF NOT EXISTS call_index
 			 INT NOT NULL DEFAULT 0`,
 			"adding tool_calls.call_index",
 		},
+		{
+			"sessions", "is_automated",
+			`ALTER TABLE sessions
+			 ADD COLUMN IF NOT EXISTS is_automated
+			 BOOLEAN NOT NULL DEFAULT FALSE`,
+			"adding sessions.is_automated",
+		},
 	}
+	tokenCoverageColumnsAdded := false
 	for _, a := range alters {
-		if _, err := db.ExecContext(ctx, a.stmt); err != nil {
+		added, err := ensureColumn(ctx, db, a.table, a.column, a.stmt)
+		if err != nil {
 			return fmt.Errorf("%s: %w", a.desc, err)
 		}
+		switch a.column {
+		case "has_total_output_tokens", "has_peak_context_tokens",
+			"has_context_tokens", "has_output_tokens":
+			tokenCoverageColumnsAdded = tokenCoverageColumnsAdded || added
+		}
 	}
-
-	// Record schema version for future migration detection.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO sync_metadata (key, value)
-		 VALUES ('schema_version', $1)
-		 ON CONFLICT (key) DO UPDATE
-		 SET value = EXCLUDED.value
-		 WHERE sync_metadata.value::int < EXCLUDED.value::int`,
-		fmt.Sprintf("%d", SchemaVersion),
-	); err != nil {
-		return fmt.Errorf("setting schema version: %w", err)
+	if err := backfillIsAutomatedPG(ctx, db); err != nil {
+		return err
+	}
+	runRepair, err := shouldRunTokenCoverageRepair(
+		ctx, db, tokenCoverageColumnsAdded,
+	)
+	if err != nil {
+		return err
+	}
+	if !runRepair {
+		return nil
+	}
+	if err := backfillTokenCoverageFlags(ctx, db); err != nil {
+		return err
+	}
+	if err := markTokenCoverageRepairDone(ctx, db); err != nil {
+		return err
 	}
 	return nil
 }
 
-// GetSchemaVersion reads the schema version from sync_metadata.
-// Returns 0 if the key is missing (pre-versioned schema).
-func GetSchemaVersion(
-	ctx context.Context, db *sql.DB,
-) (int, error) {
-	var v int
-	err := db.QueryRowContext(ctx,
-		`SELECT value::int FROM sync_metadata
-		 WHERE key = 'schema_version'`,
-	).Scan(&v)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf(
-			"reading schema version: %w", err,
+const isAutomatedBackfillMetadataKey = "is_automated_backfill_v1"
+
+// backfillIsAutomatedPG recomputes is_automated for all PG
+// sessions, correcting both false negatives (new patterns) and
+// stale false positives (patterns tightened since last run).
+// Guarded by a sync_metadata marker so it only runs once per
+// pattern version.
+func backfillIsAutomatedPG(
+	ctx context.Context, pg *sql.DB,
+) error {
+	var done int
+	if err := pg.QueryRowContext(ctx,
+		`SELECT count(*) FROM sync_metadata
+		 WHERE key = $1 AND value != ''`,
+		isAutomatedBackfillMetadataKey,
+	).Scan(&done); err != nil {
+		return fmt.Errorf(
+			"probing PG automated backfill marker: %w", err,
 		)
 	}
-	return v, nil
+	if done > 0 {
+		return nil
+	}
+
+	rows, err := pg.QueryContext(ctx,
+		`SELECT id, first_message, user_message_count,
+			is_automated
+		 FROM sessions
+		 WHERE first_message IS NOT NULL`)
+	if err != nil {
+		return fmt.Errorf(
+			"querying PG automated backfill candidates: %w",
+			err,
+		)
+	}
+	defer rows.Close()
+
+	var setIDs, clearIDs []string
+	for rows.Next() {
+		var id, fm string
+		var umc int
+		var current bool
+		if err := rows.Scan(
+			&id, &fm, &umc, &current,
+		); err != nil {
+			return fmt.Errorf(
+				"scanning PG backfill candidate: %w", err,
+			)
+		}
+		want := umc <= 1 && db.IsAutomatedSession(fm)
+		if want && !current {
+			setIDs = append(setIDs, id)
+		} else if !want && current {
+			clearIDs = append(clearIDs, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if err := batchUpdateAutomatedPG(
+		ctx, pg, setIDs, true,
+	); err != nil {
+		return err
+	}
+	if err := batchUpdateAutomatedPG(
+		ctx, pg, clearIDs, false,
+	); err != nil {
+		return err
+	}
+
+	if len(setIDs) > 0 || len(clearIDs) > 0 {
+		log.Printf(
+			"pg migration: recomputed is_automated"+
+				" (set %d, cleared %d)",
+			len(setIDs), len(clearIDs),
+		)
+	}
+
+	_, err = pg.ExecContext(ctx,
+		`INSERT INTO sync_metadata (key, value)
+		 VALUES ($1, '1')
+		 ON CONFLICT (key) DO UPDATE
+		 SET value = EXCLUDED.value`,
+		isAutomatedBackfillMetadataKey,
+	)
+	return err
+}
+
+func batchUpdateAutomatedPG(
+	ctx context.Context, pg *sql.DB,
+	ids []string, val bool,
+) error {
+	const batchSize = 500
+	for i := 0; i < len(ids); i += batchSize {
+		end := min(i+batchSize, len(ids))
+		batch := ids[i:end]
+		pb := &paramBuilder{}
+		valPh := pb.add(val)
+		phs := make([]string, len(batch))
+		for j, id := range batch {
+			phs[j] = pb.add(id)
+		}
+		_, err := pg.ExecContext(ctx,
+			"UPDATE sessions SET is_automated = "+valPh+
+				" WHERE id IN ("+
+				strings.Join(phs, ",")+
+				")",
+			pb.args...,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"updating is_automated in PG: %w", err,
+			)
+		}
+	}
+	return nil
+}
+
+func ensureColumn(
+	ctx context.Context, db *sql.DB,
+	table, column, stmt string,
+) (bool, error) {
+	var exists bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = current_schema()
+			  AND table_name = $1
+			  AND column_name = $2
+		)`,
+		table, column,
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf(
+			"probing %s.%s: %w", table, column, err,
+		)
+	}
+	if exists {
+		return false, nil
+	}
+	if _, err := db.ExecContext(ctx, stmt); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func shouldRunTokenCoverageRepair(
+	ctx context.Context, db *sql.DB, tokenCoverageColumnsAdded bool,
+) (bool, error) {
+	if tokenCoverageColumnsAdded {
+		return true, nil
+	}
+
+	var done bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM sync_metadata
+			WHERE key = $1
+		)`,
+		tokenCoverageRepairMetadataKey,
+	).Scan(&done); err != nil {
+		return false, fmt.Errorf(
+			"probing token coverage repair metadata: %w", err,
+		)
+	}
+	if done {
+		return false, nil
+	}
+
+	var hasSessions bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM sessions LIMIT 1)`,
+	).Scan(&hasSessions); err != nil {
+		return false, fmt.Errorf(
+			"probing token coverage repair sessions: %w", err,
+		)
+	}
+	return hasSessions, nil
+}
+
+func markTokenCoverageRepairDone(
+	ctx context.Context, db *sql.DB,
+) error {
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO sync_metadata (key, value)
+		 VALUES ($1, '1')
+		 ON CONFLICT (key) DO UPDATE
+		 SET value = EXCLUDED.value`,
+		tokenCoverageRepairMetadataKey,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"storing token coverage repair metadata: %w", err,
+		)
+	}
+	return nil
+}
+
+func backfillTokenCoverageFlags(
+	ctx context.Context, db *sql.DB,
+) error {
+	if _, err := backfillMessageTokenCoverage(ctx, db); err != nil {
+		return err
+	}
+	if _, err := backfillSessionTokenCoverage(ctx, db); err != nil {
+		return err
+	}
+	return nil
+}
+
+func backfillMessageTokenCoverage(
+	ctx context.Context, db *sql.DB,
+) (int, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT session_id, ordinal, token_usage, context_tokens,
+			output_tokens, has_context_tokens, has_output_tokens
+		 FROM messages
+		 WHERE (has_context_tokens = FALSE OR has_output_tokens = FALSE)
+		   AND (token_usage != ''
+			OR context_tokens != 0
+			OR output_tokens != 0)`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"querying pg message token backfill candidates: %w", err,
+		)
+	}
+	defer rows.Close()
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"beginning pg message token backfill transaction: %w",
+			err,
+		)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.PrepareContext(ctx,
+		`UPDATE messages
+		 SET has_context_tokens = $1, has_output_tokens = $2
+		 WHERE session_id = $3 AND ordinal = $4`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"preparing pg message token backfill update: %w", err,
+		)
+	}
+	defer stmt.Close()
+
+	updated := 0
+	for rows.Next() {
+		var sessionID, tokenUsage string
+		var ordinal, contextTokens, outputTokens int
+		var hasContext, hasOutput bool
+		if err := rows.Scan(
+			&sessionID, &ordinal, &tokenUsage, &contextTokens,
+			&outputTokens, &hasContext, &hasOutput,
+		); err != nil {
+			return updated, fmt.Errorf(
+				"scanning pg message token backfill candidate: %w", err,
+			)
+		}
+		backfilledContext, backfilledOutput := inferTokenCoverage(
+			[]byte(tokenUsage), contextTokens, outputTokens,
+			hasContext, hasOutput,
+		)
+		if backfilledContext == hasContext &&
+			backfilledOutput == hasOutput {
+			continue
+		}
+		if _, err := stmt.ExecContext(
+			ctx, backfilledContext, backfilledOutput,
+			sessionID, ordinal,
+		); err != nil {
+			return updated, fmt.Errorf(
+				"updating pg message token backfill %s/%d: %w",
+				sessionID, ordinal, err,
+			)
+		}
+		updated++
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return updated, fmt.Errorf(
+			"committing pg message token backfill transaction: %w",
+			err,
+		)
+	}
+	return updated, nil
+}
+
+func backfillSessionTokenCoverage(
+	ctx context.Context, conn *sql.DB,
+) (int, error) {
+	candidates, err := loadPGSessionCoverageCandidates(ctx, conn)
+	if err != nil {
+		return 0, err
+	}
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+
+	msgCoverage, err := batchLoadPGMessageCoverage(
+		ctx, conn, candidates,
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	updates := db.ComputeSessionCoverageUpdates(
+		candidates, msgCoverage,
+	)
+	if len(updates) == 0 {
+		return 0, nil
+	}
+	return applyPGSessionCoverageUpdates(ctx, conn, updates)
+}
+
+func loadPGSessionCoverageCandidates(
+	ctx context.Context, conn *sql.DB,
+) ([]db.SessionCoverageCandidate, error) {
+	rows, err := conn.QueryContext(ctx,
+		`SELECT id, total_output_tokens, peak_context_tokens,
+			has_total_output_tokens, has_peak_context_tokens
+		 FROM sessions
+		 WHERE has_total_output_tokens = FALSE
+		    OR has_peak_context_tokens = FALSE`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"querying pg session token backfill candidates: %w",
+			err,
+		)
+	}
+	defer rows.Close()
+
+	var candidates []db.SessionCoverageCandidate
+	for rows.Next() {
+		var c db.SessionCoverageCandidate
+		if err := rows.Scan(
+			&c.ID, &c.TotalOutputTokens,
+			&c.PeakContextTokens, &c.HasTotal, &c.HasPeak,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"scanning pg session token backfill candidate: %w",
+				err,
+			)
+		}
+		candidates = append(candidates, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return candidates, nil
+}
+
+func batchLoadPGMessageCoverage(
+	ctx context.Context, conn *sql.DB,
+	candidates []db.SessionCoverageCandidate,
+) (map[string][2]bool, error) {
+	coverage := map[string][2]bool{}
+	for start := 0; start < len(candidates); start += tokenCoverageBackfillBatchSize {
+		end := min(
+			start+tokenCoverageBackfillBatchSize,
+			len(candidates),
+		)
+		batch := candidates[start:end]
+		args := make([]any, len(batch))
+		placeholders := make([]string, len(batch))
+		for i, c := range batch {
+			args[i] = c.ID
+			placeholders[i] = fmt.Sprintf("$%d", i+1)
+		}
+		rows, err := conn.QueryContext(ctx,
+			`SELECT session_id, has_context_tokens,
+				has_output_tokens
+			 FROM messages
+			 WHERE session_id IN (`+strings.Join(placeholders, ",")+`)`,
+			args...,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"querying pg session message coverage: %w", err,
+			)
+		}
+		for rows.Next() {
+			var sessionID string
+			var hasContext, hasOutput bool
+			if err := rows.Scan(
+				&sessionID, &hasContext, &hasOutput,
+			); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf(
+					"scanning pg session message coverage: %w",
+					err,
+				)
+			}
+			entry := coverage[sessionID]
+			entry[0] = entry[0] || hasContext
+			entry[1] = entry[1] || hasOutput
+			coverage[sessionID] = entry
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return coverage, nil
+}
+
+func applyPGSessionCoverageUpdates(
+	ctx context.Context, conn *sql.DB,
+	updates []db.SessionCoverageUpdate,
+) (int, error) {
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"beginning pg session token backfill transaction: %w",
+			err,
+		)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.PrepareContext(ctx,
+		`UPDATE sessions
+		 SET has_total_output_tokens = $1,
+		     has_peak_context_tokens = $2
+		 WHERE id = $3`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"preparing pg session token backfill update: %w", err,
+		)
+	}
+	defer stmt.Close()
+
+	updated := 0
+	for _, u := range updates {
+		if _, err := stmt.ExecContext(
+			ctx, u.HasTotal, u.HasPeak, u.ID,
+		); err != nil {
+			return updated, fmt.Errorf(
+				"updating pg session token backfill %s: %w",
+				u.ID, err,
+			)
+		}
+		updated++
+	}
+	if err := tx.Commit(); err != nil {
+		return updated, fmt.Errorf(
+			"committing pg session token backfill transaction: %w",
+			err,
+		)
+	}
+	return updated, nil
+}
+
+func inferTokenCoverage(
+	tokenUsage []byte,
+	contextTokens, outputTokens int,
+	hasContext, hasOutput bool,
+) (bool, bool) {
+	return parser.InferTokenPresence(
+		tokenUsage, contextTokens, outputTokens,
+		hasContext, hasOutput,
+	)
 }
 
 // CheckSchemaCompat verifies that the PG schema has all columns
@@ -187,6 +792,39 @@ func CheckSchemaCompat(
 	if err != nil {
 		return fmt.Errorf(
 			"tool_calls table missing required columns: %w",
+			err,
+		)
+	}
+	rows.Close()
+
+	rows, err = db.QueryContext(ctx,
+		`SELECT is_system, model, token_usage, context_tokens,
+			output_tokens, has_context_tokens, has_output_tokens
+		 FROM messages LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"messages table missing required columns: %w",
+			err,
+		)
+	}
+	rows.Close()
+	rows, err = db.QueryContext(ctx,
+		`SELECT total_output_tokens, peak_context_tokens,
+			has_total_output_tokens, has_peak_context_tokens
+		 FROM sessions LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"sessions table missing token columns: %w",
+			err,
+		)
+	}
+	rows.Close()
+
+	rows, err = db.QueryContext(ctx,
+		`SELECT event_index FROM tool_result_events LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"tool_result_events table missing required columns: %w",
 			err,
 		)
 	}

@@ -108,19 +108,21 @@ func parseAnalyticsFilter(
 	}
 
 	includeOneShot := q.Get("include_one_shot") == "true"
+	includeAutomated := q.Get("include_automated") == "true"
 
 	return db.AnalyticsFilter{
-		From:            from,
-		To:              to,
-		Machine:         q.Get("machine"),
-		Project:         q.Get("project"),
-		Agent:           q.Get("agent"),
-		Timezone:        tz,
-		DayOfWeek:       dow,
-		Hour:            hour,
-		MinUserMessages: minUserMsgs,
-		ExcludeOneShot:  !includeOneShot,
-		ActiveSince:     activeSince,
+		From:             from,
+		To:               to,
+		Machine:          q.Get("machine"),
+		Project:          q.Get("project"),
+		Agent:            q.Get("agent"),
+		Timezone:         tz,
+		DayOfWeek:        dow,
+		Hour:             hour,
+		MinUserMessages:  minUserMsgs,
+		ExcludeOneShot:   !includeOneShot,
+		ExcludeAutomated: !includeAutomated,
+		ActiveSince:      activeSince,
 	}, true
 }
 
@@ -196,11 +198,11 @@ func (s *Server) handleAnalyticsHeatmap(
 		metric = "messages"
 	}
 	switch metric {
-	case "messages", "sessions":
+	case "messages", "sessions", "output_tokens":
 		// valid
 	default:
 		writeError(w, http.StatusBadRequest,
-			"invalid metric: must be messages or sessions")
+			"invalid metric: must be messages, sessions, or output_tokens")
 		return
 	}
 
@@ -349,11 +351,11 @@ func (s *Server) handleAnalyticsTopSessions(
 		metric = "messages"
 	}
 	switch metric {
-	case "messages", "duration":
+	case "messages", "duration", "output_tokens":
 		// valid
 	default:
 		writeError(w, http.StatusBadRequest,
-			"invalid metric: must be messages or duration")
+			"invalid metric: must be messages, duration, or output_tokens")
 		return
 	}
 

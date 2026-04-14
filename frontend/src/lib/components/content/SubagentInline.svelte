@@ -3,7 +3,8 @@
 <script lang="ts">
   import type { Message, Session } from "../../api/types.js";
   import { getMessages, getSession } from "../../api/client.js";
-  import { formatTokenCount } from "../../utils/format.js";
+  import { formatTokenUsage } from "../../utils/format.js";
+  import { computeMainModel } from "../../utils/model.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import MessageContent from "./MessageContent.svelte";
@@ -20,6 +21,7 @@
   let error = $state<string | null>(null);
 
   let subagentSession = $derived(sessions.childSessions.get(sessionId) ?? null);
+  let tokenSourceSession = $derived(sessionMeta ?? subagentSession);
 
   async function toggleExpand() {
     expanded = !expanded;
@@ -44,17 +46,40 @@
   async function openAsSession(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
-    if (router.route === "sessions") {
-      await sessions.navigateToSession(sessionId);
-    } else {
-      sessions.pendingNavTarget = sessionId;
-      router.navigate("sessions");
-    }
+    router.navigateToSession(sessionId);
   }
 
   let agentLabel = $derived(sessionMeta?.agent ?? null);
   let messageCountLabel = $derived(
     sessionMeta ? `${sessionMeta.message_count} messages` : null,
+  );
+  let subagentModel = $derived(
+    messages && sessionMeta &&
+    messages.length >= sessionMeta.message_count
+      ? computeMainModel(messages)
+      : "",
+  );
+  let subagentHasContextTokens = $derived(
+    tokenSourceSession
+      ? (tokenSourceSession.has_peak_context_tokens ??
+        tokenSourceSession.peak_context_tokens > 0)
+      : false,
+  );
+  let subagentHasOutputTokens = $derived(
+    tokenSourceSession
+      ? (tokenSourceSession.has_total_output_tokens ??
+        tokenSourceSession.total_output_tokens > 0)
+      : false,
+  );
+  let subagentTokenSummary = $derived(
+    tokenSourceSession
+      ? formatTokenUsage(
+          tokenSourceSession.peak_context_tokens,
+          subagentHasContextTokens,
+          tokenSourceSession.total_output_tokens,
+          subagentHasOutputTokens,
+        )
+      : null,
   );
 </script>
 
@@ -70,15 +95,17 @@
         <span class="toggle-meta">{messageCountLabel}</span>
       {/if}
       <span class="toggle-session-id">{sessionId.slice(0, 12)}</span>
+      {#if subagentTokenSummary}
+        <span class="toggle-tokens">({subagentTokenSummary})</span>
+      {/if}
       {#if subagentSession}
-        {@const ctxTokens = subagentSession.peak_context_tokens}
-        {#if ctxTokens + subagentSession.total_output_tokens > 0}
-          <span class="toggle-tokens">({formatTokenCount(ctxTokens)} ctx / {formatTokenCount(subagentSession.total_output_tokens)} out)</span>
+        {#if subagentModel}
+          <span class="toggle-model" title={subagentModel}>{subagentModel}</span>
         {/if}
       {/if}
     </button>
     <a
-      href="#{sessionId}"
+      href={router.buildSessionHref(sessionId)}
       class="open-session-link"
       onclick={openAsSession}
       title="Open as full session"
@@ -191,6 +218,14 @@
     white-space: nowrap;
     flex-shrink: 0;
   }
+
+  .toggle-model {
+    font-size: 10px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
 
   .subagent-messages {
     border-left: 3px solid var(--accent-green);

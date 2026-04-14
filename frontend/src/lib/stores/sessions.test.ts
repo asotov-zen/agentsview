@@ -15,6 +15,7 @@ import type { ListSessionsParams } from "../api/client.js";
 
 vi.mock("../api/client.js", () => ({
   listSessions: vi.fn(),
+  getSession: vi.fn(),
   getProjects: vi.fn(),
   getAgents: vi.fn(),
 }));
@@ -225,6 +226,8 @@ describe("SessionsStore", () => {
               user_message_count: 1,
               total_output_tokens: 0,
               peak_context_tokens: 0,
+              has_total_output_tokens: false,
+              has_peak_context_tokens: false,
               created_at: "2024-01-01T00:00:00Z",
             },
           ],
@@ -245,6 +248,8 @@ describe("SessionsStore", () => {
               user_message_count: 1,
               total_output_tokens: 0,
               peak_context_tokens: 0,
+              has_total_output_tokens: false,
+              has_peak_context_tokens: false,
               created_at: "2024-01-01T00:00:01Z",
             },
           ],
@@ -487,6 +492,11 @@ describe("SessionsStore", () => {
       expect(sessions.hasActiveFilters).toBe(false);
     });
 
+    it("should be true when machine filter is set", () => {
+      sessions.filters.machine = "host-a";
+      expect(sessions.hasActiveFilters).toBe(true);
+    });
+
     it("should be true when agent filter is set", () => {
       sessions.filters.agent = "claude";
       expect(sessions.hasActiveFilters).toBe(true);
@@ -526,6 +536,69 @@ describe("SessionsStore", () => {
 
       expect(sessions.filters.project).toBe("myproj");
       expect(sessions.hasActiveFilters).toBe(false);
+    });
+  });
+
+  describe("machine filter", () => {
+    it("should toggle one machine on and serialize it", async () => {
+      sessions.toggleMachineFilter("host-a");
+      await vi.waitFor(() => {
+        expect(api.listSessions).toHaveBeenCalled();
+      });
+
+      expect(sessions.filters.machine).toBe("host-a");
+      expect(sessions.selectedMachines).toEqual(["host-a"]);
+      expect(sessions.isMachineSelected("host-a")).toBe(true);
+      expectListSessionsCalledWith({ machine: "host-a" });
+    });
+
+    it("should allow multiple selected machines", async () => {
+      sessions.toggleMachineFilter("host-a");
+      await vi.waitFor(() => {
+        expect(api.listSessions).toHaveBeenCalledTimes(1);
+      });
+
+      sessions.toggleMachineFilter("host-b");
+      await vi.waitFor(() => {
+        expect(api.listSessions).toHaveBeenCalledTimes(2);
+      });
+
+      expect(sessions.filters.machine).toBe("host-a,host-b");
+      expect(sessions.selectedMachines).toEqual([
+        "host-a",
+        "host-b",
+      ]);
+      expect(sessions.isMachineSelected("host-b")).toBe(true);
+      expectListSessionsCalledWith({
+        machine: "host-a,host-b",
+      });
+    });
+
+    it("should toggle an already-selected machine off", async () => {
+      sessions.filters.machine = "host-a,host-b";
+
+      sessions.toggleMachineFilter("host-a");
+      await vi.waitFor(() => {
+        expect(api.listSessions).toHaveBeenCalled();
+      });
+
+      expect(sessions.filters.machine).toBe("host-b");
+      expect(sessions.selectedMachines).toEqual(["host-b"]);
+      expect(sessions.isMachineSelected("host-a")).toBe(false);
+      expectListSessionsCalledWith({ machine: "host-b" });
+    });
+
+    it("should clear the filter when the last machine is removed", async () => {
+      sessions.filters.machine = "host-a";
+
+      sessions.toggleMachineFilter("host-a");
+      await vi.waitFor(() => {
+        expect(api.listSessions).toHaveBeenCalled();
+      });
+
+      expect(sessions.filters.machine).toBe("");
+      expect(sessions.selectedMachines).toEqual([]);
+      expectListSessionsCalledWith({ machine: undefined });
     });
   });
 
@@ -822,6 +895,39 @@ describe("SessionsStore", () => {
       });
 
       expect(sessions.agents[0]!.name).toBe("fresh-agent");
+    });
+  });
+
+  describe("navigateToSession", () => {
+    it("sets activeSessionId synchronously before fetching", async () => {
+      let resolveGet!: (s: Session) => void;
+      const getPromise = new Promise<Session>((r) => {
+        resolveGet = r;
+      });
+      vi.mocked(api.getSession).mockReturnValue(getPromise);
+      mockListSessions();
+
+      const promise = sessions.navigateToSession("new-id");
+
+      // activeSessionId must be set before the await resolves
+      expect(sessions.activeSessionId).toBe("new-id");
+      expect(sessions.sessions).toHaveLength(0);
+
+      resolveGet(makeSession({ id: "new-id" }));
+      await promise;
+
+      expect(sessions.sessions).toHaveLength(1);
+      expect(sessions.sessions[0]!.id).toBe("new-id");
+    });
+
+    it("skips fetch for already-loaded session", async () => {
+      mockListSessions();
+      sessions.sessions = [makeSession({ id: "existing" })];
+
+      await sessions.navigateToSession("existing");
+
+      expect(sessions.activeSessionId).toBe("existing");
+      expect(api.getSession).not.toHaveBeenCalled();
     });
   });
 });

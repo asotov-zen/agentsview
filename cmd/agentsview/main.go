@@ -4,10 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
-	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -15,6 +13,7 @@ import (
 	"time"
 	_ "time/tzdata"
 
+	"github.com/spf13/cobra"
 	"github.com/wesm/agentsview/internal/config"
 	"github.com/wesm/agentsview/internal/db"
 	"github.com/wesm/agentsview/internal/parser"
@@ -35,125 +34,9 @@ const (
 )
 
 func main() {
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "prune":
-			runPrune(os.Args[2:])
-			return
-		case "update":
-			runUpdate(os.Args[2:])
-			return
-		case "serve":
-			runServe(os.Args[2:])
-			return
-		case "sync":
-			runSync(os.Args[2:])
-			return
-		case "pg":
-			runPG(os.Args[2:])
-			return
-		case "token-use":
-			runTokenUse(os.Args[2:])
-			return
-		case "version", "--version", "-v":
-			fmt.Printf("agentsview %s (commit %s, built %s)\n",
-				version, commit, buildDate)
-			return
-		case "help", "--help", "-h":
-			printUsage()
-			return
-		}
+	if err := executeCLI(); err != nil {
+		fatal("%v", err)
 	}
-
-	runServe(os.Args[1:])
-}
-
-func printUsage() {
-	fmt.Printf(`agentsview %s - local web viewer for AI agent sessions
-
-Syncs Claude Code, Codex, Copilot CLI, Gemini CLI, OpenCode, Cursor,
-and Amp session data into SQLite, serves an analytics dashboard and
-session browser via a local web UI.
-
-Usage:
-  agentsview [flags]          Start the server (default command)
-  agentsview serve [flags]    Start the server (explicit)
-  agentsview sync [flags]     Sync session data without serving
-  agentsview pg push [flags]  Push local data to PostgreSQL
-  agentsview pg status        Show PG sync status
-  agentsview pg serve [flags] Serve from PostgreSQL (read-only)
-  agentsview token-use <id>   Show token usage for a session (JSON)
-  agentsview prune [flags]    Delete sessions matching filters
-  agentsview update [flags]   Check for and install updates
-  agentsview version          Show version information
-  agentsview help             Show this help
-
-Server flags:
-  -host string        Host to bind to (default "127.0.0.1")
-  -port int           Port to listen on (default 8080)
-  -public-url str     Public URL to trust and open for hostname/proxy access
-  -public-origin str  Trusted browser origin to allow for remote/proxied access
-  -proxy string       Managed reverse proxy mode (currently: caddy)
-  -caddy-bin string   Caddy binary to use when -proxy=caddy
-  -proxy-bind-host    Local interface/IP for managed Caddy to bind
-  -public-port int    External port for managed Caddy/public URL (default 8443)
-  -tls-cert string    TLS certificate path for managed Caddy HTTPS mode
-  -tls-key string     TLS key path for managed Caddy HTTPS mode
-  -allowed-subnet str Client CIDR allowed to connect to the managed proxy
-  -no-browser         Don't open browser on startup
-
-Sync flags:
-  -full              Force a full resync regardless of data version
-
-PG push flags:
-  -full              Bypass per-message skip heuristic
-
-PG serve flags:
-  -host string       Host to bind to (default "127.0.0.1")
-  -port int          Port to listen on (default 8080)
-
-Prune flags:
-  -project string     Sessions whose project contains this substring
-  -max-messages int   Sessions with at most N messages (default -1)
-  -before string      Sessions that ended before this date (YYYY-MM-DD)
-  -first-message str  Sessions whose first message starts with this text
-  -dry-run            Show what would be pruned without deleting
-  -yes                Skip confirmation prompt
-
-Update flags:
-  -check              Check for updates without installing
-  -yes                Install without confirmation prompt
-  -force              Force check (ignore cache)
-
-Environment variables:
-  CLAUDE_PROJECTS_DIR     Claude Code projects directory
-  CODEX_SESSIONS_DIR      Codex sessions directory
-  COPILOT_DIR             Copilot CLI directory
-  GEMINI_DIR              Gemini CLI directory
-  OPENCODE_DIR            OpenCode data directory
-  CURSOR_PROJECTS_DIR     Cursor projects directory
-  IFLOW_DIR               iFlow projects directory
-  AMP_DIR                 Amp threads directory
-  AGENT_VIEWER_DATA_DIR   Data directory (database, config)
-  AGENTSVIEW_PG_URL       PostgreSQL connection URL for sync
-  AGENTSVIEW_PG_MACHINE   Machine name for PG sync
-  AGENTSVIEW_PG_SCHEMA    PG schema name (default "agentsview")
-
-Watcher excludes:
-  Add "watch_exclude_patterns" to ~/.agentsview/config.toml to skip
-  directory names/patterns while recursively watching roots.
-  Example:
-  watch_exclude_patterns = [".git", "node_modules", ".next", "dist"]
-
-Multiple directories:
-  Add arrays to ~/.agentsview/config.toml to scan multiple locations:
-  claude_project_dirs = ["/path/one", "/path/two"]
-  codex_sessions_dirs = ["/codex/a", "/codex/b"]
-  When set, these override the default directory. Environment variables
-  override config file arrays.
-
-Data is stored in ~/.agentsview/ by default.
-`, version)
 }
 
 // warnMissingDirs prints a warning to stderr for each
@@ -179,9 +62,8 @@ func warnMissingDirs(dirs []string, label string) {
 	}
 }
 
-func runServe(args []string) {
+func runServe(cfg config.Config) {
 	start := time.Now()
-	cfg := mustLoadConfig(args)
 	setupLogFile(cfg.DataDir)
 
 	if err := validateServeConfig(cfg); err != nil {
@@ -215,28 +97,39 @@ func runServe(args []string) {
 	)
 	defer stop()
 
-	engine := sync.NewEngine(database, sync.EngineConfig{
-		AgentDirs:               cfg.AgentDirs,
-		Machine:                 "local",
-		BlockedResultCategories: cfg.ResultContentBlockedCategories,
-	})
+	var engine *sync.Engine
+	if !cfg.NoSync {
+		engine = sync.NewEngine(database, sync.EngineConfig{
+			AgentDirs:               cfg.AgentDirs,
+			Machine:                 "local",
+			BlockedResultCategories: cfg.ResultContentBlockedCategories,
+		})
 
-	if database.NeedsResync() {
-		runInitialResync(ctx, engine)
-	} else {
-		runInitialSync(ctx, engine)
-	}
-	if ctx.Err() != nil {
-		return
+		if database.NeedsResync() {
+			runInitialResync(ctx, engine)
+		} else {
+			runInitialSync(ctx, engine)
+		}
+		if ctx.Err() != nil {
+			return
+		}
+
+		stopWatcher, unwatchedDirs := startFileWatcher(cfg, engine)
+		defer stopWatcher()
+
+		go startPeriodicSync(engine)
+		if len(unwatchedDirs) > 0 {
+			go startUnwatchedPoll(engine)
+		}
 	}
 
-	stopWatcher, unwatchedDirs := startFileWatcher(cfg, engine)
-	defer stopWatcher()
-
-	go startPeriodicSync(engine)
-	if len(unwatchedDirs) > 0 {
-		go startUnwatchedPoll(engine)
-	}
+	// Seed model_pricing after any resync swap so the new DB
+	// file (which doesn't carry pricing across the swap) is
+	// populated before the dashboard starts answering
+	// requests. Synchronous fallback upsert so the first
+	// usage page load does not observe an empty table;
+	// background LiteLLM refresh follows immediately.
+	seedPricing(database)
 
 	// Auto-bind to 0.0.0.0 when remote access is enabled so the
 	// server is reachable from the network. Only override if the
@@ -256,27 +149,15 @@ func runServe(args []string) {
 		}
 	}
 
-	requestedPort := cfg.Port
-	port := server.FindAvailablePort(cfg.Host, cfg.Port)
-	if port != cfg.Port {
-		fmt.Printf("Port %d in use, using %d\n", cfg.Port, port)
+	rtOpts := serveRuntimeOptions{
+		Mode:          "serve",
+		RequestedPort: cfg.Port,
 	}
-	cfg.Port = port
-	if cfg.Proxy.Mode == "" && cfg.PublicURL != "" {
-		updatedURL, updatedOrigins, changed, err := rewriteConfiguredPublicURLPort(
-			cfg.PublicURL,
-			cfg.PublicOrigins,
-			requestedPort,
-			cfg.Port,
-		)
-		if err != nil {
-			fatal("invalid public url: %v", err)
-		}
-		if changed {
-			cfg.PublicURL = updatedURL
-			cfg.PublicOrigins = updatedOrigins
-		}
+	preparedCfg, prepErr := prepareServeRuntimeConfig(cfg, rtOpts)
+	if prepErr != nil {
+		fatal("%v", prepErr)
 	}
+	cfg = preparedCfg
 
 	srv := server.New(cfg, database, engine,
 		server.WithVersion(server.VersionInfo{
@@ -288,66 +169,12 @@ func runServe(args []string) {
 		server.WithBaseContext(ctx),
 	)
 
-	serveErrCh := make(chan error, 1)
-	go func() {
-		serveErrCh <- srv.ListenAndServe()
-	}()
-	if err := waitForLocalPort(
-		ctx, cfg.Host, cfg.Port, 5*time.Second, serveErrCh,
-	); err != nil {
-		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(), 5*time.Second,
-		)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+	rt, err := startServerWithOptionalCaddy(ctx, cfg, srv, rtOpts)
+	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
-		fatal("server failed to start: %v", err)
-	}
-
-	var caddy *managedCaddy
-	if cfg.Proxy.Mode == "caddy" {
-		var err error
-		caddy, err = startManagedCaddy(ctx, cfg)
-		if err != nil {
-			shutdownCtx, cancel := context.WithTimeout(
-				context.Background(), 5*time.Second,
-			)
-			defer cancel()
-			_ = srv.Shutdown(shutdownCtx)
-			fatal("managed caddy error: %v", err)
-		}
-		defer caddy.Stop()
-
-		publicPort, err := publicURLPort(cfg.PublicURL)
-		if err != nil {
-			shutdownCtx, cancel := context.WithTimeout(
-				context.Background(), 5*time.Second,
-			)
-			defer cancel()
-			caddy.Stop()
-			_ = srv.Shutdown(shutdownCtx)
-			fatal("invalid public url: %v", err)
-		}
-		if err := waitForLocalPort(
-			ctx,
-			cfg.Proxy.BindHost,
-			publicPort,
-			5*time.Second,
-			caddy.Err(),
-		); err != nil {
-			shutdownCtx, cancel := context.WithTimeout(
-				context.Background(), 5*time.Second,
-			)
-			defer cancel()
-			caddy.Stop()
-			_ = srv.Shutdown(shutdownCtx)
-			if errors.Is(err, context.Canceled) {
-				return
-			}
-			fatal("managed caddy error: %v", err)
-		}
+		fatal("%v", err)
 	}
 
 	// Server is ready — write the definitive state file with the
@@ -356,7 +183,7 @@ func runServe(args []string) {
 	// is active" marker so token-use doesn't start a competing
 	// on-demand sync against our live DB.
 	if _, sfErr := server.WriteStateFile(
-		cfg.DataDir, cfg.Host, cfg.Port, version,
+		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version,
 	); sfErr != nil {
 		log.Printf(
 			"warning: could not write state file: %v"+
@@ -364,88 +191,35 @@ func runServe(args []string) {
 			sfErr,
 		)
 	} else {
-		defer server.RemoveStateFile(cfg.DataDir, cfg.Port)
-		server.RemoveStartupLock(cfg.DataDir)
+		defer server.RemoveStateFile(rt.Cfg.DataDir, rt.Cfg.Port)
+		server.RemoveStartupLock(rt.Cfg.DataDir)
 	}
 
-	localURL := fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
-	publicURL := browserURL(cfg)
-	if publicURL == localURL {
+	if rt.PublicURL == rt.LocalURL {
 		fmt.Printf(
 			"agentsview %s listening at %s (started in %s)\n",
-			version, localURL,
+			version, rt.LocalURL,
 			time.Since(start).Round(time.Millisecond),
 		)
 	} else {
 		fmt.Printf(
 			"agentsview %s backend at %s, public at %s (started in %s)\n",
-			version, localURL, publicURL,
+			version, rt.LocalURL, rt.PublicURL,
 			time.Since(start).Round(time.Millisecond),
 		)
 	}
+	fmt.Printf("Database: %s\n", cfg.DBPath)
 
-	var caddyErrCh <-chan error
-	if caddy != nil {
-		caddyErrCh = caddy.Err()
-	}
-
-	select {
-	case err := <-serveErrCh:
-		if err != nil && err != http.ErrServerClosed {
-			caddy.Stop()
-			fatal("server error: %v", err)
-		}
-	case err := <-caddyErrCh:
-		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(), 5*time.Second,
-		)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-		if ctx.Err() != nil {
-			if serveErr := <-serveErrCh; serveErr != nil &&
-				serveErr != http.ErrServerClosed {
-				fatal("server error: %v", serveErr)
-			}
-			return
-		}
-		if err != nil {
-			fatal("managed caddy error: %v", err)
-		}
-		fatal("managed caddy exited unexpectedly")
-	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(), 5*time.Second,
-		)
-		defer cancel()
-		caddy.Stop()
-		if err := srv.Shutdown(shutdownCtx); err != nil &&
-			err != http.ErrServerClosed {
-			fatal("server shutdown error: %v", err)
-		}
-		if err := <-serveErrCh; err != nil &&
-			err != http.ErrServerClosed {
-			fatal("server error: %v", err)
-		}
+	if err := waitForServerRuntime(ctx, srv, rt); err != nil {
+		fatal("%v", err)
 	}
 }
 
-func mustLoadConfig(args []string) config.Config {
-	fs := flag.NewFlagSet("agentsview", flag.ExitOnError)
-	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(),
-			"Usage: agentsview [serve] [flags]\n\nFlags:\n")
-		fs.PrintDefaults()
-	}
-	config.RegisterServeFlags(fs)
-	if err := fs.Parse(args); err != nil {
-		log.Fatalf("parsing flags: %v", err)
-	}
-
-	cfg, err := config.Load(fs)
+func mustLoadConfig(cmd *cobra.Command) config.Config {
+	cfg, err := config.LoadPFlags(cmd.Flags())
 	if err != nil {
 		log.Fatalf("loading config: %v", err)
 	}
-
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		log.Fatalf("creating data dir: %v", err)
 	}
@@ -597,8 +371,9 @@ func startFileWatcher(
 	}
 
 	type watchRoot struct {
-		dir  string
-		root string // actual path passed to WatchRecursive
+		dir     string
+		root    string // actual path passed to WatchRecursive
+		shallow bool   // use shallow watch (root only)
 	}
 
 	var roots []watchRoot
@@ -610,7 +385,7 @@ func startFileWatcher(
 			if len(def.WatchSubdirs) == 0 {
 				if _, err := os.Stat(d); err == nil {
 					roots = append(
-						roots, watchRoot{d, d},
+						roots, watchRoot{d, d, def.ShallowWatch},
 					)
 				}
 				continue
@@ -619,7 +394,7 @@ func startFileWatcher(
 				watchDir := filepath.Join(d, sub)
 				if _, err := os.Stat(watchDir); err == nil {
 					roots = append(
-						roots, watchRoot{d, watchDir},
+						roots, watchRoot{d, watchDir, def.ShallowWatch},
 					)
 				}
 			}
@@ -627,7 +402,17 @@ func startFileWatcher(
 	}
 
 	var totalWatched int
+	var shallowWatched int
 	for _, r := range roots {
+		if r.shallow {
+			if watcher.WatchShallow(r.root) {
+				shallowWatched++
+				totalWatched++
+			} else {
+				unwatchedDirs = append(unwatchedDirs, r.dir)
+			}
+			continue
+		}
 		watched, uw, _ := watcher.WatchRecursive(r.root)
 		totalWatched += watched
 		if uw > 0 {
@@ -639,10 +424,17 @@ func startFileWatcher(
 		}
 	}
 
-	fmt.Printf(
-		"Watching %d directories for changes (%s)\n",
-		totalWatched, time.Since(t).Round(time.Millisecond),
-	)
+	if shallowWatched > 0 {
+		fmt.Printf(
+			"Watching %d directories for changes (%d shallow) (%s)\n",
+			totalWatched, shallowWatched, time.Since(t).Round(time.Millisecond),
+		)
+	} else {
+		fmt.Printf(
+			"Watching %d directories for changes (%s)\n",
+			totalWatched, time.Since(t).Round(time.Millisecond),
+		)
+	}
 	watcher.Start()
 	return watcher.Stop, unwatchedDirs
 }

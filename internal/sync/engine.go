@@ -50,9 +50,16 @@ type Engine struct {
 	skipCache map[string]int64
 }
 
+// codexExecMigrationKey is the pg_sync_state flag that
+// records whether the one-time cleanup of legacy codex_exec
+// skip cache entries has already run on this database.
+const codexExecMigrationKey = "codex_exec_legacy_migration_v1"
+
 // NewEngine creates a sync engine. It pre-populates the
 // in-memory skip cache from the database so that files
-// skipped in a prior run are not re-parsed on startup.
+// skipped in a prior run are not re-parsed on startup, and
+// migrates legacy codex_exec skip entries on first run under
+// the new bulk-sync behavior.
 func NewEngine(
 	database *db.DB, cfg EngineConfig,
 ) *Engine {
@@ -62,6 +69,8 @@ func NewEngine(
 	} else {
 		log.Printf("loading skip cache: %v", err)
 	}
+
+	migrateLegacyCodexExecSkips(database, skipCache)
 
 	dirs := make(map[parser.AgentType][]string, len(cfg.AgentDirs))
 	for k, v := range cfg.AgentDirs {
@@ -74,6 +83,72 @@ func NewEngine(
 		machine:                 cfg.Machine,
 		blockedResultCategories: blockedCategorySet(cfg.BlockedResultCategories),
 		skipCache:               skipCache,
+	}
+}
+
+// migrateLegacyCodexExecSkips removes skip cache entries
+// created by older agentsview builds that excluded Codex exec
+// sessions from bulk sync. The scrub runs once per database:
+// a `pg_sync_state` flag is set after the first successful
+// pass so subsequent process starts do not re-scan files.
+// New skip entries for real parse errors on exec files are
+// untouched here and honored normally on later syncs.
+//
+// The cleanup builds a rebuilt snapshot and writes it through
+// the atomic ReplaceSkippedFiles, then only mutates the
+// in-memory map and records the done flag after the persist
+// succeeds. A partial failure leaves both the DB and the
+// in-memory cache in their prior state so the migration is
+// retried on the next startup rather than being falsely
+// marked complete.
+func migrateLegacyCodexExecSkips(
+	database *db.DB, skipCache map[string]int64,
+) {
+	done, err := database.GetSyncState(codexExecMigrationKey)
+	if err != nil {
+		log.Printf("codex exec migration: %v", err)
+		return
+	}
+	if done != "" {
+		return
+	}
+
+	cleaned := make(map[string]int64, len(skipCache))
+	var legacy []string
+	for path, mtime := range skipCache {
+		if strings.HasSuffix(path, ".jsonl") &&
+			parser.IsCodexExecSessionFile(path) {
+			legacy = append(legacy, path)
+			continue
+		}
+		cleaned[path] = mtime
+	}
+
+	if len(legacy) > 0 {
+		if err := database.ReplaceSkippedFiles(
+			cleaned,
+		); err != nil {
+			log.Printf(
+				"codex exec migration: persist cleaned skip cache: %v",
+				err,
+			)
+			return
+		}
+		for _, p := range legacy {
+			delete(skipCache, p)
+		}
+		log.Printf(
+			"codex exec legacy migration: cleared %d skip entries",
+			len(legacy),
+		)
+	}
+
+	if err := database.SetSyncState(
+		codexExecMigrationKey, "done",
+	); err != nil {
+		log.Printf(
+			"codex exec migration: set flag: %v", err,
+		)
 	}
 }
 
@@ -347,23 +422,51 @@ func (e *Engine) classifyOnePath(
 		}
 	}
 
-	// Cursor: <cursorDir>/<project>/agent-transcripts/<uuid>.{txt,jsonl}
+	// OpenHands CLI:
+	//   <openhandsDir>/<conversation-id>/base_state.json
+	//   <openhandsDir>/<conversation-id>/TASKS.json
+	//   <openhandsDir>/<conversation-id>/events/*.json
+	for _, openHandsDir := range e.agentDirs[parser.AgentOpenHands] {
+		if openHandsDir == "" {
+			continue
+		}
+		if rel, ok := isUnder(openHandsDir, path); ok {
+			parts := strings.Split(rel, sep)
+			if len(parts) < 2 || !parser.IsValidSessionID(parts[0]) {
+				continue
+			}
+			switch {
+			case len(parts) == 2 &&
+				(parts[1] == "base_state.json" ||
+					parts[1] == "TASKS.json"):
+			case len(parts) == 3 &&
+				parts[1] == "events" &&
+				strings.HasSuffix(parts[2], ".json"):
+			default:
+				continue
+			}
+			return parser.DiscoveredFile{
+				Path: filepath.Join(
+					openHandsDir, parts[0],
+				),
+				Agent: parser.AgentOpenHands,
+			}, true
+		}
+	}
+
+	// Cursor:
+	//   <cursorDir>/<project>/agent-transcripts/<uuid>.{txt,jsonl}
+	//   <cursorDir>/<project>/agent-transcripts/<uuid>/<uuid>.{txt,jsonl}
 	for _, cursorDir := range e.agentDirs[parser.AgentCursor] {
 		if cursorDir == "" {
 			continue
 		}
 		if rel, ok := isUnder(cursorDir, path); ok {
-			parts := strings.Split(rel, sep)
-			if len(parts) != 3 {
+			projectDir, ok := parser.ParseCursorTranscriptRelPath(rel)
+			if !ok {
 				continue
 			}
-			if parts[1] != "agent-transcripts" {
-				continue
-			}
-			if !parser.IsCursorTranscriptExt(parts[2]) {
-				continue
-			}
-			project := parser.DecodeCursorProjectDir(parts[0])
+			project := parser.DecodeCursorProjectDir(projectDir)
 			if project == "" {
 				project = "unknown"
 			}
@@ -392,6 +495,24 @@ func (e *Engine) classifyOnePath(
 				Path:    path,
 				Project: parts[0],
 				Agent:   parser.AgentIflow,
+			}, true
+		}
+	}
+
+	// Kimi: <kimiDir>/<project-hash>/<session-uuid>/wire.jsonl
+	for _, kimiDir := range e.agentDirs[parser.AgentKimi] {
+		if kimiDir == "" {
+			continue
+		}
+		if rel, ok := isUnder(kimiDir, path); ok {
+			parts := strings.Split(rel, sep)
+			if len(parts) != 3 || parts[2] != "wire.jsonl" {
+				continue
+			}
+			return parser.DiscoveredFile{
+				Path:    path,
+				Project: parts[0],
+				Agent:   parser.AgentKimi,
 			}, true
 		}
 	}
@@ -542,6 +663,43 @@ func (e *Engine) classifyOnePath(
 		}
 	}
 
+	// Cortex: <cortexDir>/<uuid>.json
+	//     or: <cortexDir>/<uuid>.history.jsonl → remap to .json
+	for _, cortexDir := range e.agentDirs[parser.AgentCortex] {
+		if cortexDir == "" {
+			continue
+		}
+		if rel, ok := isUnder(cortexDir, path); ok {
+			if strings.Count(rel, sep) != 0 {
+				continue
+			}
+			name := filepath.Base(rel)
+
+			// .history.jsonl companion → remap to .json metadata.
+			if stem, ok := strings.CutSuffix(
+				name, ".history.jsonl",
+			); ok {
+				jsonPath := filepath.Join(
+					cortexDir, stem+".json",
+				)
+				if parser.IsCortexSessionFile(stem + ".json") {
+					return parser.DiscoveredFile{
+						Path:  jsonPath,
+						Agent: parser.AgentCortex,
+					}, true
+				}
+				continue
+			}
+
+			if parser.IsCortexSessionFile(name) {
+				return parser.DiscoveredFile{
+					Path:  path,
+					Agent: parser.AgentCortex,
+				}, true
+			}
+		}
+	}
+
 	return parser.DiscoveredFile{}, false
 }
 
@@ -633,7 +791,7 @@ func (e *Engine) ResyncAll(
 
 	// 3. Point engine at newDB and sync into it.
 	e.db = newDB
-	stats := e.syncAllLocked(ctx, onProgress)
+	stats := e.syncAllLocked(ctx, onProgress, time.Time{})
 	e.db = origDB // restore immediately
 
 	// Abort swap when the fresh DB would be worse than the
@@ -827,21 +985,60 @@ func removeWAL(path string) {
 	os.Remove(path + "-shm")
 }
 
+// Sync state keys persisted in pg_sync_state.
+const (
+	syncStateStartedAt  = "last_sync_started_at"
+	syncStateFinishedAt = "last_sync_finished_at"
+)
+
+// LastSyncStartedAt returns the recorded start time of the
+// most recent sync. Returns zero time if no sync has run.
+// Use this as the mtime cutoff for quick incremental syncs —
+// anything modified at or after this time must be re-evaluated.
+func (e *Engine) LastSyncStartedAt() time.Time {
+	raw, err := e.db.GetSyncState(syncStateStartedAt)
+	if err != nil || raw == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
 // SyncAll discovers and syncs all session files from all agents.
 func (e *Engine) SyncAll(
 	ctx context.Context, onProgress ProgressFunc,
 ) SyncStats {
 	e.syncMu.Lock()
 	defer e.syncMu.Unlock()
-	return e.syncAllLocked(ctx, onProgress)
+	return e.syncAllLocked(ctx, onProgress, time.Time{})
+}
+
+// SyncAllSince syncs only files whose mtime is at or after
+// the given cutoff time. Use a zero time to sync everything
+// (equivalent to SyncAll). The cutoff is applied after
+// discovery; directory traversal still walks all session
+// directories. Typical callers pass a small safety margin
+// behind the last successful sync start to avoid missing
+// files that were being written during a prior sync.
+func (e *Engine) SyncAllSince(
+	ctx context.Context, since time.Time, onProgress ProgressFunc,
+) SyncStats {
+	e.syncMu.Lock()
+	defer e.syncMu.Unlock()
+	return e.syncAllLocked(ctx, onProgress, since)
 }
 
 func (e *Engine) syncAllLocked(
-	ctx context.Context, onProgress ProgressFunc,
+	ctx context.Context, onProgress ProgressFunc, since time.Time,
 ) SyncStats {
 	if ctx.Err() != nil {
 		return SyncStats{Aborted: true}
 	}
+
+	e.recordSyncStarted()
 
 	t0 := time.Now()
 
@@ -856,6 +1053,10 @@ func (e *Engine) syncAllLocked(
 			counts[def.Type] += len(found)
 			all = append(all, found...)
 		}
+	}
+
+	if !since.IsZero() {
+		all = filterFilesByMtime(all, since)
 	}
 
 	verbose := onProgress == nil
@@ -952,6 +1153,47 @@ func (e *Engine) syncAllLocked(
 		return stats
 	}
 
+	// Sync Warp sessions (DB-backed, not file-based).
+	tWarp := time.Now()
+	warpPending := e.syncWarp(ctx)
+	if len(warpPending) > 0 {
+		stats.TotalSessions += len(warpPending)
+		tWrite := time.Now()
+		var warpWritten int
+		for _, pw := range warpPending {
+			if ctx.Err() != nil {
+				break
+			}
+			switch err := e.writeSessionFull(pw); {
+			case err == nil:
+				warpWritten++
+			case errors.Is(err, db.ErrSessionExcluded):
+				// Intentional skip, not a failure.
+			default:
+				stats.RecordFailed()
+			}
+		}
+		stats.RecordSynced(warpWritten)
+		if verbose {
+			log.Printf(
+				"warp write: %d sessions in %s",
+				len(warpPending),
+				time.Since(tWrite).Round(time.Millisecond),
+			)
+		}
+	}
+	if verbose {
+		log.Printf(
+			"warp sync: %s",
+			time.Since(tWarp).Round(time.Millisecond),
+		)
+	}
+
+	if ctx.Err() != nil {
+		stats.Aborted = true
+		return stats
+	}
+
 	tPersist := time.Now()
 	skipCount := e.persistSkipCache()
 	if verbose {
@@ -966,7 +1208,52 @@ func (e *Engine) syncAllLocked(
 	e.lastSync = time.Now()
 	e.lastSyncStats = stats
 	e.mu.Unlock()
+
+	e.recordSyncFinished()
 	return stats
+}
+
+// recordSyncStarted persists the start time of a sync run
+// into pg_sync_state. Callers use this to compute mtime
+// cutoffs for future quick incremental syncs.
+func (e *Engine) recordSyncStarted() {
+	ts := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := e.db.SetSyncState(syncStateStartedAt, ts); err != nil {
+		log.Printf("persist sync start time: %v", err)
+	}
+}
+
+// recordSyncFinished persists the finish time of a completed
+// sync run. Only called on successful completion (not on
+// cancellation or abort).
+func (e *Engine) recordSyncFinished() {
+	ts := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := e.db.SetSyncState(syncStateFinishedAt, ts); err != nil {
+		log.Printf("persist sync finish time: %v", err)
+	}
+}
+
+// filterFilesByMtime returns only files whose mtime is at or
+// after the given cutoff. Files that can't be stat'd are kept
+// (so errors surface in the worker rather than being silently
+// dropped). The cost is one stat per file — acceptable for
+// polling use cases where most files will be skipped.
+func filterFilesByMtime(
+	files []parser.DiscoveredFile, cutoff time.Time,
+) []parser.DiscoveredFile {
+	cutoffNs := cutoff.UnixNano()
+	out := files[:0]
+	for _, f := range files {
+		info, err := os.Stat(f.Path)
+		if err != nil {
+			out = append(out, f)
+			continue
+		}
+		if info.ModTime().UnixNano() >= cutoffNs {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // syncOpenCode syncs sessions from OpenCode SQLite databases.
@@ -1214,15 +1501,17 @@ func drainResults(results <-chan syncJob, remaining int) {
 // incremental JSONL parse, used to partially update the
 // session row without overwriting unrelated columns.
 type incrementalUpdate struct {
-	sessionID         string
-	msgs              []parser.ParsedMessage
-	endedAt           time.Time
-	msgCount          int // total (old + new)
-	userMsgCount      int // total (old + new)
-	fileSize          int64
-	fileMtime         int64
-	totalOutputTokens int // absolute (old + new)
-	peakContextTokens int // absolute max(old, new)
+	sessionID            string
+	msgs                 []parser.ParsedMessage
+	endedAt              time.Time
+	msgCount             int // total (old + new)
+	userMsgCount         int // total (old + new)
+	fileSize             int64
+	fileMtime            int64
+	totalOutputTokens    int // absolute (old + new)
+	peakContextTokens    int // absolute max(old, new)
+	hasTotalOutputTokens bool
+	hasPeakContextTokens bool
 }
 
 type processResult struct {
@@ -1247,9 +1536,21 @@ func (e *Engine) processFile(
 	// Capture mtime once from the initial stat so all
 	// downstream cache operations use a consistent value.
 	mtime := info.ModTime().UnixNano()
+	if file.Agent == parser.AgentOpenHands {
+		snapshot, err := parser.OpenHandsSnapshot(file.Path)
+		if err != nil {
+			return processResult{err: err}
+		}
+		mtime = snapshot.Mtime
+	}
 
 	// Skip files cached from a previous sync (parse errors
 	// or non-interactive sessions) whose mtime is unchanged.
+	// Legacy codex_exec entries from pre-bulk-sync builds are
+	// scrubbed once at engine construction by
+	// migrateLegacyCodexExecSkips, so this check can treat
+	// the skip cache as authoritative without per-file
+	// re-validation.
 	e.skipMu.RLock()
 	cachedMtime, cached := e.skipCache[file.Path]
 	e.skipMu.RUnlock()
@@ -1267,6 +1568,8 @@ func (e *Engine) processFile(
 		res = e.processCopilot(file, info)
 	case parser.AgentGemini:
 		res = e.processGemini(file, info)
+	case parser.AgentOpenHands:
+		res = e.processOpenHands(file, info)
 	case parser.AgentCursor:
 		res = e.processCursor(file, info)
 	case parser.AgentIflow:
@@ -1281,6 +1584,18 @@ func (e *Engine) processFile(
 		res = e.processPi(file, info)
 	case parser.AgentOpenClaw:
 		res = e.processOpenClaw(file, info)
+	case parser.AgentKimi:
+		res = e.processKimi(file, info)
+	case parser.AgentKiro:
+		res = e.processKiro(file, info)
+	case parser.AgentKiroIDE:
+		res = e.processKiroIDE(file, info)
+	case parser.AgentCortex:
+		res = e.processCortex(file, info)
+	case parser.AgentHermes:
+		res = e.processHermes(file, info)
+	case parser.AgentPositron:
+		res = e.processPositron(file, info)
 	default:
 		res = processResult{
 			err: fmt.Errorf(
@@ -1458,6 +1773,13 @@ func (e *Engine) tryIncrementalJSONL(
 		file.Path, inc.FileSize, maxOrd+1,
 	)
 	if err != nil {
+		if parser.IsIncrementalFullParseFallback(err) {
+			log.Printf(
+				"incremental %s %s: %v (explicit full parse fallback)",
+				agent, file.Path, err,
+			)
+			return processResult{}, false
+		}
 		log.Printf(
 			"incremental %s %s: %v (full parse)",
 			agent, file.Path, err,
@@ -1479,14 +1801,16 @@ func (e *Engine) tryIncrementalJSONL(
 		if consumed > 0 {
 			return processResult{
 				incremental: &incrementalUpdate{
-					sessionID:         inc.ID,
-					endedAt:           endedAt,
-					msgCount:          inc.MsgCount,
-					userMsgCount:      inc.UserMsgCount,
-					fileSize:          newOffset,
-					fileMtime:         info.ModTime().UnixNano(),
-					totalOutputTokens: inc.TotalOutputTokens,
-					peakContextTokens: inc.PeakContextTokens,
+					sessionID:            inc.ID,
+					endedAt:              endedAt,
+					msgCount:             inc.MsgCount,
+					userMsgCount:         inc.UserMsgCount,
+					fileSize:             newOffset,
+					fileMtime:            info.ModTime().UnixNano(),
+					totalOutputTokens:    inc.TotalOutputTokens,
+					peakContextTokens:    inc.PeakContextTokens,
+					hasTotalOutputTokens: inc.HasTotalOutputTokens,
+					hasPeakContextTokens: inc.HasPeakContextTokens,
 				},
 			}, true
 		}
@@ -1503,24 +1827,33 @@ func (e *Engine) tryIncrementalJSONL(
 
 	totalOut := inc.TotalOutputTokens
 	peakCtx := inc.PeakContextTokens
+	hasTotalOut := inc.HasTotalOutputTokens
+	hasPeakCtx := inc.HasPeakContextTokens
 	for _, m := range newMsgs {
-		totalOut += m.OutputTokens
-		if m.ContextTokens > peakCtx {
+		msgHasCtx, msgHasOut := m.TokenPresence()
+		if msgHasOut {
+			totalOut += m.OutputTokens
+			hasTotalOut = true
+		}
+		if msgHasCtx && (!hasPeakCtx || m.ContextTokens > peakCtx) {
 			peakCtx = m.ContextTokens
+			hasPeakCtx = true
 		}
 	}
 
 	return processResult{
 		incremental: &incrementalUpdate{
-			sessionID:         inc.ID,
-			msgs:              newMsgs,
-			endedAt:           endedAt,
-			msgCount:          inc.MsgCount + len(newMsgs),
-			userMsgCount:      inc.UserMsgCount + newUserCount,
-			fileSize:          newOffset,
-			fileMtime:         info.ModTime().UnixNano(),
-			totalOutputTokens: totalOut,
-			peakContextTokens: peakCtx,
+			sessionID:            inc.ID,
+			msgs:                 newMsgs,
+			endedAt:              endedAt,
+			msgCount:             inc.MsgCount + len(newMsgs),
+			userMsgCount:         inc.UserMsgCount + newUserCount,
+			fileSize:             newOffset,
+			fileMtime:            info.ModTime().UnixNano(),
+			totalOutputTokens:    totalOut,
+			peakContextTokens:    peakCtx,
+			hasTotalOutputTokens: hasTotalOut,
+			hasPeakContextTokens: hasPeakCtx,
 		},
 	}, true
 }
@@ -1534,8 +1867,6 @@ func (e *Engine) processCodex(
 		return processResult{skip: true}
 	}
 
-	// Try incremental parse for append-only JSONL files
-	// that have already been synced.
 	codexParseFn := func(
 		path string, offset int64, startOrd int,
 	) ([]parser.ParsedMessage, time.Time, int64, error) {
@@ -1554,9 +1885,6 @@ func (e *Engine) processCodex(
 	)
 	if err != nil {
 		return processResult{err: err}
-	}
-	if sess == nil {
-		return processResult{} // non-interactive
 	}
 
 	hash, err := ComputeFileHash(file.Path)
@@ -1738,6 +2066,214 @@ func (e *Engine) processOpenClaw(
 	hash, err := ComputeFileHash(file.Path)
 	if err == nil {
 		sess.File.Hash = hash
+	}
+
+	return processResult{
+		results: []parser.ParseResult{
+			{Session: *sess, Messages: msgs},
+		},
+	}
+}
+
+func (e *Engine) processKimi(
+	file parser.DiscoveredFile, info os.FileInfo,
+) processResult {
+	if e.shouldSkipByPath(file.Path, info) {
+		return processResult{skip: true}
+	}
+
+	sess, msgs, err := parser.ParseKimiSession(
+		file.Path, file.Project, e.machine,
+	)
+	if err != nil {
+		return processResult{err: err}
+	}
+	if sess == nil {
+		return processResult{}
+	}
+
+	hash, err := ComputeFileHash(file.Path)
+	if err == nil {
+		sess.File.Hash = hash
+	}
+
+	return processResult{
+		results: []parser.ParseResult{
+			{Session: *sess, Messages: msgs},
+		},
+	}
+}
+
+func (e *Engine) processKiro(
+	file parser.DiscoveredFile, info os.FileInfo,
+) processResult {
+	if e.shouldSkipByPath(file.Path, info) {
+		return processResult{skip: true}
+	}
+
+	sess, msgs, err := parser.ParseKiroSession(
+		file.Path, e.machine,
+	)
+	if err != nil {
+		return processResult{err: err}
+	}
+	if sess == nil {
+		return processResult{}
+	}
+
+	hash, err := ComputeFileHash(file.Path)
+	if err == nil {
+		sess.File.Hash = hash
+	}
+
+	return processResult{
+		results: []parser.ParseResult{
+			{Session: *sess, Messages: msgs},
+		},
+	}
+}
+
+func (e *Engine) processKiroIDE(
+	file parser.DiscoveredFile, info os.FileInfo,
+) processResult {
+	if e.shouldSkipByPath(file.Path, info) {
+		return processResult{skip: true}
+	}
+
+	sess, msgs, err := parser.ParseKiroIDESession(
+		file.Path, e.machine,
+	)
+	if err != nil {
+		return processResult{err: err}
+	}
+	if sess == nil {
+		return processResult{}
+	}
+
+	hash, err := ComputeFileHash(file.Path)
+	if err == nil {
+		sess.File.Hash = hash
+	}
+
+	return processResult{
+		results: []parser.ParseResult{
+			{Session: *sess, Messages: msgs},
+		},
+	}
+}
+
+func (e *Engine) processCortex(
+	file parser.DiscoveredFile, info os.FileInfo,
+) processResult {
+	if e.shouldSkipByPath(file.Path, info) {
+		return processResult{skip: true}
+	}
+
+	sess, msgs, err := parser.ParseCortexSession(
+		file.Path, e.machine,
+	)
+	if err != nil {
+		return processResult{err: err}
+	}
+	if sess == nil {
+		return processResult{}
+	}
+
+	hash, err := ComputeFileHash(file.Path)
+	if err == nil {
+		sess.File.Hash = hash
+	}
+
+	return processResult{
+		results: []parser.ParseResult{
+			{Session: *sess, Messages: msgs},
+		},
+	}
+}
+
+func (e *Engine) processHermes(
+	file parser.DiscoveredFile, info os.FileInfo,
+) processResult {
+	if e.shouldSkipByPath(file.Path, info) {
+		return processResult{skip: true}
+	}
+
+	sess, msgs, err := parser.ParseHermesSession(
+		file.Path, file.Project, e.machine,
+	)
+	if err != nil {
+		return processResult{err: err}
+	}
+	if sess == nil {
+		return processResult{}
+	}
+
+	hash, err := ComputeFileHash(file.Path)
+	if err == nil {
+		sess.File.Hash = hash
+	}
+
+	return processResult{
+		results: []parser.ParseResult{
+			{Session: *sess, Messages: msgs},
+		},
+	}
+}
+
+func (e *Engine) processPositron(
+	file parser.DiscoveredFile, info os.FileInfo,
+) processResult {
+	if e.shouldSkipByPath(file.Path, info) {
+		return processResult{skip: true}
+	}
+
+	sess, msgs, err := parser.ParsePositronSession(
+		file.Path, file.Project, e.machine,
+	)
+	if err != nil {
+		return processResult{err: err}
+	}
+	if sess == nil {
+		return processResult{}
+	}
+
+	hash, err := ComputeFileHash(file.Path)
+	if err == nil {
+		sess.File.Hash = hash
+	}
+
+	return processResult{
+		results: []parser.ParseResult{
+			{Session: *sess, Messages: msgs},
+		},
+	}
+}
+
+func (e *Engine) processOpenHands(
+	file parser.DiscoveredFile, _ os.FileInfo,
+) processResult {
+	snapshot, err := parser.OpenHandsSnapshot(file.Path)
+	if err != nil {
+		return processResult{err: err}
+	}
+
+	storedSize, storedMtime, ok := e.db.GetFileInfoByPath(
+		file.Path,
+	)
+	if ok &&
+		storedSize == snapshot.Size &&
+		storedMtime == snapshot.Mtime {
+		return processResult{skip: true}
+	}
+
+	sess, msgs, err := parser.ParseOpenHandsSession(
+		file.Path, e.machine,
+	)
+	if err != nil {
+		return processResult{err: err}
+	}
+	if sess == nil {
+		return processResult{}
 	}
 
 	return processResult{
@@ -1995,6 +2531,7 @@ func (e *Engine) writeIncremental(
 		msgCount, userMsgCount,
 		inc.fileSize, inc.fileMtime,
 		inc.totalOutputTokens, inc.peakContextTokens,
+		inc.hasTotalOutputTokens, inc.hasPeakContextTokens,
 	); err != nil {
 		return fmt.Errorf(
 			"incremental update %s: %w",
@@ -2084,22 +2621,25 @@ func (e *Engine) writeSessionFull(pw pendingWrite) error {
 
 // toDBSession converts a pendingWrite to a db.Session.
 func toDBSession(pw pendingWrite) db.Session {
+	hasTotal, hasPeak := pw.sess.TokenCoverage(pw.msgs)
 	s := db.Session{
-		ID:                pw.sess.ID,
-		Project:           pw.sess.Project,
-		Machine:           pw.sess.Machine,
-		Agent:             string(pw.sess.Agent),
-		MessageCount:      pw.sess.MessageCount,
-		UserMessageCount:  pw.sess.UserMessageCount,
-		ParentSessionID:   strPtr(pw.sess.ParentSessionID),
-		RelationshipType:  string(pw.sess.RelationshipType),
-		Cwd:               strPtr(pw.sess.Cwd),
-		TotalOutputTokens: pw.sess.TotalOutputTokens,
-		PeakContextTokens: pw.sess.PeakContextTokens,
-		FilePath:          strPtr(pw.sess.File.Path),
-		FileSize:          int64Ptr(pw.sess.File.Size),
-		FileMtime:         int64Ptr(pw.sess.File.Mtime),
-		FileHash:          strPtr(pw.sess.File.Hash),
+		ID:                   pw.sess.ID,
+		Project:              pw.sess.Project,
+		Machine:              pw.sess.Machine,
+		Agent:                string(pw.sess.Agent),
+		MessageCount:         pw.sess.MessageCount,
+		UserMessageCount:     pw.sess.UserMessageCount,
+		ParentSessionID:      strPtr(pw.sess.ParentSessionID),
+		RelationshipType:     string(pw.sess.RelationshipType),
+		Cwd:                  strPtr(pw.sess.Cwd),
+		TotalOutputTokens:    pw.sess.TotalOutputTokens,
+		PeakContextTokens:    pw.sess.PeakContextTokens,
+		HasTotalOutputTokens: hasTotal,
+		HasPeakContextTokens: hasPeak,
+		FilePath:             strPtr(pw.sess.File.Path),
+		FileSize:             int64Ptr(pw.sess.File.Size),
+		FileMtime:            int64Ptr(pw.sess.File.Mtime),
+		FileHash:             strPtr(pw.sess.File.Hash),
 	}
 	if pw.sess.FirstMessage != "" {
 		s.FirstMessage = &pw.sess.FirstMessage
@@ -2118,22 +2658,27 @@ func toDBSession(pw pendingWrite) db.Session {
 func toDBMessages(pw pendingWrite, blocked map[string]bool) []db.Message {
 	msgs := make([]db.Message, len(pw.msgs))
 	for i, m := range pw.msgs {
+		hasCtx, hasOut := m.TokenPresence()
 		msgs[i] = db.Message{
-			SessionID:     pw.sess.ID,
-			Ordinal:       m.Ordinal,
-			Role:          string(m.Role),
-			Content:       m.Content,
-			Timestamp:     timeutil.Format(m.Timestamp),
-			HasThinking:   m.HasThinking,
-			HasToolUse:    m.HasToolUse,
-			IsSystem:      m.IsSystem,
-			ContentLength: m.ContentLength,
-			ModelID:       m.ModelID,
-			ProviderID:    m.ProviderID,
-			Model:         m.Model,
-			TokenUsage:    m.TokenUsage,
-			ContextTokens: m.ContextTokens,
-			OutputTokens:  m.OutputTokens,
+			SessionID:        pw.sess.ID,
+			Ordinal:          m.Ordinal,
+			Role:             string(m.Role),
+			Content:          m.Content,
+			Timestamp:        timeutil.Format(m.Timestamp),
+			HasThinking:      m.HasThinking,
+			HasToolUse:       m.HasToolUse,
+			IsSystem:         m.IsSystem,
+			ContentLength:    m.ContentLength,
+			ModelID:          m.ModelID,
+			ProviderID:       m.ProviderID,
+			Model:            m.Model,
+			TokenUsage:       m.TokenUsage,
+			ContextTokens:    m.ContextTokens,
+			OutputTokens:     m.OutputTokens,
+			HasContextTokens: hasCtx,
+			HasOutputTokens:  hasOut,
+			ClaudeMessageID:  m.ClaudeMessageID,
+			ClaudeRequestID:  m.ClaudeRequestID,
 			ToolCalls: convertToolCalls(
 				pw.sess.ID, m.ToolCalls,
 			),
@@ -2203,9 +2748,8 @@ func (e *Engine) FindSourceFile(sessionID string) string {
 	return ""
 }
 
-// SyncSingleSession re-syncs a single session by its ID.
-// Unlike the bulk SyncAll path, this includes exec-originated
-// Codex sessions and uses the existing DB project as fallback.
+// SyncSingleSession re-syncs a single session by its ID and
+// uses the existing DB project as fallback where applicable.
 func (e *Engine) SyncSingleSession(sessionID string) error {
 	e.syncMu.Lock()
 	defer e.syncMu.Unlock()
@@ -2215,7 +2759,12 @@ func (e *Engine) SyncSingleSession(sessionID string) error {
 		return fmt.Errorf("unknown agent for session %s", sessionID)
 	}
 	if !def.FileBased {
-		return e.syncSingleOpenCode(sessionID)
+		switch def.Type {
+		case parser.AgentWarp:
+			return e.syncSingleWarp(sessionID)
+		default:
+			return e.syncSingleOpenCode(sessionID)
+		}
 	}
 
 	path := e.FindSourceFile(sessionID)
@@ -2232,9 +2781,7 @@ func (e *Engine) SyncSingleSession(sessionID string) error {
 	// during a bulk SyncAll.
 	e.clearSkip(path)
 
-	// Reuse processFile for stat and DB-skip logic. For
-	// Claude this is the full pipeline; for Codex we need
-	// includeExec=true so we call the parser directly.
+	// Reuse processFile for stat and DB-skip logic.
 	file := parser.DiscoveredFile{
 		Path:  path,
 		Agent: agent,
@@ -2250,12 +2797,22 @@ func (e *Engine) SyncSingleSession(sessionID string) error {
 			file.Project = filepath.Base(filepath.Dir(path))
 		}
 	case parser.AgentCursor:
-		// path is <cursorDir>/<project>/agent-transcripts/<uuid>.txt
-		// Extract project dir name from two levels up
-		projDir := filepath.Base(
-			filepath.Dir(filepath.Dir(path)),
-		)
-		file.Project = parser.DecodeCursorProjectDir(projDir)
+		// Support both flat and nested transcript layouts.
+		for _, cursorDir := range e.agentDirs[parser.AgentCursor] {
+			rel, ok := isUnder(cursorDir, path)
+			if !ok {
+				continue
+			}
+			projDir, ok := parser.ParseCursorTranscriptRelPath(rel)
+			if !ok {
+				continue
+			}
+			file.Project = parser.DecodeCursorProjectDir(projDir)
+			break
+		}
+		if file.Project == "" {
+			file.Project = "unknown"
+		}
 	case parser.AgentIflow:
 		// path is <iflowDir>/<project>/session-<uuid>.jsonl
 		// Extract project dir name from parent directory
@@ -2266,6 +2823,10 @@ func (e *Engine) SyncSingleSession(sessionID string) error {
 		} else {
 			file.Project = filepath.Base(filepath.Dir(path))
 		}
+	case parser.AgentKimi:
+		// path is <kimiDir>/<project-hash>/<session-uuid>/wire.jsonl
+		// Derive project from two levels up.
+		file.Project = filepath.Base(filepath.Dir(filepath.Dir(path)))
 	}
 
 	res := e.processFile(file)
@@ -2283,23 +2844,6 @@ func (e *Engine) SyncSingleSession(sessionID string) error {
 	// append-only JSONL that was already synced).
 	if res.incremental != nil {
 		return e.writeIncremental(res.incremental)
-	}
-
-	// For Codex, processFile uses includeExec=false which may
-	// return empty results for exec-originated sessions. Re-parse
-	// with includeExec=true when that happens.
-	if len(res.results) == 0 && agent == parser.AgentCodex {
-		execRes := e.processCodexIncludeExec(file)
-		if execRes.err != nil {
-			if res.mtime != 0 {
-				e.cacheSkip(path, res.mtime)
-			}
-			return execRes.err
-		}
-		if len(execRes.results) == 0 {
-			return nil
-		}
-		res.results = execRes.results
 	}
 
 	if len(res.results) == 0 {
@@ -2323,30 +2867,6 @@ func (e *Engine) SyncSingleSession(sessionID string) error {
 	}
 
 	return nil
-}
-
-// processCodexIncludeExec re-parses a Codex session with
-// exec-originated sessions included.
-func (e *Engine) processCodexIncludeExec(
-	file parser.DiscoveredFile,
-) processResult {
-	sess, msgs, err := parser.ParseCodexSession(
-		file.Path, e.machine, true,
-	)
-	if err != nil {
-		return processResult{err: err}
-	}
-	if sess == nil {
-		return processResult{}
-	}
-	if h, herr := ComputeFileHash(file.Path); herr == nil {
-		sess.File.Hash = h
-	}
-	return processResult{
-		results: []parser.ParseResult{
-			{Session: *sess, Messages: msgs},
-		},
-	}
 }
 
 // syncSingleOpenCode re-syncs a single OpenCode session.
@@ -2391,6 +2911,129 @@ func (e *Engine) syncSingleOpenCode(
 	return fmt.Errorf("opencode session %s not found", sessionID)
 }
 
+// syncWarp syncs sessions from Warp SQLite databases.
+// Uses per-conversation last_modified_at to detect changes,
+// so only modified conversations are fully parsed.
+func (e *Engine) syncWarp(
+	ctx context.Context,
+) []pendingWrite {
+	var allPending []pendingWrite
+	for _, dir := range e.agentDirs[parser.AgentWarp] {
+		if ctx.Err() != nil {
+			break
+		}
+		if dir == "" {
+			continue
+		}
+		allPending = append(
+			allPending, e.syncOneWarp(ctx, dir)...,
+		)
+	}
+	return allPending
+}
+
+// syncOneWarp handles a single Warp directory.
+func (e *Engine) syncOneWarp(
+	ctx context.Context, dir string,
+) []pendingWrite {
+	dbPath := parser.FindWarpDBPath(dir)
+	if dbPath == "" {
+		return nil
+	}
+
+	metas, err := parser.ListWarpSessionMeta(dbPath)
+	if err != nil {
+		log.Printf("sync warp: %v", err)
+		return nil
+	}
+	if len(metas) == 0 {
+		return nil
+	}
+
+	var changed []string
+	for _, m := range metas {
+		_, storedMtime, ok :=
+			e.db.GetFileInfoByPath(m.VirtualPath)
+		if ok && storedMtime == m.FileMtime {
+			continue
+		}
+		changed = append(changed, m.SessionID)
+	}
+	if len(changed) == 0 {
+		return nil
+	}
+
+	var pending []pendingWrite
+	for _, cid := range changed {
+		if ctx.Err() != nil {
+			break
+		}
+		sess, msgs, err := parser.ParseWarpSession(
+			dbPath, cid, e.machine,
+		)
+		if err != nil {
+			log.Printf(
+				"warp conversation %s: %v", cid, err,
+			)
+			continue
+		}
+		if sess == nil {
+			continue
+		}
+		pending = append(pending, pendingWrite{
+			sess: *sess,
+			msgs: msgs,
+		})
+	}
+
+	return pending
+}
+
+// syncSingleWarp re-syncs a single Warp conversation.
+func (e *Engine) syncSingleWarp(
+	sessionID string,
+) error {
+	rawID := strings.TrimPrefix(sessionID, "warp:")
+
+	var lastErr error
+	for _, dir := range e.agentDirs[parser.AgentWarp] {
+		if dir == "" {
+			continue
+		}
+		dbPath := parser.FindWarpDBPath(dir)
+		if dbPath == "" {
+			continue
+		}
+		sess, msgs, err := parser.ParseWarpSession(
+			dbPath, rawID, e.machine,
+		)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if sess == nil {
+			continue
+		}
+		if err := e.writeSessionFull(
+			pendingWrite{sess: *sess, msgs: msgs},
+		); err != nil && !errors.Is(err, db.ErrSessionExcluded) {
+			return fmt.Errorf("write session %s: %w",
+				sess.ID, err)
+		}
+		return nil
+	}
+
+	if len(e.agentDirs[parser.AgentWarp]) == 0 {
+		return fmt.Errorf("warp dir not configured")
+	}
+	if lastErr != nil {
+		return fmt.Errorf(
+			"warp session %s: %w", sessionID, lastErr,
+		)
+	}
+	return fmt.Errorf("warp session %s not found", sessionID)
+}
+
 func strPtr(s string) *string {
 	if s == "" {
 		return nil
@@ -2423,9 +3066,33 @@ func convertToolCalls(
 			InputJSON:         tc.InputJSON,
 			SkillName:         tc.SkillName,
 			SubagentSessionID: tc.SubagentSessionID,
+			ResultEvents:      convertToolResultEvents(tc.ResultEvents),
 		}
 	}
 	return calls
+}
+
+func convertToolResultEvents(
+	parsed []parser.ParsedToolResultEvent,
+) []db.ToolResultEvent {
+	if len(parsed) == 0 {
+		return nil
+	}
+	events := make([]db.ToolResultEvent, len(parsed))
+	for i, ev := range parsed {
+		events[i] = db.ToolResultEvent{
+			ToolUseID:         ev.ToolUseID,
+			AgentID:           ev.AgentID,
+			SubagentSessionID: ev.SubagentSessionID,
+			Source:            ev.Source,
+			Status:            ev.Status,
+			Content:           ev.Content,
+			ContentLength:     len(ev.Content),
+			Timestamp:         timeutil.Format(ev.Timestamp),
+			EventIndex:        i,
+		}
+	}
+	return events
 }
 
 // convertToolResults maps parsed tool results to db.ToolResult
@@ -2452,6 +3119,7 @@ func convertToolResults(
 // tool_result blocks (no displayable text).
 func pairAndFilter(msgs []db.Message, blocked map[string]bool) []db.Message {
 	pairToolResults(msgs, blocked)
+	pairToolResultEventSummaries(msgs, blocked)
 	filtered := msgs[:0]
 	for _, m := range msgs {
 		if m.Role == "user" &&
@@ -2490,4 +3158,81 @@ func pairToolResults(msgs []db.Message, blocked map[string]bool) {
 			}
 		}
 	}
+}
+
+func pairToolResultEventSummaries(
+	msgs []db.Message, blocked map[string]bool,
+) {
+	for i := range msgs {
+		for j := range msgs[i].ToolCalls {
+			tc := &msgs[i].ToolCalls[j]
+			if len(tc.ResultEvents) == 0 {
+				continue
+			}
+			summary := summarizeToolResultEvents(tc.ResultEvents)
+			tc.ResultContentLength = len(summary)
+			if blocked[tc.Category] {
+				tc.ResultContent = ""
+				tc.ResultEvents = nil
+				continue
+			}
+			tc.ResultContent = summary
+		}
+	}
+}
+
+func summarizeToolResultEvents(
+	events []db.ToolResultEvent,
+) string {
+	if len(events) == 0 {
+		return ""
+	}
+	type agentSummary struct {
+		order   int
+		content string
+	}
+	latestByAgent := map[string]agentSummary{}
+	orderedAgents := make([]string, 0, len(events))
+	lastAnon := ""
+	allHaveAgentID := true
+	for _, ev := range events {
+		if strings.TrimSpace(ev.Content) == "" {
+			continue
+		}
+		agentID := strings.TrimSpace(ev.AgentID)
+		if agentID == "" {
+			allHaveAgentID = false
+			lastAnon = ev.Content
+			continue
+		}
+		if _, ok := latestByAgent[agentID]; !ok {
+			latestByAgent[agentID] = agentSummary{
+				order:   len(orderedAgents),
+				content: ev.Content,
+			}
+			orderedAgents = append(orderedAgents, agentID)
+			continue
+		}
+		entry := latestByAgent[agentID]
+		entry.content = ev.Content
+		latestByAgent[agentID] = entry
+	}
+	if len(latestByAgent) <= 1 {
+		if len(latestByAgent) == 1 {
+			summary := latestByAgent[orderedAgents[0]].content
+			if lastAnon != "" {
+				return summary + "\n\n" + lastAnon
+			}
+			return summary
+		}
+		return lastAnon
+	}
+	parts := make([]string, 0, len(orderedAgents))
+	for _, agentID := range orderedAgents {
+		parts = append(parts, agentID+":\n"+latestByAgent[agentID].content)
+	}
+	if !allHaveAgentID && lastAnon != "" {
+		parts = append(parts, lastAnon)
+	}
+	return strings.Join(parts, "\n\n")
 }

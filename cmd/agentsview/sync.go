@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -46,16 +45,7 @@ func parseSyncFlags(args []string) (SyncConfig, error) {
 	}, nil
 }
 
-func runSync(args []string) {
-	cfg, err := parseSyncFlags(args)
-	if err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			os.Exit(0)
-		}
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
-	}
-
+func runSync(cfg SyncConfig) {
 	appCfg, err := config.LoadMinimal()
 	if err != nil {
 		log.Fatalf("loading config: %v", err)
@@ -117,7 +107,7 @@ func runLocalSync(
 	}
 
 	fmt.Println()
-	stats, err := database.GetStats(context.Background(), false)
+	stats, err := database.GetStats(context.Background(), false, false)
 	if err == nil {
 		fmt.Printf(
 			"Database: %d sessions, %d messages\n",

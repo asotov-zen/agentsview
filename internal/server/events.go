@@ -41,10 +41,10 @@ const (
 // syncing files to the database, and this monitor detects the
 // resulting DB changes.
 //
-// As a fallback for sessions the file watcher skips (e.g.
-// codex_exec sessions), it also monitors the source file's
-// mtime and triggers a direct sync when the DB hasn't been
-// updated within syncFallbackDelay.
+// As a fallback when file watching or incremental sync misses
+// a DB update, it also monitors the source file's mtime and
+// triggers a direct sync when the DB hasn't been updated
+// within syncFallbackDelay.
 func (s *Server) sessionMonitor(
 	ctx context.Context, sessionID string,
 ) <-chan struct{} {
@@ -190,8 +190,7 @@ func (s *Server) checkDBForChanges(
 
 	// Fallback: if the file changed but the DB hasn't been
 	// updated within syncFallbackDelay, trigger a direct
-	// sync. This handles sessions the watcher skips (e.g.
-	// codex_exec).
+	// sync.
 	if !fileMtimeChangedAt.IsZero() &&
 		time.Since(*fileMtimeChangedAt) >= syncFallbackDelay {
 		*fileMtimeChangedAt = time.Time{}
@@ -319,8 +318,10 @@ func (s *Server) handleSyncStatus(
 func (s *Server) handleGetStats(
 	w http.ResponseWriter, r *http.Request,
 ) {
-	excludeOneShot := r.URL.Query().Get("include_one_shot") != "true"
-	stats, err := s.db.GetStats(r.Context(), excludeOneShot)
+	q := r.URL.Query()
+	excludeOneShot := q.Get("include_one_shot") != "true"
+	excludeAutomated := q.Get("include_automated") != "true"
+	stats, err := s.db.GetStats(r.Context(), excludeOneShot, excludeAutomated)
 	if err != nil {
 		if handleContextError(w, err) {
 			return
@@ -334,8 +335,10 @@ func (s *Server) handleGetStats(
 func (s *Server) handleListProjects(
 	w http.ResponseWriter, r *http.Request,
 ) {
-	excludeOneShot := r.URL.Query().Get("include_one_shot") != "true"
-	projects, err := s.db.GetProjects(r.Context(), excludeOneShot)
+	q := r.URL.Query()
+	excludeOneShot := q.Get("include_one_shot") != "true"
+	excludeAutomated := q.Get("include_automated") != "true"
+	projects, err := s.db.GetProjects(r.Context(), excludeOneShot, excludeAutomated)
 	if err != nil {
 		if handleContextError(w, err) {
 			return
@@ -351,8 +354,10 @@ func (s *Server) handleListProjects(
 func (s *Server) handleListMachines(
 	w http.ResponseWriter, r *http.Request,
 ) {
-	excludeOneShot := r.URL.Query().Get("include_one_shot") != "true"
-	machines, err := s.db.GetMachines(r.Context(), excludeOneShot)
+	q := r.URL.Query()
+	excludeOneShot := q.Get("include_one_shot") != "true"
+	excludeAutomated := q.Get("include_automated") != "true"
+	machines, err := s.db.GetMachines(r.Context(), excludeOneShot, excludeAutomated)
 	if err != nil {
 		if handleContextError(w, err) {
 			return
@@ -368,8 +373,10 @@ func (s *Server) handleListMachines(
 func (s *Server) handleListAgents(
 	w http.ResponseWriter, r *http.Request,
 ) {
-	excludeOneShot := r.URL.Query().Get("include_one_shot") != "true"
-	agents, err := s.db.GetAgents(r.Context(), excludeOneShot)
+	q := r.URL.Query()
+	excludeOneShot := q.Get("include_one_shot") != "true"
+	excludeAutomated := q.Get("include_automated") != "true"
+	agents, err := s.db.GetAgents(r.Context(), excludeOneShot, excludeAutomated)
 	if err != nil {
 		if handleContextError(w, err) {
 			return

@@ -1,18 +1,35 @@
 <script lang="ts">
-  import { ui, ALL_BLOCK_TYPES, type BlockType } from "../../stores/ui.svelte.js";
+  import {
+    ui,
+    ALL_BLOCK_TYPES,
+    type BlockType,
+    type TranscriptMode,
+  } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { sync } from "../../stores/sync.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import { downloadExport, getRawUrl } from "../../api/client.js";
   import ProjectTypeahead from "./ProjectTypeahead.svelte";
+  import ImportModal from "../import/ImportModal.svelte";
 
   const isMac = navigator.platform.toUpperCase().includes("MAC");
   const modKey = isMac ? "Cmd" : "Ctrl";
 
+  let showImportModal = $state(false);
   let showBlockFilter = $state(false);
+  let showOverflow = $state(false);
+  let moreOpen = $state(false);
   let filterBtnRef: HTMLButtonElement | undefined =
     $state(undefined);
   let filterDropRef: HTMLDivElement | undefined =
+    $state(undefined);
+  let overflowBtnRef: HTMLButtonElement | undefined =
+    $state(undefined);
+  let overflowDropRef: HTMLDivElement | undefined =
+    $state(undefined);
+  let moreBtnRef: HTMLButtonElement | undefined =
+    $state(undefined);
+  let moreDropRef: HTMLDivElement | undefined =
     $state(undefined);
 
   const BLOCK_LABELS: Record<BlockType, string> = {
@@ -74,16 +91,78 @@
         true,
       );
   });
+
+  // Close overflow dropdown on outside click
+  $effect(() => {
+    if (!showOverflow) return;
+    function onClickOutside(e: MouseEvent) {
+      const target = e.target as Node;
+      if (
+        overflowBtnRef?.contains(target) ||
+        overflowDropRef?.contains(target)
+      )
+        return;
+      showOverflow = false;
+    }
+    document.addEventListener("click", onClickOutside, true);
+    return () =>
+      document.removeEventListener(
+        "click",
+        onClickOutside,
+        true,
+      );
+  });
+
+  // Close More dropdown on outside click or Escape
+  $effect(() => {
+    if (!moreOpen) return;
+    function onClickOutside(e: MouseEvent) {
+      const target = e.target as Node;
+      if (
+        moreBtnRef?.contains(target) ||
+        moreDropRef?.contains(target)
+      )
+        return;
+      moreOpen = false;
+    }
+    function onKeydown(e: KeyboardEvent) {
+      if (e.key === "Escape") moreOpen = false;
+    }
+    document.addEventListener("click", onClickOutside, true);
+    document.addEventListener("keydown", onKeydown);
+    return () => {
+      document.removeEventListener(
+        "click",
+        onClickOutside,
+        true,
+      );
+      document.removeEventListener("keydown", onKeydown);
+    };
+  });
 </script>
 
 <header class="header">
   <div class="header-left">
     <button
-      class="header-home"
+      class="hamburger"
       onclick={() => {
-        sessions.deselectSession();
-        router.navigate("sessions");
+        if (ui.isMobileViewport && router.route !== "sessions") {
+          router.navigate("sessions");
+          ui.sidebarOpen = true;
+        } else {
+          ui.toggleSidebar();
+        }
       }}
+      title="Toggle sidebar (b)"
+      aria-label="Toggle sidebar"
+    >
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+        <path d="M1 2.75A.75.75 0 011.75 2h12.5a.75.75 0 010 1.5H1.75A.75.75 0 011 2.75zm0 5A.75.75 0 011.75 7h12.5a.75.75 0 010 1.5H1.75A.75.75 0 011 7.75zm0 5a.75.75 0 01.75-.75h12.5a.75.75 0 010 1.5H1.75a.75.75 0 01-.75-.75z"/>
+      </svg>
+    </button>
+    <button
+      class="header-home"
+      onclick={() => router.navigate("sessions")}
       title="Home"
     >
       <svg class="header-logo" width="18" height="18" viewBox="0 0 32 32" aria-hidden="true">
@@ -105,55 +184,63 @@
     <button
       class="nav-btn"
       class:active={router.route === "sessions"}
-      onclick={() => {
-        sessions.deselectSession();
-        router.navigate("sessions");
-      }}
+      onclick={() => router.navigate("sessions")}
       title="Sessions"
+      aria-label="Sessions"
     >
       <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
         <path d="M0 1.5A1.5 1.5 0 011.5 0h2A1.5 1.5 0 015 1.5v2A1.5 1.5 0 013.5 5h-2A1.5 1.5 0 010 3.5v-2zm6 0A1.5 1.5 0 017.5 0h2A1.5 1.5 0 0111 1.5v2A1.5 1.5 0 019.5 5h-2A1.5 1.5 0 016 3.5v-2zm5 0A1.5 1.5 0 0112.5 0h2A1.5 1.5 0 0116 1.5v2A1.5 1.5 0 0114.5 5h-2A1.5 1.5 0 0111 3.5v-2zM0 7.5A1.5 1.5 0 011.5 6h2A1.5 1.5 0 015 7.5v2A1.5 1.5 0 013.5 11h-2A1.5 1.5 0 010 9.5v-2zm6 0A1.5 1.5 0 017.5 6h2A1.5 1.5 0 0111 7.5v2A1.5 1.5 0 019.5 11h-2A1.5 1.5 0 016 9.5v-2zm5 0A1.5 1.5 0 0112.5 6h2A1.5 1.5 0 0116 7.5v2a1.5 1.5 0 01-1.5 1.5h-2A1.5 1.5 0 0111 9.5v-2zM0 13.5A1.5 1.5 0 011.5 12h2A1.5 1.5 0 015 13.5v2A1.5 1.5 0 013.5 17h-2A1.5 1.5 0 010 15.5v-2zm6 0A1.5 1.5 0 017.5 12h2a1.5 1.5 0 011.5 1.5v2A1.5 1.5 0 019.5 17h-2A1.5 1.5 0 016 15.5v-2zm5 0a1.5 1.5 0 011.5-1.5h2a1.5 1.5 0 011.5 1.5v2a1.5 1.5 0 01-1.5 1.5h-2a1.5 1.5 0 01-1.5-1.5v-2z"/>
       </svg>
-      Sessions
+      <span class="nav-label">Sessions</span>
     </button>
 
     <button
       class="nav-btn"
-      class:active={router.route === "pinned"}
-      onclick={() => router.navigate("pinned")}
-      title="Pinned Messages"
+      class:active={router.route === "usage"}
+      onclick={() => router.navigate("usage")}
+      title="Token Usage"
+      aria-label="Usage"
     >
       <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-        <path d="M4.146.146A.5.5 0 014.5 0h7a.5.5 0 01.5.5c0 .68-.342 1.174-.646 1.479-.126.125-.25.224-.354.298v4.431l.078.048c.203.127.476.314.751.555C12.36 7.775 13 8.527 13 9.5a.5.5 0 01-.5.5H8.5v5.5a.5.5 0 01-1 0V10H3.5a.5.5 0 01-.5-.5c0-.973.64-1.725 1.17-2.189A6 6 0 015 6.708V2.277a3 3 0 01-.354-.298C4.342 1.674 4 1.179 4 .5a.5.5 0 01.146-.354z"/>
+        <path d="M1 2.5A1.5 1.5 0 012.5 1h3A1.5 1.5 0 017 2.5v3A1.5 1.5 0 015.5 7h-3A1.5 1.5 0 011 5.5v-3zM2.5 2a.5.5 0 00-.5.5v3a.5.5 0 00.5.5h3a.5.5 0 00.5-.5v-3a.5.5 0 00-.5-.5h-3zm6.5.5A1.5 1.5 0 0110.5 1h3A1.5 1.5 0 0115 2.5v3A1.5 1.5 0 0113.5 7h-3A1.5 1.5 0 019 5.5v-3zm1.5-.5a.5.5 0 00-.5.5v3a.5.5 0 00.5.5h3a.5.5 0 00.5-.5v-3a.5.5 0 00-.5-.5h-3zM1 10.5A1.5 1.5 0 012.5 9h3A1.5 1.5 0 017 10.5v3A1.5 1.5 0 015.5 15h-3A1.5 1.5 0 011 13.5v-3zm1.5-.5a.5.5 0 00-.5.5v3a.5.5 0 00.5.5h3a.5.5 0 00.5-.5v-3a.5.5 0 00-.5-.5h-3zm6.5.5A1.5 1.5 0 0110.5 9h3a1.5 1.5 0 011.5 1.5v3a1.5 1.5 0 01-1.5 1.5h-3A1.5 1.5 0 019 13.5v-3zm1.5-.5a.5.5 0 00-.5.5v3a.5.5 0 00.5.5h3a.5.5 0 00.5-.5v-3a.5.5 0 00-.5-.5h-3z"/>
       </svg>
-      Pinned
+      <span class="nav-label">Usage</span>
     </button>
 
-    <button
-      class="nav-btn"
-      class:active={router.route === "insights"}
-      onclick={() => router.navigate("insights")}
-      title="Insights"
-    >
-      <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-        <path d="M14.5 3a.5.5 0 01.5.5v9a.5.5 0 01-.5.5h-13a.5.5 0 01-.5-.5v-9a.5.5 0 01.5-.5h13zm-13-1A1.5 1.5 0 000 3.5v9A1.5 1.5 0 001.5 14h13a1.5 1.5 0 001.5-1.5v-9A1.5 1.5 0 0014.5 2h-13z"/>
-        <path d="M3 5.5a.5.5 0 01.5-.5h9a.5.5 0 010 1h-9a.5.5 0 01-.5-.5zM3 8a.5.5 0 01.5-.5h9a.5.5 0 010 1h-9A.5.5 0 013 8zm0 2.5a.5.5 0 01.5-.5h6a.5.5 0 010 1h-6a.5.5 0 01-.5-.5z"/>
-      </svg>
-      Insights
-    </button>
-
-    <button
-      class="nav-btn"
-      class:active={router.route === "trash"}
-      onclick={() => router.navigate("trash")}
-      title="Trash"
-    >
-      <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-        <path d="M5.5 5.5A.5.5 0 016 6v6a.5.5 0 01-1 0V6a.5.5 0 01.5-.5zm2.5 0a.5.5 0 01.5.5v6a.5.5 0 01-1 0V6a.5.5 0 01.5-.5zm3 .5a.5.5 0 00-1 0v6a.5.5 0 001 0V6z"/>
-        <path fill-rule="evenodd" d="M14.5 3a1 1 0 01-1 1H13v9a2 2 0 01-2 2H5a2 2 0 01-2-2V4h-.5a1 1 0 01-1-1V2a1 1 0 011-1H5.5l1-1h3l1 1h2.5a1 1 0 011 1v1zM4.118 4L4 4.059V13a1 1 0 001 1h6a1 1 0 001-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
-      </svg>
-      Trash
-    </button>
+    <div class="more-wrap">
+      <button
+        class="nav-btn"
+        class:active={router.route === "pinned" || router.route === "insights" || router.route === "trash" || moreOpen}
+        bind:this={moreBtnRef}
+        onclick={() => { moreOpen = !moreOpen; }}
+        aria-label="More navigation"
+        aria-expanded={moreOpen}
+      >
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+          <path d="M3 9.5a1.5 1.5 0 110-3 1.5 1.5 0 010 3zm5 0a1.5 1.5 0 110-3 1.5 1.5 0 010 3zm5 0a1.5 1.5 0 110-3 1.5 1.5 0 010 3z"/>
+        </svg>
+        <span class="nav-label">More</span>
+      </button>
+      {#if moreOpen}
+        <div class="more-dropdown" role="menu" bind:this={moreDropRef}>
+          <button class="more-item" role="menuitem"
+            class:active={router.route === "pinned"}
+            onclick={() => { router.navigate("pinned"); moreOpen = false; }}>
+            Pinned
+          </button>
+          <button class="more-item" role="menuitem"
+            class:active={router.route === "insights"}
+            onclick={() => { router.navigate("insights"); moreOpen = false; }}>
+            Insights
+          </button>
+          <button class="more-item" role="menuitem"
+            class:active={router.route === "trash"}
+            onclick={() => { router.navigate("trash"); moreOpen = false; }}>
+            Trash
+          </button>
+        </div>
+      {/if}
+    </div>
   </div>
 
   <button
@@ -170,57 +257,81 @@
 
   <div class="header-right">
     {#if hasActiveSession}
-      <div class="block-filter-wrap">
+      <!-- Transcript controls: mode pills + filter, grouped visually -->
+      <div class="transcript-strip">
         <button
-          class="header-btn"
-          class:active={ui.hasBlockFilters}
-          bind:this={filterBtnRef}
-          onclick={() => (showBlockFilter = !showBlockFilter)}
-          title="Filter block types"
-          aria-label="Filter block types"
+          class="pill"
+          class:active={ui.transcriptMode === "normal"}
+          onclick={() => ui.setTranscriptMode("normal")}
+          title="Normal transcript — show all messages"
+          aria-label="Normal transcript mode"
         >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
-          </svg>
-          {#if ui.hasBlockFilters}
-            <span class="block-filter-badge">{ui.hiddenBlockCount}</span>
-          {/if}
+          <span class="pill-label">Normal</span>
+        </button>
+        <button
+          class="pill"
+          class:active={ui.transcriptMode === "focused"}
+          onclick={() => ui.setTranscriptMode("focused")}
+          title="Focused transcript — user prompts and final answers only"
+          aria-label="Focused transcript mode"
+        >
+          <span class="pill-label">Focused</span>
         </button>
 
-        {#if showBlockFilter}
-          <div class="block-filter-dropdown" bind:this={filterDropRef}>
-            <div class="block-filter-title">Block Visibility</div>
-            {#each ALL_BLOCK_TYPES as bt}
-              {@const visible = ui.isBlockVisible(bt)}
-              <button
-                class="block-filter-item"
-                class:active={visible}
-                onclick={() => ui.toggleBlock(bt)}
-              >
-                <span
-                  class="block-filter-dot"
-                  style:background={visible ? BLOCK_COLORS[bt] : "var(--border-muted)"}
-                ></span>
-                <span class="block-filter-label">{BLOCK_LABELS[bt]}</span>
-                <span class="block-filter-check" class:on={visible}>
-                  {#if visible}
-                    <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
-                      <path d="M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z"/>
-                    </svg>
-                  {/if}
-                </span>
-              </button>
-            {/each}
+        <span class="strip-divider"></span>
+
+        <div class="filter-wrap">
+          <button
+            class="pill pill-icon"
+            class:filter-active={ui.hasBlockFilters}
+            bind:this={filterBtnRef}
+            onclick={() => (showBlockFilter = !showBlockFilter)}
+            title="Filter block types"
+            aria-label="Filter block types"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
+            </svg>
             {#if ui.hasBlockFilters}
-              <button
-                class="block-filter-reset"
-                onclick={() => ui.showAllBlocks()}
-              >
-                Show all
-              </button>
+              <span class="filter-badge">{ui.hiddenBlockCount}</span>
             {/if}
-          </div>
-        {/if}
+          </button>
+
+          {#if showBlockFilter}
+            <div class="block-filter-dropdown" bind:this={filterDropRef}>
+              <div class="block-filter-title">Block Visibility</div>
+              {#each ALL_BLOCK_TYPES as bt}
+                {@const visible = ui.isBlockVisible(bt)}
+                <button
+                  class="block-filter-item"
+                  class:active={visible}
+                  onclick={() => ui.toggleBlock(bt)}
+                >
+                  <span
+                    class="block-filter-dot"
+                    style:background={visible ? BLOCK_COLORS[bt] : "var(--border-muted)"}
+                  ></span>
+                  <span class="block-filter-label">{BLOCK_LABELS[bt]}</span>
+                  <span class="block-filter-check" class:on={visible}>
+                    {#if visible}
+                      <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
+                        <path d="M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z"/>
+                      </svg>
+                    {/if}
+                  </span>
+                </button>
+              {/each}
+              {#if ui.hasBlockFilters}
+                <button
+                  class="block-filter-reset"
+                  onclick={() => ui.showAllBlocks()}
+                >
+                  Show all
+                </button>
+              {/if}
+            </div>
+          {/if}
+        </div>
       </div>
 
       <button
@@ -253,25 +364,23 @@
         {/if}
       </button>
 
+      <!-- Layout, export, publish: collapse into overflow at narrow widths -->
       <button
-        class="header-btn"
+        class="header-btn collapsible"
         onclick={() => ui.cycleLayout()}
         title="Cycle layout: {ui.messageLayout} (l)"
         aria-label="Cycle message layout"
       >
         {#if ui.messageLayout === "default"}
-          <!-- Default: cards/bordered -->
           <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
             <path d="M1.5 2A1.5 1.5 0 000 3.5v2A1.5 1.5 0 001.5 7h13A1.5 1.5 0 0016 5.5v-2A1.5 1.5 0 0014.5 2h-13zm0 1h13a.5.5 0 01.5.5v2a.5.5 0 01-.5.5h-13a.5.5 0 01-.5-.5v-2a.5.5 0 01.5-.5zm0 6A1.5 1.5 0 000 10.5v2A1.5 1.5 0 001.5 14h13a1.5 1.5 0 001.5-1.5v-2A1.5 1.5 0 0014.5 9h-13zm0 1h13a.5.5 0 01.5.5v2a.5.5 0 01-.5.5h-13a.5.5 0 01-.5-.5v-2a.5.5 0 01.5-.5z"/>
           </svg>
         {:else if ui.messageLayout === "compact"}
-          <!-- Compact: terminal lines -->
           <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
             <path d="M3 4l4 4-4 4" stroke="currentColor" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
             <line x1="9" y1="12" x2="14" y2="12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
           </svg>
         {:else}
-          <!-- Stream: continuous flow -->
           <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
             <rect x="1" y="1" width="14" height="4" rx="1" opacity="0.2"/>
             <rect x="1" y="6" width="14" height="4" rx="1" opacity="0.08"/>
@@ -281,7 +390,7 @@
       </button>
 
       <button
-        class="header-btn"
+        class="header-btn collapsible"
         onclick={handleExport}
         disabled={!sessions.activeSessionId}
         title="Export session (e)"
@@ -294,7 +403,7 @@
       </button>
 
       <button
-        class="header-btn"
+        class="header-btn collapsible"
         onclick={handleDownloadRaw}
         disabled={!sessions.activeSessionId}
         title="Download raw session file"
@@ -307,7 +416,7 @@
       </button>
 
       <button
-        class="header-btn"
+        class="header-btn collapsible"
         onclick={() => (ui.activeModal = "publish")}
         disabled={!sessions.activeSessionId}
         title="Publish to Gist (p)"
@@ -317,6 +426,63 @@
           <path d="M3.5 13h9a.5.5 0 010 1h-9a.5.5 0 010-1zm4.854-9.354a.5.5 0 00-.708 0l-3 3a.5.5 0 10.708.708L7.5 5.207V11.5a.5.5 0 001 0V5.207l2.146 2.147a.5.5 0 00.708-.708l-3-3z"/>
         </svg>
       </button>
+
+      <!-- Overflow menu (visible only at narrow widths) -->
+      <div class="overflow-wrap">
+        <button
+          class="header-btn overflow-btn"
+          bind:this={overflowBtnRef}
+          onclick={() => (showOverflow = !showOverflow)}
+          title="More actions"
+          aria-label="More actions"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M3 8a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0zm6.5 0a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0zm5 1.5a1.5 1.5 0 100-3 1.5 1.5 0 000 3z"/>
+          </svg>
+        </button>
+
+        {#if showOverflow}
+          <div class="overflow-dropdown" bind:this={overflowDropRef}>
+            <button
+              class="overflow-item"
+              onclick={() => { ui.cycleLayout(); showOverflow = false; }}
+            >
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
+                {#if ui.messageLayout === "default"}
+                  <path d="M1.5 2A1.5 1.5 0 000 3.5v2A1.5 1.5 0 001.5 7h13A1.5 1.5 0 0016 5.5v-2A1.5 1.5 0 0014.5 2h-13zm0 1h13a.5.5 0 01.5.5v2a.5.5 0 01-.5.5h-13a.5.5 0 01-.5-.5v-2a.5.5 0 01.5-.5zm0 6A1.5 1.5 0 000 10.5v2A1.5 1.5 0 001.5 14h13a1.5 1.5 0 001.5-1.5v-2A1.5 1.5 0 0014.5 9h-13zm0 1h13a.5.5 0 01.5.5v2a.5.5 0 01-.5.5h-13a.5.5 0 01-.5-.5v-2a.5.5 0 01.5-.5z"/>
+                {:else if ui.messageLayout === "compact"}
+                  <path d="M3 4l4 4-4 4" stroke="currentColor" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                  <line x1="9" y1="12" x2="14" y2="12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                {:else}
+                  <rect x="1" y="1" width="14" height="4" rx="1" opacity="0.2"/>
+                  <rect x="1" y="6" width="14" height="4" rx="1" opacity="0.08"/>
+                  <rect x="1" y="11" width="14" height="4" rx="1" opacity="0.2"/>
+                {/if}
+              </svg>
+              <span>Layout: {ui.messageLayout}</span>
+            </button>
+            <button
+              class="overflow-item"
+              onclick={() => { handleExport(); showOverflow = false; }}
+            >
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
+                <path d="M4.406 1.342A5.53 5.53 0 018 0c2.69 0 4.923 2 5.166 4.579C14.758 4.804 16 6.137 16 7.773 16 9.569 14.502 11 12.687 11H10a.5.5 0 010-1h2.688C13.979 10 15 8.988 15 7.773c0-1.216-1.02-2.228-2.313-2.228h-.5v-.5C12.188 2.825 10.328 1 8 1a4.53 4.53 0 00-2.941 1.1c-.757.652-1.153 1.438-1.153 2.055v.448l-.445.049C2.064 4.805 1 5.952 1 7.318 1 8.785 2.23 10 3.781 10H6a.5.5 0 010 1H3.781C1.708 11 0 9.366 0 7.318c0-1.763 1.266-3.223 2.942-3.593.143-.863.698-1.723 1.464-2.383z"/>
+                <path d="M7.646 4.146a.5.5 0 01.708 0l3 3a.5.5 0 01-.708.708L8.5 5.707V14.5a.5.5 0 01-1 0V5.707L5.354 7.854a.5.5 0 11-.708-.708l3-3z"/>
+              </svg>
+              <span>Export session</span>
+            </button>
+            <button
+              class="overflow-item"
+              onclick={() => { ui.activeModal = "publish"; showOverflow = false; }}
+            >
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
+                <path d="M3.5 13h9a.5.5 0 010 1h-9a.5.5 0 010-1zm4.854-9.354a.5.5 0 00-.708 0l-3 3a.5.5 0 10.708.708L7.5 5.207V11.5a.5.5 0 001 0V5.207l2.146 2.147a.5.5 0 00.708-.708l-3-3z"/>
+              </svg>
+              <span>Publish to Gist</span>
+            </button>
+          </div>
+        {/if}
+      </div>
     {/if}
 
     <button
@@ -330,6 +496,19 @@
       <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
         <path d="M8 3a5 5 0 00-4.546 2.914.5.5 0 01-.908-.418A6 6 0 0114 8a.5.5 0 01-1 0 5 5 0 00-5-5zm4.546 7.086a.5.5 0 01.908.418A6 6 0 012 8a.5.5 0 011 0 5 5 0 005 5 5 5 0 004.546-2.914z"/>
       </svg>
+    </button>
+
+    <button
+      class="import-btn"
+      onclick={() => showImportModal = true}
+      title="Import conversations"
+      aria-label="Import conversations"
+    >
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+        <path d="M2.75 14A1.75 1.75 0 011 12.25v-2.5a.75.75 0 011.5 0v2.5c0 .138.112.25.25.25h10.5a.25.25 0 00.25-.25v-2.5a.75.75 0 011.5 0v2.5A1.75 1.75 0 0113.25 14H2.75z"/>
+        <path d="M11.78 4.72a.75.75 0 00-1.06 0L8.75 6.69V1.5a.75.75 0 00-1.5 0v5.19L5.28 4.72a.75.75 0 00-1.06 1.06l3.25 3.25a.75.75 0 001.06 0l3.25-3.25a.75.75 0 000-1.06z"/>
+      </svg>
+      <span class="import-label">Import</span>
     </button>
 
     <span class="header-divider"></span>
@@ -373,23 +552,32 @@
   </div>
 </header>
 
+<ImportModal
+  bind:open={showImportModal}
+  onclose={() => showImportModal = false}
+  onimported={() => {
+    sessions.invalidateFilterCaches();
+    sessions.load();
+  }}
+/>
+
 <style>
   .header {
-    height: 40px;
+    height: var(--header-height, 40px);
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0 14px;
+    padding: 0 10px;
     background: var(--bg-surface);
     border-bottom: 1px solid var(--border-default);
     flex-shrink: 0;
-    gap: 10px;
+    gap: 8px;
   }
 
   .header-left {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
     min-width: 0;
   }
 
@@ -419,7 +607,7 @@
     letter-spacing: -0.01em;
   }
 
-.nav-btn {
+  .nav-btn {
     height: 26px;
     display: flex;
     align-items: center;
@@ -446,6 +634,49 @@
       var(--accent-blue) 8%,
       transparent
     );
+  }
+
+  .more-wrap {
+    position: relative;
+  }
+
+  .more-dropdown {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    min-width: 140px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+    display: flex;
+    flex-direction: column;
+    padding: 4px;
+    z-index: 20;
+    animation: dropdown-in 0.12s ease-out;
+  }
+
+  .more-item {
+    padding: 6px 10px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    border-radius: var(--radius-sm);
+    text-align: left;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    transition: background 0.08s, color 0.08s;
+  }
+
+  .more-item:hover {
+    background: var(--bg-surface-hover);
+    color: var(--text-primary);
+  }
+
+  .more-item.active {
+    color: var(--text-primary);
+    font-weight: 500;
+    background: var(--bg-inset);
   }
 
   .search-hint {
@@ -488,61 +719,93 @@
     display: flex;
     align-items: center;
     gap: 2px;
+    flex-shrink: 0;
   }
 
-  .header-btn {
-    width: 28px;
-    height: 28px;
+  /* ── Transcript strip: mode pills + filter ── */
+  .transcript-strip {
+    display: flex;
+    align-items: stretch;
+    height: 26px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    margin-right: 4px;
+    flex-shrink: 0;
+  }
+
+  .filter-wrap {
+    position: relative;
+    display: flex;
+  }
+
+  .pill {
+    height: 100%;
     display: flex;
     align-items: center;
     justify-content: center;
-    border-radius: var(--radius-sm);
+    padding: 0 9px;
+    font-size: 11px;
+    font-weight: 500;
     color: var(--text-muted);
-    font-size: 12px;
-    font-weight: 600;
-    transition: background 0.12s, color 0.12s;
+    background: transparent;
+    transition: background 0.1s, color 0.1s;
+    white-space: nowrap;
+    cursor: pointer;
+    border: none;
+    border-radius: 0;
   }
 
-  .header-btn:hover:not(:disabled) {
+  .pill:hover {
     background: var(--bg-surface-hover);
     color: var(--text-secondary);
   }
 
-  .header-btn.active {
-    color: var(--accent-purple);
+  .pill.active {
+    background: color-mix(
+      in srgb,
+      var(--accent-blue) 12%,
+      transparent
+    );
+    color: var(--accent-blue);
+    font-weight: 600;
   }
 
-  .header-btn.syncing {
-    animation: spin 1s linear infinite;
+  /* Match parent's border-radius on outer edges */
+  .pill:first-child {
+    border-radius: var(--radius-sm) 0 0 var(--radius-sm);
   }
 
-  .header-divider {
-    width: 1px;
-    height: 14px;
-    background: var(--border-muted);
-    margin: 0 2px;
-    flex-shrink: 0;
-  }
-
-  @keyframes spin {
-    from { transform: rotate(0deg); }
-    to { transform: rotate(360deg); }
-  }
-
-  .block-filter-wrap {
+  .pill-icon {
+    padding: 0 7px;
     position: relative;
   }
 
-  .block-filter-badge {
+  .filter-wrap:last-child .pill {
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  }
+
+  .pill.filter-active {
+    color: var(--accent-purple);
+  }
+
+  .strip-divider {
+    width: 1px;
+    height: 14px;
+    background: var(--border-default);
+    flex-shrink: 0;
+    align-self: center;
+  }
+
+  .filter-badge {
     position: absolute;
-    top: 1px;
-    right: 1px;
-    width: 12px;
-    height: 12px;
+    top: 0px;
+    right: 0px;
+    width: 11px;
+    height: 11px;
     border-radius: 50%;
     background: var(--accent-amber);
     color: white;
-    font-size: 8px;
+    font-size: 7px;
     font-weight: 700;
     display: flex;
     align-items: center;
@@ -551,6 +814,7 @@
     pointer-events: none;
   }
 
+  /* ── Block filter dropdown ── */
   .block-filter-dropdown {
     position: absolute;
     top: 100%;
@@ -644,5 +908,230 @@
 
   .block-filter-reset:hover {
     color: var(--text-primary);
+  }
+
+  /* ── Header icon buttons ── */
+  .header-btn {
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 600;
+    transition: background 0.12s, color 0.12s;
+    flex-shrink: 0;
+  }
+
+  .header-btn:hover:not(:disabled) {
+    background: var(--bg-surface-hover);
+    color: var(--text-secondary);
+  }
+
+  .header-btn.active {
+    color: var(--accent-purple);
+  }
+
+  .header-btn.syncing {
+    animation: spin 1s linear infinite;
+  }
+
+  /* ── Import button (icon + label) ── */
+  .import-btn {
+    height: 26px;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0 10px;
+    border-radius: var(--radius-sm);
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-muted);
+    white-space: nowrap;
+    transition: background 0.12s, color 0.12s;
+  }
+
+  .import-btn:hover {
+    background: var(--bg-surface-hover);
+    color: var(--text-primary);
+  }
+
+  .header-divider {
+    width: 1px;
+    height: 14px;
+    background: var(--border-muted);
+    margin: 0 2px;
+    flex-shrink: 0;
+  }
+
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+
+  .hamburger {
+    display: flex;
+    width: 28px;
+    height: 28px;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    transition: background 0.12s, color 0.12s;
+  }
+
+  .hamburger:hover {
+    background: var(--bg-surface-hover);
+    color: var(--text-primary);
+  }
+
+  /* ── Overflow menu (narrow viewports) ── */
+  .overflow-wrap {
+    position: relative;
+    display: none;
+  }
+
+  .overflow-dropdown {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 4px;
+    width: 180px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-lg);
+    padding: 4px 0;
+    z-index: 100;
+    animation: dropdown-in 0.12s ease-out;
+    transform-origin: top right;
+  }
+
+  .overflow-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 6px 12px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    text-align: left;
+    transition: background 0.08s;
+    white-space: nowrap;
+  }
+
+  .overflow-item:hover {
+    background: var(--bg-surface-hover);
+    color: var(--text-primary);
+  }
+
+  .overflow-item svg {
+    flex-shrink: 0;
+    color: var(--text-muted);
+  }
+
+  /* ── Responsive ── */
+
+  /* 1024px: Hide nav button labels + search text/kbd */
+  @media (max-width: 1023px) {
+    .nav-label,
+    .import-label {
+      display: none;
+    }
+
+    .search-hint-text {
+      display: none;
+    }
+
+    .search-hint-kbd {
+      display: none;
+    }
+
+    .hamburger {
+      display: flex;
+    }
+  }
+
+  /* 767px: Hide nav buttons and typeahead */
+  @media (max-width: 767px) {
+    .header-left .nav-btn,
+    .header-left .more-wrap {
+      display: none;
+    }
+
+    .header-left :global(.typeahead) {
+      display: none;
+    }
+  }
+
+  /* 699px: Collapse layout/export/publish into overflow menu */
+  @media (max-width: 699px) {
+    .collapsible {
+      display: none;
+    }
+
+    .overflow-wrap {
+      display: block;
+    }
+
+    .pill-label {
+      font-size: 0;
+    }
+
+    /* Show first letter only via data attrs */
+    .pill:nth-child(1) .pill-label::after {
+      content: "N";
+      font-size: 11px;
+    }
+
+    .pill:nth-child(2) .pill-label::after {
+      content: "F";
+      font-size: 11px;
+    }
+
+    .pill {
+      padding: 0 7px;
+    }
+  }
+
+  /* 549px: Minimal mode — collapse further */
+  @media (max-width: 549px) {
+    .header-title {
+      display: none;
+    }
+
+    .search-hint {
+      padding: 0 8px;
+    }
+
+    .header {
+      padding: 0 6px;
+      gap: 4px;
+    }
+
+    .header-left {
+      gap: 6px;
+    }
+  }
+
+  /* Touch targets for coarse pointers */
+  @media (pointer: coarse) {
+    .header-btn,
+    .nav-btn,
+    .hamburger,
+    .import-btn {
+      min-width: 44px;
+      min-height: 44px;
+    }
+
+    .transcript-strip {
+      min-height: 44px;
+    }
+
+    .pill {
+      min-height: 44px;
+    }
   }
 </style>

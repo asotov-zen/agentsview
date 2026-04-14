@@ -11,7 +11,13 @@ LDFLAGS := -X main.version=$(VERSION) \
 LDFLAGS_RELEASE := $(LDFLAGS) -s -w
 DESKTOP_DIST_DIR := dist/desktop
 
-.PHONY: build build-release install frontend frontend-dev dev desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app test test-short test-postgres test-postgres-ci postgres-up postgres-down e2e vet lint tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir help
+GOPATH_FIRST := $(shell go env GOPATH | cut -d: -f1)
+AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
+	elif [ -n "$$(go env GOBIN)" ] && [ -x "$$(go env GOBIN)/air" ]; then printf "%s" "$$(go env GOBIN)/air"; \
+	elif [ -x "$(GOPATH_FIRST)/bin/air" ]; then printf "%s" "$(GOPATH_FIRST)/bin/air"; \
+	fi)
+
+.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app test test-short test-postgres test-postgres-ci postgres-up postgres-down e2e vet lint lint-ci tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir help
 
 # Ensure go:embed has at least one file (no-op if frontend is built)
 ensure-embed-dir:
@@ -55,9 +61,21 @@ frontend:
 frontend-dev:
 	cd frontend && npm run dev
 
-# Run Go server in dev mode (no embedded frontend)
-dev: ensure-embed-dir
-	go run -tags fts5 -ldflags="$(LDFLAGS)" ./cmd/agentsview $(ARGS)
+# Ensure air is installed for backend live reload
+check-air:
+	@if [ -z "$(AIR_BIN)" ]; then \
+		echo "air not found. Install with: make air-install" >&2; \
+		exit 1; \
+	fi
+
+# Install air for backend live reload
+air-install:
+	go install github.com/air-verse/air@latest
+
+# Run Go server in dev mode with live reload (use with frontend-dev).
+# Edits to .go files trigger a rebuild + restart via air.
+dev: ensure-embed-dir check-air
+	"$(AIR_BIN)" -c .air.toml -- $(ARGS)
 
 # Run the Tauri desktop wrapper in development mode
 desktop-dev:
@@ -168,8 +186,16 @@ e2e:
 vet: ensure-embed-dir
 	go vet -tags fts5 ./...
 
-# Lint Go code with project defaults
+# Lint Go code and auto-fix where possible (local development)
 lint: ensure-embed-dir
+	@if ! command -v golangci-lint >/dev/null 2>&1; then \
+		echo "golangci-lint not found. Install with: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.10.1" >&2; \
+		exit 1; \
+	fi
+	golangci-lint run --fix ./...
+
+# Lint Go code without fixing (for CI)
+lint-ci: ensure-embed-dir
 	@if ! command -v golangci-lint >/dev/null 2>&1; then \
 		echo "golangci-lint not found. Install with: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.10.1" >&2; \
 		exit 1; \
@@ -183,7 +209,7 @@ tidy:
 # Clean build artifacts
 clean:
 	rm -f agentsview agentsv
-	rm -rf internal/web/dist dist/
+	rm -rf internal/web/dist dist/ tmp/
 
 # Build release binary for current platform (CGO required for sqlite3)
 release: frontend
@@ -211,16 +237,13 @@ release-linux-amd64: frontend
 		-ldflags="$(LDFLAGS_RELEASE)" -trimpath \
 		-o dist/agentsview-linux-amd64 ./cmd/agentsview
 
-# Install pre-commit hook, resolving the hooks directory via git so
-# this works in both normal repos and linked worktrees
+# Install pre-commit hooks via prek
 install-hooks:
-	@hooks_rel=$$(git rev-parse --git-path hooks) && \
-		hooks_dir=$$(cd "$$(dirname "$$hooks_rel")" && echo "$$PWD/$$(basename "$$hooks_rel")") && \
-		git config --local core.hooksPath "$$hooks_dir" && \
-		mkdir -p "$$hooks_dir" && \
-		cp .githooks/pre-commit "$$hooks_dir/pre-commit" && \
-		chmod +x "$$hooks_dir/pre-commit" && \
-		echo "Installed pre-commit hook to $$hooks_dir/pre-commit"
+	@if ! command -v prek >/dev/null 2>&1; then \
+		echo "prek not found. Install with: brew install prek" >&2; \
+		exit 1; \
+	fi
+	prek install -f
 
 # Show help
 help:
@@ -230,7 +253,8 @@ help:
 	@echo "  build-release  - Release build (optimized, stripped)"
 	@echo "  install        - Build and install to ~/.local/bin or GOPATH"
 	@echo ""
-	@echo "  dev            - Run Go server (use with frontend-dev)"
+	@echo "  dev            - Run Go server with live reload via air (use with frontend-dev)"
+	@echo "  air-install    - Install air for backend live reload"
 	@echo "  frontend       - Build frontend SPA"
 	@echo "  frontend-dev   - Run Vite dev server"
 	@echo "  desktop-dev    - Run Tauri desktop wrapper in dev mode"
@@ -248,7 +272,8 @@ help:
 	@echo "  postgres-down  - Stop test PostgreSQL container"
 	@echo "  e2e            - Run Playwright E2E tests"
 	@echo "  vet            - Run go vet"
-	@echo "  lint           - Run golangci-lint"
+	@echo "  lint           - Run golangci-lint (auto-fix)"
+	@echo "  lint-ci        - Run golangci-lint (no fix, for CI)"
 	@echo "  tidy           - Tidy go.mod"
 	@echo ""
 	@echo "  release        - Release build for current platform"

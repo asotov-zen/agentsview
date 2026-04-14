@@ -3,7 +3,7 @@
   import { sessions, isRecentlyActive } from "../../stores/sessions.svelte.js";
   import { starred } from "../../stores/starred.svelte.js";
   import { formatRelativeTime, truncate } from "../../utils/format.js";
-  import { agentColor as getAgentColor } from "../../utils/agents.js";
+  import { agentColor as getAgentColor, agentLabel } from "../../utils/agents.js";
 
   interface Props {
     session: Session;
@@ -59,6 +59,12 @@
 
   let agentColor = $derived(
     getAgentColor(session.agent),
+  );
+
+  let showMachine = $derived(
+    !compact &&
+    !!session.machine &&
+    session.machine !== "local",
   );
 
   /** Whether this session is a team member (received a <teammate-message>). */
@@ -290,12 +296,12 @@
       <span class="session-time">{timeStr}</span>
       <span class="session-count">{session.user_message_count}</span>
       {#if hasSubagents}
-        <svg class="group-hint-icon" width="9" height="9" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" title="Has subagents">
+        <svg class="group-hint-icon" width="9" height="9" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
           <path d="M10.56 7.01A3.5 3.5 0 108 0a3.5 3.5 0 002.56 7.01zM8 8.5c-2.7 0-5 1.7-5 4v.75c0 .41.34.75.75.75h8.5c.41 0 .75-.34.75-.75v-.75c0-2.3-2.3-4-5-4z"/>
         </svg>
       {/if}
       {#if hasTeammates}
-        <svg class="group-hint-icon" width="11" height="9" viewBox="0 0 20 16" fill="currentColor" aria-hidden="true" title="Has team">
+        <svg class="group-hint-icon" width="11" height="9" viewBox="0 0 20 16" fill="currentColor" aria-hidden="true">
           <path d="M7.56 7.01A3.5 3.5 0 105 0a3.5 3.5 0 002.56 7.01zM5 8.5c-2.7 0-5 1.7-5 4v.75c0 .41.34.75.75.75h8.5c.41 0 .75-.34.75-.75v-.75c0-2.3-2.3-4-5-4z"/>
           <path d="M17.56 7.01A3.5 3.5 0 1015 0a3.5 3.5 0 002.56 7.01zM15 8.5c-2.7 0-5 1.7-5 4v.75c0 .41.34.75.75.75h8.5c.41 0 .75-.34.75-.75v-.75c0-2.3-2.3-4-5-4z" opacity="0.6"/>
         </svg>
@@ -325,8 +331,17 @@
       {/if}
     </button>
   {/if}
-  {#if !hideAgent && !compact}
-    <span class="agent-tag" style:color={agentColor}>{session.agent}</span>
+  {#if !compact && (!hideAgent || showMachine)}
+    <div class="side-meta">
+      {#if !hideAgent}
+        <span class="agent-tag" style:color={agentColor}>{agentLabel(session.agent)}</span>
+      {/if}
+      {#if showMachine}
+        <span class="machine-tag" title={session.machine}>
+          {truncate(session.machine, 18)}
+        </span>
+      {/if}
+    </div>
   {/if}
 </div>
 
@@ -449,9 +464,18 @@
     }
   }
 
+  .side-meta {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 3px;
+    min-width: 0;
+    flex-shrink: 0;
+    margin-left: 4px;
+  }
+
   /* Agent tag on the right side */
   .agent-tag {
-    flex-shrink: 0;
     font-size: 8px;
     font-weight: 600;
     text-transform: uppercase;
@@ -460,6 +484,17 @@
     opacity: 0.7;
     white-space: nowrap;
     max-width: 52px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .machine-tag {
+    font-size: 9px;
+    line-height: 1;
+    color: var(--text-muted);
+    opacity: 0.9;
+    white-space: nowrap;
+    max-width: 74px;
     overflow: hidden;
     text-overflow: ellipsis;
   }

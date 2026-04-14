@@ -6,13 +6,17 @@
   import StatusBar from "./lib/components/layout/StatusBar.svelte";
   import SessionList from "./lib/components/sidebar/SessionList.svelte";
   import MessageList from "./lib/components/content/MessageList.svelte";
+  import ActivityMinimap from "./lib/components/content/ActivityMinimap.svelte";
+  import { sessionActivity } from "./lib/stores/sessionActivity.svelte.js";
   import CommandPalette from "./lib/components/command-palette/CommandPalette.svelte";
   import AboutModal from "./lib/components/modals/AboutModal.svelte";
   import ShortcutsModal from "./lib/components/modals/ShortcutsModal.svelte";
   import PublishModal from "./lib/components/modals/PublishModal.svelte";
   import ResyncModal from "./lib/components/modals/ResyncModal.svelte";
   import UpdateModal from "./lib/components/modals/UpdateModal.svelte";
+  import ConfirmDeleteModal from "./lib/components/modals/ConfirmDeleteModal.svelte";
   import AnalyticsPage from "./lib/components/analytics/AnalyticsPage.svelte";
+  import UsagePage from "./lib/components/usage/UsagePage.svelte";
   import InsightsPage from "./lib/components/insights/InsightsPage.svelte";
   import PinnedPage from "./lib/components/pinned/PinnedPage.svelte";
   import TrashPage from "./lib/components/trash/TrashPage.svelte";
@@ -25,8 +29,10 @@
   import { starred } from "./lib/stores/starred.svelte.js";
   import { pins } from "./lib/stores/pins.svelte.js";
   import { settings } from "./lib/stores/settings.svelte.js";
-  import { setAuthToken, getAuthToken, setServerUrl } from "./lib/api/client.js";
+  import { setAuthToken, getAuthToken, setServerUrl, getBase } from "./lib/api/client.js";
+  import { setupVisibilityHealthCheck } from "./lib/utils/health.js";
   import { registerShortcuts } from "./lib/utils/keyboard.js";
+  import { shouldAutoSwitchTranscriptModeToNormal } from "./lib/utils/transcript-mode.js";
 
   let globalAuthToken: string = $state("");
 
@@ -48,6 +54,7 @@
     | {
         scrollToOrdinal: (o: number) => void;
         getDisplayItems: () => DisplayItem[];
+        getNormalDisplayItems: () => DisplayItem[];
       }
     | undefined = $state(undefined);
 
@@ -72,15 +79,24 @@
         ui.pendingScrollSession = null;
       }
       if (id) {
+        if (ui.isMobileViewport) {
+          ui.closeSidebar();
+        }
         messages.loadSession(id);
         sessions.loadChildSessions(id);
         sync.watchSession(id, () => {
           messages.reload();
           sessions.refreshActiveSession();
           sessions.loadChildSessions(id);
+          if (ui.activityMinimapOpen) {
+            sessionActivity.reload(id);
+          } else {
+            sessionActivity.invalidate();
+          }
         });
         pins.loadForSession(id);
       } else {
+        sessionActivity.clear();
         messages.clear();
         sessions.childSessions = new Map();
         sync.unwatchSession();
@@ -102,11 +118,25 @@
       if (ordinal === null || loading || !messageListRef) return;
 
       const items = messageListRef.getDisplayItems();
+      const normalItems =
+        messageListRef.getNormalDisplayItems();
       const found = items.some((item) =>
         item.ordinals.includes(ordinal),
       );
 
       if (!found) {
+        if (
+          shouldAutoSwitchTranscriptModeToNormal(
+            ui.transcriptMode,
+            ordinal,
+            items,
+            normalItems,
+          )
+        ) {
+          ui.setTranscriptMode("normal");
+          return; // effect re-runs with normal transcript mode
+        }
+
         // Only auto-enable thinking if the ordinal is loaded
         // but filtered out *specifically* due to hidden thinking.
         // If it's outside the loaded window, don't change filters.
@@ -117,7 +147,12 @@
         );
         if (msg && !thinkingVisible) {
           const segs = enrichSegments(
-            parseContent(msg.content, msg.has_tool_use),
+            parseContent(
+              msg.content,
+              msg.has_tool_use,
+              msg.id,
+              msg.content_length,
+            ),
             msg.tool_calls,
           );
           const hasThinkingSegment = segs.some(
@@ -169,15 +204,98 @@
     messageListRef?.scrollToOrdinal(next.ordinals[0]!);
   }
 
-  // React to route changes: initialize session filters from URL params
+  // React to route changes: initialize session filters from URL params.
+  // Only track route and params — NOT sessionId. When the URL sync
+  // effect deselects a session (changing sessionId), we must not
+  // re-run initFromParams or it will reset filters the user just set.
   $effect(() => {
     const _route = router.route;
     const params = router.params;
     untrack(() => {
-      sessions.initFromParams(params);
+      const sid = router.sessionId;
+      if (!sid) {
+        sessions.initFromParams(params);
+      }
       sessions.load();
       sessions.loadProjects();
       sessions.loadAgents();
+    });
+  });
+
+  // Deep-link: select session from URL and handle ?msg param.
+  $effect(() => {
+    const sid = router.sessionId;
+    const msgParam = router.params["msg"] ?? null;
+    untrack(() => {
+      if (sid) {
+        if (sid !== sessions.activeSessionId) {
+          sessions.navigateToSession(sid);
+        }
+        if (msgParam) {
+          if (msgParam === "last") {
+            ui.pendingScrollOrdinal = -1;
+            ui.pendingScrollSession = sid;
+          } else {
+            const ordinal = parseInt(msgParam, 10);
+            if (Number.isFinite(ordinal)) {
+              ui.scrollToOrdinal(ordinal, sid);
+            }
+          }
+        }
+      } else if (router.route === "sessions") {
+        if (sessions.activeSessionId !== null) {
+          sessions.deselectSession();
+        }
+      }
+    });
+  });
+
+  // Resolve msg=last once messages are loaded.
+  $effect(() => {
+    const pending = ui.pendingScrollOrdinal;
+    const loading = messages.loading;
+    const msgs = messages.messages;
+    untrack(() => {
+      if (pending !== -1 || loading || msgs.length === 0) return;
+      const target = ui.pendingScrollSession;
+      if (target !== null && target !== messages.sessionId) return;
+      const lastOrdinal = msgs[msgs.length - 1]!.ordinal;
+      ui.scrollToOrdinal(lastOrdinal, target ?? undefined);
+    });
+  });
+
+  // Build URL params from current session filters.
+  function buildFilterParams(): Record<string, string> {
+    const f = sessions.filters;
+    const p: Record<string, string> = {};
+    if (f.project) p.project = f.project;
+    if (f.machine) p.machine = f.machine;
+    if (f.agent) p.agent = f.agent;
+    if (f.date) p.date = f.date;
+    if (f.dateFrom) p.date_from = f.dateFrom;
+    if (f.dateTo) p.date_to = f.dateTo;
+    if (f.recentlyActive) p.active_since = "true";
+    if (f.hideUnknownProject) p.exclude_project = "unknown";
+    if (f.minMessages > 0) p.min_messages = String(f.minMessages);
+    if (f.maxMessages > 0) p.max_messages = String(f.maxMessages);
+    if (f.minUserMessages > 0) p.min_user_messages = String(f.minUserMessages);
+    if (!f.includeOneShot) p.include_one_shot = "false";
+    if (f.includeAutomated) p.include_automated = "true";
+    return p;
+  }
+
+  // Sync active session to URL.
+  $effect(() => {
+    const activeId = sessions.activeSessionId;
+    const currentUrlSessionId = router.sessionId;
+    untrack(() => {
+      if (router.route !== "sessions") return;
+      if (activeId === currentUrlSessionId) return;
+      if (activeId) {
+        router.navigateToSession(activeId);
+      } else {
+        router.navigateFromSession(buildFilterParams());
+      }
     });
   });
 
@@ -196,9 +314,12 @@
     sync.checkForUpdate();
     sync.startPolling();
 
+    const healthCleanup = setupVisibilityHealthCheck(getBase);
+
     window.addEventListener("show-about", showAbout);
     const cleanup = registerShortcuts({ navigateMessage });
     return () => {
+      healthCleanup();
       cleanup();
       window.removeEventListener("show-about", showAbout);
       sync.stopPolling();
@@ -249,7 +370,11 @@
 
 <AppHeader />
 
-{#if router.route === "insights"}
+{#if router.route === "usage"}
+  <div class="page-scroll">
+    <UsagePage />
+  </div>
+{:else if router.route === "insights"}
   <div class="page-scroll">
     <InsightsPage />
   </div>
@@ -278,6 +403,11 @@
           session={session}
           onBack={() => sessions.deselectSession()}
         />
+        {#if ui.activityMinimapOpen && sessions.activeSessionId}
+          <ActivityMinimap
+            sessionId={sessions.activeSessionId}
+          />
+        {/if}
         <MessageList bind:this={messageListRef} />
       {:else}
         <AnalyticsPage />
@@ -310,6 +440,10 @@
 
 {#if ui.activeModal === "update"}
   <UpdateModal />
+{/if}
+
+{#if ui.activeModal === "confirmDelete"}
+  <ConfirmDeleteModal />
 {/if}
 
 {/if}

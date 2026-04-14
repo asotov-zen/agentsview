@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/spf13/pflag"
 	"github.com/wesm/agentsview/internal/parser"
 )
 
@@ -56,10 +57,12 @@ type ProxyConfig struct {
 
 // PGConfig holds PostgreSQL connection settings.
 type PGConfig struct {
-	URL           string `toml:"url" json:"url"`
-	Schema        string `toml:"schema" json:"schema"`
-	MachineName   string `toml:"machine_name" json:"machine_name"`
-	AllowInsecure bool   `toml:"allow_insecure" json:"allow_insecure"`
+	URL             string   `toml:"url" json:"url"`
+	Schema          string   `toml:"schema" json:"schema"`
+	MachineName     string   `toml:"machine_name" json:"machine_name"`
+	AllowInsecure   bool     `toml:"allow_insecure" json:"allow_insecure"`
+	Projects        []string `toml:"projects" json:"projects,omitempty"`
+	ExcludeProjects []string `toml:"exclude_projects" json:"exclude_projects,omitempty"`
 }
 
 // Config holds all application configuration.
@@ -78,6 +81,8 @@ type Config struct {
 	AuthToken            string         `json:"auth_token,omitempty" toml:"auth_token"`
 	RemoteAccess         bool           `json:"remote_access" toml:"remote_access"`
 	NoBrowser            bool           `json:"no_browser" toml:"no_browser"`
+	DisableUpdateCheck   bool           `json:"disable_update_check" toml:"disable_update_check"`
+	NoSync               bool           `json:"-" toml:"-"`
 	PG                   PGConfig       `json:"pg,omitempty" toml:"pg"`
 	WriteTimeout         time.Duration  `json:"-" toml:"-"`
 
@@ -171,6 +176,78 @@ func Load(fs *flag.FlagSet) (Config, error) {
 	return cfg, nil
 }
 
+// LoadPFlags builds a Config from a parsed Cobra/pflag FlagSet.
+func LoadPFlags(fs *pflag.FlagSet) (Config, error) {
+	cfg, err := LoadMinimal()
+	if err != nil {
+		return cfg, err
+	}
+	applyPFlags(&cfg, fs)
+	if err := finalize(&cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+// LoadPGServe builds a Config for `pg serve` by preserving
+// shared and PG settings from defaults/env/config file while
+// resetting serve-specific network/browser settings to defaults.
+// Only explicitly provided serve flags are applied on top.
+func LoadPGServe(fs *flag.FlagSet) (Config, error) {
+	cfg, err := loadPGServeBase()
+	if err != nil {
+		return cfg, err
+	}
+	applyFlags(&cfg, fs)
+	if err := finalize(&cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+// LoadPGServePFlags builds a PG serve config from a parsed Cobra/pflag FlagSet.
+func LoadPGServePFlags(fs *pflag.FlagSet) (Config, error) {
+	cfg, err := loadPGServeBase()
+	if err != nil {
+		return cfg, err
+	}
+	applyPFlags(&cfg, fs)
+	if err := finalize(&cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+func loadPGServeBase() (Config, error) {
+	cfg, err := Default()
+	if err != nil {
+		return cfg, err
+	}
+	cfg.loadEnv()
+	if err := cfg.loadFile(); err != nil {
+		return cfg, fmt.Errorf("loading config file: %w", err)
+	}
+	if err := cfg.ensureCursorSecret(); err != nil {
+		return cfg, fmt.Errorf("ensuring cursor secret: %w", err)
+	}
+	cfg.DBPath = filepath.Join(cfg.DataDir, "sessions.db")
+
+	// pg serve intentionally ignores persisted normal serve/public/proxy
+	// settings so an existing SQLite-backed serve deployment cannot silently
+	// reconfigure the PG-backed server. Until a dedicated pg-serve config
+	// namespace exists, only explicit pg-serve flags should shape its
+	// network/proxy behavior.
+	cfg.Host = "127.0.0.1"
+	cfg.Port = 8080
+	cfg.PublicURL = ""
+	cfg.PublicOrigins = nil
+	cfg.Proxy = ProxyConfig{}
+	cfg.RemoteAccess = false
+	cfg.NoBrowser = false
+	cfg.HostExplicit = false
+	return cfg, nil
+}
+
 // LoadMinimal builds a Config from defaults, env, and config file,
 // without parsing CLI flags. Use this for subcommands that manage
 // their own flag sets.
@@ -259,6 +336,7 @@ func (c *Config) loadFile() error {
 		Terminal                       TerminalConfig `toml:"terminal"`
 		AuthToken                      string         `toml:"auth_token"`
 		RemoteAccess                   bool           `toml:"remote_access"`
+		DisableUpdateCheck             bool           `toml:"disable_update_check"`
 		PG                             PGConfig       `toml:"pg"`
 	}
 	if _, err := toml.DecodeFile(path, &file); err != nil {
@@ -295,6 +373,7 @@ func (c *Config) loadFile() error {
 		c.AuthToken = file.AuthToken
 	}
 	c.RemoteAccess = file.RemoteAccess
+	c.DisableUpdateCheck = file.DisableUpdateCheck
 	// Merge pg field-by-field so env vars override only
 	// the fields they set, preserving config-file settings.
 	if file.PG.URL != "" && c.PG.URL == "" {
@@ -308,6 +387,12 @@ func (c *Config) loadFile() error {
 	}
 	if file.PG.AllowInsecure {
 		c.PG.AllowInsecure = true
+	}
+	if file.PG.Projects != nil && c.PG.Projects == nil {
+		c.PG.Projects = file.PG.Projects
+	}
+	if file.PG.ExcludeProjects != nil && c.PG.ExcludeProjects == nil {
+		c.PG.ExcludeProjects = file.PG.ExcludeProjects
 	}
 
 	// Parse config-file dir arrays for agents that have a
@@ -429,6 +514,9 @@ func (c *Config) loadEnv() {
 	if v := os.Getenv("AGENTSVIEW_PG_MACHINE"); v != "" {
 		c.PG.MachineName = v
 	}
+	if v := os.Getenv("AGENTSVIEW_DISABLE_UPDATE_CHECK"); v != "" {
+		c.DisableUpdateCheck = v == "1" || v == "true"
+	}
 }
 
 type stringListFlag []string
@@ -446,6 +534,10 @@ func (f *stringListFlag) Set(value string) error {
 		*f = append(*f, part)
 	}
 	return nil
+}
+
+func (f *stringListFlag) Type() string {
+	return "stringList"
 }
 
 // RegisterServeFlags registers serve-command flags on fs.
@@ -495,6 +587,70 @@ func RegisterServeFlags(fs *flag.FlagSet) {
 		"no-browser", false,
 		"Don't open browser on startup",
 	)
+	fs.Bool(
+		"no-sync", false,
+		"Skip initial sync and disable background sync/file watching",
+	)
+	fs.Bool(
+		"no-update-check", false,
+		"Disable the update check API endpoint",
+	)
+}
+
+// RegisterServePFlags registers serve-command flags on fs.
+func RegisterServePFlags(fs *pflag.FlagSet) {
+	fs.String("host", "127.0.0.1", "Host to bind to")
+	fs.Int("port", 8080, "Port to listen on")
+	fs.String(
+		"public-url", "",
+		"Public URL to trust and open for hostname or proxy access",
+	)
+	fs.Var(
+		&stringListFlag{},
+		"public-origin",
+		"Trusted browser origin to allow for remote or proxied access (repeatable or comma-separated)",
+	)
+	fs.String(
+		"proxy", "",
+		"Managed reverse proxy mode (currently: caddy)",
+	)
+	fs.String(
+		"caddy-bin", "",
+		"Caddy binary to use when -proxy=caddy (default: caddy)",
+	)
+	fs.String(
+		"proxy-bind-host", "",
+		"Local interface/IP for managed Caddy to bind (default: 0.0.0.0)",
+	)
+	fs.Int(
+		"public-port", 0,
+		"External port for the public URL in managed Caddy mode (default: 8443)",
+	)
+	fs.String(
+		"tls-cert", "",
+		"TLS certificate path for managed Caddy HTTPS mode",
+	)
+	fs.String(
+		"tls-key", "",
+		"TLS key path for managed Caddy HTTPS mode",
+	)
+	fs.Var(
+		&stringListFlag{},
+		"allowed-subnet",
+		"Client CIDR allowed to connect to the managed proxy (repeatable or comma-separated)",
+	)
+	fs.Bool(
+		"no-browser", false,
+		"Don't open browser on startup",
+	)
+	fs.Bool(
+		"no-sync", false,
+		"Skip initial sync and disable background sync/file watching",
+	)
+	fs.Bool(
+		"no-update-check", false,
+		"Disable the update check API endpoint",
+	)
 }
 
 // applyFlags copies explicitly-set flags from fs into cfg.
@@ -503,35 +659,52 @@ func applyFlags(cfg *Config, fs *flag.FlagSet) {
 		return
 	}
 	fs.Visit(func(f *flag.Flag) {
-		switch f.Name {
-		case "host":
-			cfg.Host = f.Value.String()
-			cfg.HostExplicit = true
-		case "port":
-			// flag already validated the int; ignore parse error
-			cfg.Port, _ = strconv.Atoi(f.Value.String())
-		case "public-url":
-			cfg.PublicURL = f.Value.String()
-		case "public-origin":
-			cfg.PublicOrigins = splitFlagList(f.Value.String())
-		case "proxy":
-			cfg.Proxy.Mode = f.Value.String()
-		case "caddy-bin":
-			cfg.Proxy.Bin = f.Value.String()
-		case "proxy-bind-host":
-			cfg.Proxy.BindHost = f.Value.String()
-		case "public-port":
-			cfg.Proxy.PublicPort, _ = strconv.Atoi(f.Value.String())
-		case "tls-cert":
-			cfg.Proxy.TLSCert = f.Value.String()
-		case "tls-key":
-			cfg.Proxy.TLSKey = f.Value.String()
-		case "allowed-subnet":
-			cfg.Proxy.AllowedSubnets = splitFlagList(f.Value.String())
-		case "no-browser":
-			cfg.NoBrowser = f.Value.String() == "true"
-		}
+		applyFlagValue(cfg, f.Name, f.Value.String())
 	})
+}
+
+// applyPFlags copies explicitly-set pflags from fs into cfg.
+func applyPFlags(cfg *Config, fs *pflag.FlagSet) {
+	if fs == nil {
+		return
+	}
+	fs.Visit(func(f *pflag.Flag) {
+		applyFlagValue(cfg, f.Name, f.Value.String())
+	})
+}
+
+func applyFlagValue(cfg *Config, name, value string) {
+	switch name {
+	case "host":
+		cfg.Host = value
+		cfg.HostExplicit = true
+	case "port":
+		cfg.Port, _ = strconv.Atoi(value)
+	case "public-url":
+		cfg.PublicURL = value
+	case "public-origin":
+		cfg.PublicOrigins = splitFlagList(value)
+	case "proxy":
+		cfg.Proxy.Mode = value
+	case "caddy-bin":
+		cfg.Proxy.Bin = value
+	case "proxy-bind-host":
+		cfg.Proxy.BindHost = value
+	case "public-port":
+		cfg.Proxy.PublicPort, _ = strconv.Atoi(value)
+	case "tls-cert":
+		cfg.Proxy.TLSCert = value
+	case "tls-key":
+		cfg.Proxy.TLSKey = value
+	case "allowed-subnet":
+		cfg.Proxy.AllowedSubnets = splitFlagList(value)
+	case "no-browser":
+		cfg.NoBrowser = value == "true"
+	case "no-sync":
+		cfg.NoSync = value == "true"
+	case "no-update-check":
+		cfg.DisableUpdateCheck = value == "true"
+	}
 }
 
 func splitFlagList(value string) []string {

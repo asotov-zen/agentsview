@@ -1,5 +1,7 @@
 import * as api from "../api/client.js";
 import type { Message } from "../api/types.js";
+import { clearContentCaches } from "../utils/content-parser.js";
+import { computeMainModel } from "../utils/model.js";
 
 const MESSAGE_PAGE_SIZE = 1000;
 const FULL_SESSION_MESSAGE_THRESHOLD = 20_000;
@@ -18,6 +20,14 @@ class MessagesStore {
   messageCount: number = $state(0);
   hasOlder: boolean = $state(false);
   loadingOlder: boolean = $state(false);
+  private _stableMainModel: string = $state("");
+  mainModel: string = $derived(
+    this.loading
+      ? this._stableMainModel
+      : this.messages.length > 0
+        ? computeMainModel(this.messages)
+        : "",
+  );
   private abortController: AbortController | null = null;
   private reloadPromise: Promise<void> | null = null;
   private reloadSessionId: string | null = null;
@@ -32,6 +42,7 @@ class MessagesStore {
       return;
     }
     this.clear();
+    this._stableMainModel = "";
     this.sessionId = id;
     this.loading = true;
 
@@ -71,6 +82,10 @@ class MessagesStore {
     } finally {
       if (this.sessionId === id) {
         this.loading = false;
+        this._stableMainModel =
+          this.messages.length > 0
+            ? computeMainModel(this.messages)
+            : "";
       }
     }
   }
@@ -107,8 +122,10 @@ class MessagesStore {
     this.abortController?.abort();
     this.abortController = null;
     this.messages = [];
+    clearContentCaches();
     this.sessionId = null;
     this.loading = false;
+    this._stableMainModel = "";
     this.messageCount = 0;
     this.hasOlder = false;
     this.loadingOlder = false;
@@ -422,6 +439,7 @@ class MessagesStore {
     signal: AbortSignal,
     messageCountHint?: number,
   ) {
+    clearContentCaches();
     this.loading = true;
     try {
       if (
@@ -439,6 +457,10 @@ class MessagesStore {
     } finally {
       if (this.sessionId === id) {
         this.loading = false;
+        this._stableMainModel =
+          this.messages.length > 0
+            ? computeMainModel(this.messages)
+            : "";
       }
     }
   }

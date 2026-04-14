@@ -11,13 +11,18 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/tidwall/gjson"
 )
 
 var (
-	xmlTaskIDRe  = regexp.MustCompile(`<task-id>([^<]+)</task-id>`)
-	xmlToolUseRe = regexp.MustCompile(`<tool-use-id>([^<]+)</tool-use-id>`)
+	xmlTaskIDRe   = regexp.MustCompile(`<task-id>([^<]+)</task-id>`)
+	xmlToolUseRe  = regexp.MustCompile(`<tool-use-id>([^<]+)</tool-use-id>`)
+	xmlCmdNameRe  = regexp.MustCompile(`<command-name>([^<]+)</command-name>`)
+	xmlCmdMsgRe   = regexp.MustCompile(`<command-message>([^<]+)</command-message>`)
+	xmlCmdArgsRe  = regexp.MustCompile(`<command-args>([^<]*)</command-args>`)
+	xmlCmdStripRe = regexp.MustCompile(`<command-(?:name|message|args)>[^<]*</command-(?:name|message|args)>`)
 )
 
 const (
@@ -177,6 +182,12 @@ func ParseClaudeSession(
 		return nil, fmt.Errorf("reading %s: %w", path, err)
 	}
 
+	// Collapse consecutive assistant entries that share the same
+	// message.id — these are streaming progress snapshots of a
+	// single response. Keep only the last entry per message.id
+	// run (it has the final content and token counts).
+	entries = collapseStreamingDuplicates(entries)
+
 	fileInfo := FileInfo{
 		Path:  path,
 		Size:  info.Size(),
@@ -332,6 +343,19 @@ func extractMessagesFrom(
 		content := gjson.Get(e.line, "message.content")
 		text, hasThinking, hasToolUse, tcs, trs :=
 			ExtractTextContent(content)
+
+		// Convert command/skill invocation XML into readable
+		// text (e.g. "/roborev-fix 450"). If the content
+		// looks like a command envelope but can't be
+		// normalized, skip it to avoid raw XML in transcripts.
+		if e.entryType == "user" {
+			if cmdText, ok := extractCommandText(text); ok {
+				text = cmdText
+			} else if isCommandEnvelope(text) {
+				continue
+			}
+		}
+
 		if strings.TrimSpace(text) == "" && len(trs) == 0 {
 			continue
 		}
@@ -342,15 +366,16 @@ func extractMessagesFrom(
 		}
 
 		msg := ParsedMessage{
-			Ordinal:       ordinal,
-			Role:          RoleType(e.entryType),
-			Content:       text,
-			Timestamp:     e.timestamp,
-			HasThinking:   hasThinking,
-			HasToolUse:    hasToolUse,
-			ContentLength: len(text),
-			ToolCalls:     tcs,
-			ToolResults:   trs,
+			Ordinal:            ordinal,
+			Role:               RoleType(e.entryType),
+			Content:            text,
+			Timestamp:          e.timestamp,
+			HasThinking:        hasThinking,
+			HasToolUse:         hasToolUse,
+			ContentLength:      len(text),
+			ToolCalls:          tcs,
+			ToolResults:        trs,
+			tokenPresenceKnown: e.entryType == "assistant",
 		}
 
 		if e.entryType == "assistant" {
@@ -404,7 +429,7 @@ func parseLinear(
 		UserMessageCount: userCount,
 		File:             fileInfo,
 	}
-	sumTokenUsage(&sess, messages)
+	accumulateMessageTokenUsage(&sess, messages)
 
 	return []ParseResult{{Session: sess, Messages: messages}}, nil
 }
@@ -581,7 +606,7 @@ func parseDAG(
 			UserMessageCount: userCount,
 			File:             fileInfo,
 		}
-		sumTokenUsage(&sess, messages)
+		accumulateMessageTokenUsage(&sess, messages)
 
 		results = append(results, ParseResult{
 			Session:  sess,
@@ -592,25 +617,61 @@ func parseDAG(
 	return results, nil
 }
 
-// countUserTurns counts the number of user entries reachable from
-// a starting index by following the first child at each node.
+// collapseStreamingDuplicates removes consecutive assistant entries
+// that share the same message.id. Claude Code writes multiple JSONL
+// lines as a response streams — each has the same message.id but
+// progressively more output tokens. Only the last entry in each
+// same-message.id run has the final content and token counts.
+func collapseStreamingDuplicates(entries []dagEntry) []dagEntry {
+	if len(entries) <= 1 {
+		return entries
+	}
+
+	result := make([]dagEntry, 0, len(entries))
+	for i := 0; i < len(entries); i++ {
+		mid := ""
+		if entries[i].entryType == "assistant" {
+			mid = gjson.Get(entries[i].line, "message.id").Str
+		}
+
+		// Look ahead: if next entries are assistant with same
+		// message.id, skip to the last one in the run.
+		if mid != "" {
+			j := i + 1
+			for j < len(entries) &&
+				entries[j].entryType == "assistant" &&
+				gjson.Get(entries[j].line, "message.id").Str == mid {
+				j++
+			}
+			// Keep only the last entry (j-1) in the run.
+			result = append(result, entries[j-1])
+			i = j - 1
+		} else {
+			result = append(result, entries[i])
+		}
+	}
+	return result
+}
+
+// countUserTurns counts all user entries reachable from a
+// starting index by traversing the entire subtree. Earlier
+// versions followed only the first child at each node, which
+// undercounted in sessions with many nested forks and caused
+// the fork heuristic to discard the main conversation branch.
 func countUserTurns(
 	entries []dagEntry,
 	children map[string][]int,
 	startIdx int,
 ) int {
 	count := 0
-	current := startIdx
-	for current >= 0 {
+	stack := []int{startIdx}
+	for len(stack) > 0 {
+		current := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
 		if entries[current].entryType == "user" {
 			count++
 		}
-		uuid := entries[current].uuid
-		kids := children[uuid]
-		if len(kids) == 0 {
-			break
-		}
-		current = kids[0]
+		stack = append(stack, children[entries[current].uuid]...)
 	}
 	return count
 }
@@ -648,6 +709,19 @@ func extractMessages(entries []dagEntry) (
 		content := gjson.Get(e.line, "message.content")
 		text, hasThinking, hasToolUse, tcs, trs :=
 			ExtractTextContent(content)
+
+		// Convert command/skill invocation XML into readable
+		// text (e.g. "/roborev-fix 450"). If the content
+		// looks like a command envelope but can't be
+		// normalized, skip it to avoid raw XML in transcripts.
+		if e.entryType == "user" {
+			if cmdText, ok := extractCommandText(text); ok {
+				text = cmdText
+			} else if isCommandEnvelope(text) {
+				continue
+			}
+		}
+
 		if strings.TrimSpace(text) == "" && len(trs) == 0 {
 			continue
 		}
@@ -663,18 +737,19 @@ func extractMessages(entries []dagEntry) (
 		}
 
 		msg := ParsedMessage{
-			Ordinal:       ordinal,
-			Role:          RoleType(e.entryType),
-			Content:       text,
-			Timestamp:     e.timestamp,
-			HasThinking:   hasThinking,
-			HasToolUse:    hasToolUse,
-			IsSystem:      isSystem,
-			ContentLength: len(text),
-			ModelID:       modelID,
-			ProviderID:    claudeProviderID(modelID),
-			ToolCalls:     tcs,
-			ToolResults:   trs,
+			Ordinal:            ordinal,
+			Role:               RoleType(e.entryType),
+			Content:            text,
+			Timestamp:          e.timestamp,
+			HasThinking:        hasThinking,
+			HasToolUse:         hasToolUse,
+			IsSystem:           isSystem,
+			ContentLength:      len(text),
+			ModelID:            modelID,
+			ProviderID:         claudeProviderID(modelID),
+			ToolCalls:          tcs,
+			ToolResults:        trs,
+			tokenPresenceKnown: e.entryType == "assistant",
 		}
 
 		if e.entryType == "assistant" {
@@ -689,15 +764,21 @@ func extractMessages(entries []dagEntry) (
 }
 
 // extractClaudeTokenFields populates Model, TokenUsage,
-// ContextTokens, and OutputTokens on a ParsedMessage from
-// a Claude JSONL line. Used by both full and incremental
-// parsing paths.
+// ContextTokens, OutputTokens, ClaudeMessageID, and
+// ClaudeRequestID on a ParsedMessage from a Claude JSONL line.
+// Used by both full and incremental parsing paths.
 func extractClaudeTokenFields(msg *ParsedMessage, line string) {
 	msg.Model = gjson.Get(line, "message.model").String()
+	msg.ClaudeMessageID = gjson.Get(line, "message.id").String()
+	msg.ClaudeRequestID = gjson.Get(line, "requestId").String()
 
 	usageResult := gjson.Get(line, "message.usage")
 	if usageResult.Exists() {
 		msg.TokenUsage = json.RawMessage(usageResult.Raw)
+		msg.HasOutputTokens = usageResult.Get("output_tokens").Exists()
+		msg.HasContextTokens = usageResult.Get("input_tokens").Exists() ||
+			usageResult.Get("cache_creation_input_tokens").Exists() ||
+			usageResult.Get("cache_read_input_tokens").Exists()
 
 		input := int(usageResult.Get("input_tokens").Int())
 		cacheCreation := int(usageResult.Get(
@@ -710,17 +791,6 @@ func extractClaudeTokenFields(msg *ParsedMessage, line string) {
 			"output_tokens",
 		).Int())
 		msg.ContextTokens = input + cacheCreation + cacheRead
-	}
-}
-
-// sumTokenUsage accumulates per-message token counts into session
-// totals on the given ParsedSession.
-func sumTokenUsage(sess *ParsedSession, messages []ParsedMessage) {
-	for _, m := range messages {
-		sess.TotalOutputTokens += m.OutputTokens
-		if m.ContextTokens > sess.PeakContextTokens {
-			sess.PeakContextTokens = m.ContextTokens
-		}
 	}
 }
 
@@ -867,16 +937,79 @@ func claudeProviderID(modelID string) string {
 	return "anthropic"
 }
 
+// extractCommandText detects Claude Code command/skill invocation
+// messages and returns a human-readable representation like
+// "/skill-name args". Only matches messages whose trimmed content
+// starts with <command-message> or <command-name> (the standard
+// envelope format), so user messages that merely mention these
+// tags in prose are not affected.
+// Returns ("", false) if the content is not a command message.
+func extractCommandText(content string) (string, bool) {
+	trimmed := strings.TrimLeftFunc(content, func(r rune) bool {
+		return r == '\uFEFF' || unicode.IsSpace(r)
+	})
+	if !strings.HasPrefix(trimmed, "<command-message>") &&
+		!strings.HasPrefix(trimmed, "<command-name>") {
+		return "", false
+	}
+	// Verify the content is purely command XML tags with no
+	// trailing prose — strip all known tags and check the
+	// remainder is whitespace-only.
+	stripped := xmlCmdStripRe.ReplaceAllString(trimmed, "")
+	if strings.TrimSpace(stripped) != "" {
+		return "", false
+	}
+	m := xmlCmdNameRe.FindStringSubmatch(content)
+	if m == nil {
+		// Bare <command-message> without <command-name>: extract
+		// the command-message value as a fallback.
+		if cm := xmlCmdMsgRe.FindStringSubmatch(content); cm != nil {
+			return "/" + cm[1], true
+		}
+		return "", false
+	}
+	name := m[1]
+	// Ensure the name starts with "/" for display.
+	if !strings.HasPrefix(name, "/") {
+		name = "/" + name
+	}
+	args := ""
+	if am := xmlCmdArgsRe.FindStringSubmatch(content); am != nil {
+		args = strings.TrimSpace(am[1])
+	}
+	if args != "" {
+		return name + " " + args, true
+	}
+	return name, true
+}
+
+// isCommandEnvelope returns true if the content is a pure
+// command XML envelope (starts with a command tag and contains
+// nothing but command tags and whitespace). Used as a fallback
+// to skip messages that look like command envelopes but couldn't
+// be normalized by extractCommandText.
+func isCommandEnvelope(content string) bool {
+	trimmed := strings.TrimLeftFunc(content, func(r rune) bool {
+		return r == '\uFEFF' || unicode.IsSpace(r)
+	})
+	if !strings.HasPrefix(trimmed, "<command-message>") &&
+		!strings.HasPrefix(trimmed, "<command-name>") {
+		return false
+	}
+	stripped := xmlCmdStripRe.ReplaceAllString(trimmed, "")
+	return strings.TrimSpace(stripped) == ""
+}
+
 // isClaudeSystemMessage returns true if the content matches
 // a known system-injected user message pattern.
 func isClaudeSystemMessage(content string) bool {
-	trimmed := strings.TrimSpace(content)
+	trimmed := strings.TrimLeftFunc(content, func(r rune) bool {
+		return r == '\uFEFF' || unicode.IsSpace(r)
+	})
 	prefixes := [...]string{
 		"This session is being continued",
 		"[Request interrupted",
 		"<task-notification>",
-		"<command-message>",
-		"<command-name>",
 		"<local-command-",
 		"Stop hook feedback:",
 	}

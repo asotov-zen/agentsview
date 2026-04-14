@@ -8,18 +8,24 @@ import (
 	"log"
 	"strings"
 	"time"
+
+	"github.com/wesm/agentsview/internal/parser"
 )
 
 const (
 	selectMessageCols = `id, session_id, ordinal, role, content,
 		timestamp, has_thinking, has_tool_use, is_system, content_length,
 		model_id, provider_id,
-		model, token_usage, context_tokens, output_tokens`
+		model, token_usage, context_tokens, output_tokens,
+		has_context_tokens, has_output_tokens,
+		claude_message_id, claude_request_id`
 
 	insertMessageCols = `session_id, ordinal, role, content,
 		timestamp, has_thinking, has_tool_use, is_system, content_length,
 		model_id, provider_id,
-		model, token_usage, context_tokens, output_tokens`
+		model, token_usage, context_tokens, output_tokens,
+		has_context_tokens, has_output_tokens,
+		claude_message_id, claude_request_id`
 
 	// DefaultMessageLimit is the default number of messages returned.
 	DefaultMessageLimit = 100
@@ -34,16 +40,17 @@ const (
 // ToolCall represents a single tool invocation stored in
 // the tool_calls table.
 type ToolCall struct {
-	MessageID           int64  `json:"-"`
-	SessionID           string `json:"-"`
-	ToolName            string `json:"tool_name"`
-	Category            string `json:"category"`
-	ToolUseID           string `json:"tool_use_id,omitempty"`
-	InputJSON           string `json:"input_json,omitempty"`
-	SkillName           string `json:"skill_name,omitempty"`
-	ResultContentLength int    `json:"result_content_length,omitempty"`
-	ResultContent       string `json:"result_content,omitempty"`
-	SubagentSessionID   string `json:"subagent_session_id,omitempty"`
+	MessageID           int64             `json:"-"`
+	SessionID           string            `json:"-"`
+	ToolName            string            `json:"tool_name"`
+	Category            string            `json:"category"`
+	ToolUseID           string            `json:"tool_use_id,omitempty"`
+	InputJSON           string            `json:"input_json,omitempty"`
+	SkillName           string            `json:"skill_name,omitempty"`
+	ResultContentLength int               `json:"result_content_length,omitempty"`
+	ResultContent       string            `json:"result_content,omitempty"`
+	SubagentSessionID   string            `json:"subagent_session_id,omitempty"`
+	ResultEvents        []ToolResultEvent `json:"result_events,omitempty"`
 }
 
 // ToolResult holds a tool_result content block for pairing.
@@ -53,26 +60,54 @@ type ToolResult struct {
 	ContentRaw    string // raw JSON of the content field; decode lazily
 }
 
+// ToolResultEvent represents a canonical chronological result update.
+type ToolResultEvent struct {
+	ToolUseID         string `json:"tool_use_id,omitempty"`
+	AgentID           string `json:"agent_id,omitempty"`
+	SubagentSessionID string `json:"subagent_session_id,omitempty"`
+	Source            string `json:"source"`
+	Status            string `json:"status"`
+	Content           string `json:"content"`
+	ContentLength     int    `json:"content_length"`
+	Timestamp         string `json:"timestamp,omitempty"`
+	EventIndex        int    `json:"event_index"`
+}
+
 // Message represents a row in the messages table.
 type Message struct {
-	ID            int64           `json:"id"`
-	SessionID     string          `json:"session_id"`
-	Ordinal       int             `json:"ordinal"`
-	Role          string          `json:"role"`
-	Content       string          `json:"content"`
-	Timestamp     string          `json:"timestamp"`
-	HasThinking   bool            `json:"has_thinking"`
-	HasToolUse    bool            `json:"has_tool_use"`
-	IsSystem      bool            `json:"is_system"` // persisted, filters search/analytics
-	ContentLength int             `json:"content_length"`
-	ModelID       string          `json:"model_id,omitempty"`
-	ProviderID    string          `json:"provider_id,omitempty"`
-	Model         string          `json:"model"`
-	TokenUsage    json.RawMessage `json:"token_usage,omitempty"`
-	ContextTokens int             `json:"context_tokens"`
-	OutputTokens  int             `json:"output_tokens"`
-	ToolCalls     []ToolCall      `json:"tool_calls,omitempty"`
-	ToolResults   []ToolResult    `json:"-"` // transient, for pairing
+	ID               int64           `json:"id"`
+	SessionID        string          `json:"session_id"`
+	Ordinal          int             `json:"ordinal"`
+	Role             string          `json:"role"`
+	Content          string          `json:"content"`
+	Timestamp        string          `json:"timestamp"`
+	HasThinking      bool            `json:"has_thinking"`
+	HasToolUse       bool            `json:"has_tool_use"`
+	IsSystem         bool            `json:"is_system"` // persisted, filters search/analytics
+	ContentLength    int             `json:"content_length"`
+	ModelID          string          `json:"model_id,omitempty"`
+	ProviderID       string          `json:"provider_id,omitempty"`
+	Model            string          `json:"model"`
+	TokenUsage       json.RawMessage `json:"token_usage,omitempty"`
+	ContextTokens    int             `json:"context_tokens"`
+	OutputTokens     int             `json:"output_tokens"`
+	HasContextTokens bool            `json:"has_context_tokens"`
+	HasOutputTokens  bool            `json:"has_output_tokens"`
+	ClaudeMessageID  string          `json:"claude_message_id,omitempty"`
+	ClaudeRequestID  string          `json:"claude_request_id,omitempty"`
+	ToolCalls        []ToolCall      `json:"tool_calls,omitempty"`
+	ToolResults      []ToolResult    `json:"-"` // transient, for pairing
+}
+
+// TokenPresence reports whether context/output token fields were
+// present in stored message metadata. It preserves explicit flags,
+// falls back to non-zero numeric values for legacy rows, and inspects
+// raw token_usage payload keys to preserve zero-valued coverage.
+func (m Message) TokenPresence() (bool, bool) {
+	return parser.InferTokenPresence(
+		m.TokenUsage, m.ContextTokens, m.OutputTokens,
+		m.HasContextTokens, m.HasOutputTokens,
+	)
 }
 
 // MinimapEntry is a lightweight message summary for minimap rendering.
@@ -217,7 +252,7 @@ func (db *DB) insertMessagesTx(
 ) ([]int64, error) {
 	stmt, err := tx.Prepare(fmt.Sprintf(`
 		INSERT INTO messages (%s)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, insertMessageCols))
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, insertMessageCols))
 	if err != nil {
 		return nil, fmt.Errorf("preparing insert: %w", err)
 	}
@@ -232,6 +267,8 @@ func (db *DB) insertMessagesTx(
 			nilIfEmpty(m.ModelID), nilIfEmpty(m.ProviderID),
 			m.Model, string(m.TokenUsage),
 			m.ContextTokens, m.OutputTokens,
+			m.HasContextTokens, m.HasOutputTokens,
+			m.ClaudeMessageID, m.ClaudeRequestID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf(
@@ -301,6 +338,45 @@ func insertToolCallsTx(
 	return nil
 }
 
+func insertToolResultEventsTx(
+	tx *sql.Tx, rows []toolResultEventRow,
+) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	stmt, err := tx.Prepare(`
+		INSERT INTO tool_result_events
+			(session_id, tool_call_message_ordinal, call_index,
+			 tool_use_id, agent_id, subagent_session_id,
+			 source, status, content, content_length,
+			 timestamp, event_index)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return fmt.Errorf("preparing tool_result_events insert: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, r := range rows {
+		if _, err := stmt.Exec(
+			r.SessionID, r.MessageOrdinal, r.CallIndex,
+			nilIfEmpty(r.Event.ToolUseID),
+			nilIfEmpty(r.Event.AgentID),
+			nilIfEmpty(r.Event.SubagentSessionID),
+			r.Event.Source, r.Event.Status,
+			r.Event.Content,
+			r.Event.ContentLength,
+			nilIfEmpty(r.Event.Timestamp),
+			r.Event.EventIndex,
+		); err != nil {
+			return fmt.Errorf(
+				"inserting tool_result_event %q/%q: %w",
+				r.Event.Source, r.Event.Status, err,
+			)
+		}
+	}
+	return nil
+}
+
 const slowOpThreshold = 100 * time.Millisecond
 
 // InsertMessages batch-inserts messages for a session.
@@ -336,6 +412,10 @@ func (db *DB) InsertMessages(msgs []Message) error {
 	if err := insertToolCallsTx(tx, toolCalls); err != nil {
 		return err
 	}
+	events := resolveToolResultEvents(msgs)
+	if err := insertToolResultEventsTx(tx, events); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -354,8 +434,20 @@ func (db *DB) MaxOrdinal(sessionID string) int {
 	return int(n.Int64)
 }
 
+// savedPin captures the minimal pin state needed to re-attach a pin
+// after a full message replacement. The ordinal acts as a stable key
+// because session files are append-only and message ordinals never
+// change for existing messages.
+type savedPin struct {
+	ordinal   int
+	note      *string
+	createdAt string
+}
+
 // ReplaceSessionMessages deletes existing and inserts new messages
-// in a single transaction.
+// in a single transaction. Any existing pins are preserved by
+// re-attaching them to the new message rows that share the same
+// ordinal (pins for ordinals that no longer exist are dropped).
 func (db *DB) ReplaceSessionMessages(
 	sessionID string, msgs []Message,
 ) error {
@@ -379,11 +471,42 @@ func (db *DB) ReplaceSessionMessages(
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Save existing pins before deletion. The ON DELETE CASCADE on
+	// pinned_messages.message_id would otherwise wipe them when
+	// messages are deleted below.
+	pinRows, err := tx.Query(
+		"SELECT ordinal, note, created_at FROM pinned_messages WHERE session_id = ?",
+		sessionID,
+	)
+	if err != nil {
+		return fmt.Errorf("saving pins: %w", err)
+	}
+	defer pinRows.Close()
+	var pins []savedPin
+	for pinRows.Next() {
+		var sp savedPin
+		if err := pinRows.Scan(&sp.ordinal, &sp.note, &sp.createdAt); err != nil {
+			return fmt.Errorf("scanning pin: %w", err)
+		}
+		pins = append(pins, sp)
+	}
+	if err := pinRows.Err(); err != nil {
+		return fmt.Errorf("iterating pins: %w", err)
+	}
+
 	if _, err := tx.Exec(
 		"DELETE FROM tool_calls WHERE session_id = ?",
 		sessionID,
 	); err != nil {
 		return fmt.Errorf("deleting old tool_calls: %w", err)
+	}
+	if _, err := tx.Exec(
+		"DELETE FROM tool_result_events WHERE session_id = ?",
+		sessionID,
+	); err != nil {
+		return fmt.Errorf(
+			"deleting old tool_result_events: %w", err,
+		)
 	}
 
 	if _, err := tx.Exec(
@@ -400,6 +523,26 @@ func (db *DB) ReplaceSessionMessages(
 		toolCalls := resolveToolCalls(msgs, ids)
 		if err := insertToolCallsTx(tx, toolCalls); err != nil {
 			return err
+		}
+		events := resolveToolResultEvents(msgs)
+		if err := insertToolResultEventsTx(tx, events); err != nil {
+			return err
+		}
+	}
+
+	// Re-attach saved pins by matching ordinal to the newly inserted
+	// messages. Pins for ordinals that no longer exist are silently
+	// dropped (the message was removed from the session).
+	for _, sp := range pins {
+		if _, err := tx.Exec(`
+			INSERT OR IGNORE INTO pinned_messages
+				(session_id, message_id, ordinal, note, created_at)
+			SELECT ?, m.id, m.ordinal, ?, ?
+			FROM messages m
+			WHERE m.session_id = ? AND m.ordinal = ?`,
+			sessionID, sp.note, sp.createdAt, sessionID, sp.ordinal,
+		); err != nil {
+			return fmt.Errorf("restoring pin ord=%d: %w", sp.ordinal, err)
 		}
 	}
 
@@ -429,6 +572,9 @@ func (db *DB) attachToolCalls(
 		); err != nil {
 			return err
 		}
+	}
+	if err := db.attachToolResultEvents(ctx, msgs); err != nil {
+		return err
 	}
 	return nil
 }
@@ -506,6 +652,110 @@ func (db *DB) attachToolCallsBatch(
 	return rows.Err()
 }
 
+func (db *DB) attachToolResultEvents(
+	ctx context.Context, msgs []Message,
+) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+
+	sessionID := msgs[0].SessionID
+	ordToIdx := make(map[int]int, len(msgs))
+	ordinals := make([]int, 0, len(msgs))
+	for i, m := range msgs {
+		ordToIdx[m.Ordinal] = i
+		ordinals = append(ordinals, m.Ordinal)
+	}
+	for i := 0; i < len(ordinals); i += attachToolCallBatchSize {
+		end := min(i+attachToolCallBatchSize, len(ordinals))
+		if err := db.attachToolResultEventsBatch(
+			ctx, msgs, ordToIdx, sessionID, ordinals[i:end],
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *DB) attachToolResultEventsBatch(
+	ctx context.Context,
+	msgs []Message,
+	ordToIdx map[int]int,
+	sessionID string,
+	ordinals []int,
+) error {
+	if len(ordinals) == 0 {
+		return nil
+	}
+
+	args := []any{sessionID}
+	placeholders := make([]string, len(ordinals))
+	for i, ord := range ordinals {
+		args = append(args, ord)
+		placeholders[i] = "?"
+	}
+
+	query := fmt.Sprintf(`
+		SELECT tool_call_message_ordinal, call_index,
+			tool_use_id, agent_id, subagent_session_id,
+			source, status, content, content_length,
+			timestamp, event_index
+		FROM tool_result_events
+		WHERE session_id = ? AND tool_call_message_ordinal IN (%s)
+		ORDER BY tool_call_message_ordinal, call_index, event_index`,
+		strings.Join(placeholders, ","))
+
+	rows, err := db.getReader().QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("querying tool_result_events: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			msgOrdinal int
+			callIndex  int
+			ev         ToolResultEvent
+			toolUseID  sql.NullString
+			agentID    sql.NullString
+			subID      sql.NullString
+			timestamp  sql.NullString
+		)
+		if err := rows.Scan(
+			&msgOrdinal, &callIndex,
+			&toolUseID, &agentID, &subID,
+			&ev.Source, &ev.Status, &ev.Content,
+			&ev.ContentLength, &timestamp, &ev.EventIndex,
+		); err != nil {
+			return fmt.Errorf("scanning tool_result_event: %w", err)
+		}
+		if toolUseID.Valid {
+			ev.ToolUseID = toolUseID.String
+		}
+		if agentID.Valid {
+			ev.AgentID = agentID.String
+		}
+		if subID.Valid {
+			ev.SubagentSessionID = subID.String
+		}
+		if timestamp.Valid {
+			ev.Timestamp = timestamp.String
+		}
+		idx, ok := ordToIdx[msgOrdinal]
+		if !ok {
+			continue
+		}
+		if callIndex < 0 || callIndex >= len(msgs[idx].ToolCalls) {
+			continue
+		}
+		msgs[idx].ToolCalls[callIndex].ResultEvents = append(
+			msgs[idx].ToolCalls[callIndex].ResultEvents,
+			ev,
+		)
+	}
+	return rows.Err()
+}
+
 func scanMessages(rows *sql.Rows) ([]Message, error) {
 	var msgs []Message
 	for rows.Next() {
@@ -520,6 +770,8 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 			&modelID, &providerID,
 			&m.Model, &tokenUsage,
 			&m.ContextTokens, &m.OutputTokens,
+			&m.HasContextTokens, &m.HasOutputTokens,
+			&m.ClaudeMessageID, &m.ClaudeRequestID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning message: %w", err)
@@ -559,6 +811,50 @@ func (db *DB) MessageContentFingerprint(sessionID string) (sum, max, min int64, 
 	return sum, max, min, err
 }
 
+// MessageTokenFingerprint returns an exact ordered fingerprint of
+// stored token metadata for a session's messages. Used by PG push
+// fast-paths to detect token metadata changes without rewriting
+// unchanged sessions.
+func (db *DB) MessageTokenFingerprint(sessionID string) (string, error) {
+	rows, err := db.getReader().Query(
+		`SELECT ordinal, model, token_usage, context_tokens,
+			output_tokens, has_context_tokens, has_output_tokens,
+			claude_message_id, claude_request_id
+		 FROM messages
+		 WHERE session_id = ?
+		 ORDER BY ordinal ASC`,
+		sessionID,
+	)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var b strings.Builder
+	for rows.Next() {
+		var ordinal, contextTokens, outputTokens int
+		var model, tokenUsage string
+		var hasContextTokens, hasOutputTokens bool
+		var claudeMsgID, claudeReqID string
+		if err := rows.Scan(
+			&ordinal, &model, &tokenUsage, &contextTokens,
+			&outputTokens, &hasContextTokens, &hasOutputTokens,
+			&claudeMsgID, &claudeReqID,
+		); err != nil {
+			return "", err
+		}
+		fmt.Fprintf(&b, "%d|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s;",
+			ordinal,
+			len(model), model,
+			len(tokenUsage), tokenUsage,
+			contextTokens, outputTokens,
+			hasContextTokens, hasOutputTokens,
+			claudeMsgID, claudeReqID,
+		)
+	}
+	return b.String(), rows.Err()
+}
+
 // ToolCallCount returns the number of tool_calls rows for a session.
 func (db *DB) ToolCallCount(sessionID string) (int, error) {
 	var n int
@@ -567,6 +863,28 @@ func (db *DB) ToolCallCount(sessionID string) (int, error) {
 		sessionID,
 	).Scan(&n)
 	return n, err
+}
+
+// SystemMessageFingerprint returns the ordered, comma-separated list of
+// ordinals for system messages in a session (e.g. "0,2,5"). This is an
+// exact fingerprint of the system-message ordinal set: any reclassification
+// of which messages are system — even when counts, sums, or sums-of-squares
+// remain equal — produces a different string. Used by the PG push fast-path.
+func (db *DB) SystemMessageFingerprint(sessionID string) (string, error) {
+	var v sql.NullString
+	err := db.getReader().QueryRow(
+		`SELECT GROUP_CONCAT(ordinal, ',')
+		 FROM (
+		   SELECT ordinal FROM messages
+		   WHERE session_id = ? AND is_system = 1
+		   ORDER BY ordinal
+		 )`,
+		sessionID,
+	).Scan(&v)
+	if err != nil {
+		return "", err
+	}
+	return v.String, nil
 }
 
 // ToolCallContentFingerprint returns the sum of result_content_length
@@ -602,6 +920,8 @@ func (db *DB) GetMessageByOrdinal(
 		&modelID, &providerID,
 		&m.Model, &tokenUsage,
 		&m.ContextTokens, &m.OutputTokens,
+		&m.HasContextTokens, &m.HasOutputTokens,
+		&m.ClaudeMessageID, &m.ClaudeRequestID,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -651,4 +971,38 @@ func resolveToolCalls(
 		}
 	}
 	return calls
+}
+
+type toolResultEventRow struct {
+	SessionID      string
+	MessageOrdinal int
+	CallIndex      int
+	Event          ToolResultEvent
+}
+
+func resolveToolResultEvents(msgs []Message) []toolResultEventRow {
+	var rows []toolResultEventRow
+	for _, m := range msgs {
+		for callIndex, tc := range m.ToolCalls {
+			for eventIndex, ev := range tc.ResultEvents {
+				ev.EventIndex = eventIndex
+				if ev.ContentLength == 0 {
+					ev.ContentLength = len(ev.Content)
+				}
+				if ev.ToolUseID == "" {
+					ev.ToolUseID = tc.ToolUseID
+				}
+				if ev.SubagentSessionID == "" {
+					ev.SubagentSessionID = tc.SubagentSessionID
+				}
+				rows = append(rows, toolResultEventRow{
+					SessionID:      m.SessionID,
+					MessageOrdinal: m.Ordinal,
+					CallIndex:      callIndex,
+					Event:          ev,
+				})
+			}
+		}
+	}
+	return rows
 }

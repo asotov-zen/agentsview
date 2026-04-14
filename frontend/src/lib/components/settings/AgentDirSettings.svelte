@@ -8,12 +8,14 @@
     copilot: "Copilot",
     gemini: "Gemini",
     opencode: "OpenCode",
+    openhands: "OpenHands CLI",
     cursor: "Cursor",
     amp: "Amp",
     iflow: "iFlow",
     "vscode-copilot": "VSCode Copilot",
     pi: "Pi",
     openclaw: "OpenClaw",
+    kimi: "Kimi",
   };
 </script>
 

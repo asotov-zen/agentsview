@@ -567,11 +567,6 @@ type messageListResponse struct {
 	Count    int          `json:"count"`
 }
 
-type minimapResponse struct {
-	Entries []db.MinimapEntry `json:"entries"`
-	Count   int               `json:"count"`
-}
-
 type searchResponse struct {
 	Query   string            `json:"query"`
 	Results []db.SearchResult `json:"results"`
@@ -948,103 +943,6 @@ func TestSearch_InvalidParams(t *testing.T) {
 	}
 }
 
-func TestGetMinimap(t *testing.T) {
-	te := setup(t)
-	te.seedSession(t, "s1", "my-app", 5)
-	te.seedMessages(t, "s1", 5)
-
-	w := te.get(t, "/api/v1/sessions/s1/minimap")
-	assertStatus(t, w, http.StatusOK)
-
-	resp := decode[minimapResponse](t, w)
-	if len(resp.Entries) != 5 {
-		t.Fatalf("expected 5 entries, got %d",
-			len(resp.Entries))
-	}
-	if resp.Entries[0].Role == "" {
-		t.Fatal("minimap should include role")
-	}
-
-	// Verify "content" is not present in raw JSON
-	var raw map[string]any
-	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
-		t.Fatalf("decoding raw JSON: %v", err)
-	}
-	entriesRaw, ok := raw["entries"].([]any)
-	if !ok {
-		t.Fatal("expected entries to be a list")
-	}
-	if len(entriesRaw) > 0 {
-		first, ok := entriesRaw[0].(map[string]any)
-		if !ok {
-			t.Fatal("expected entry to be a map")
-		}
-		if _, ok := first["content"]; ok {
-			t.Fatal("minimap should not include content")
-		}
-	}
-}
-
-func TestGetMinimap_FromOrdinal(t *testing.T) {
-	te := setup(t)
-	te.seedSession(t, "s1", "my-app", 5)
-	te.seedMessages(t, "s1", 5)
-
-	w := te.get(t, "/api/v1/sessions/s1/minimap?from=3")
-	assertStatus(t, w, http.StatusOK)
-
-	resp := decode[minimapResponse](t, w)
-	if len(resp.Entries) != 2 {
-		t.Fatalf("expected 2 entries, got %d",
-			len(resp.Entries))
-	}
-	if got := resp.Entries[0].Ordinal; got != 3 {
-		t.Fatalf("first ordinal = %d, want 3", got)
-	}
-}
-
-func TestGetMinimap_InvalidFrom(t *testing.T) {
-	te := setup(t)
-	te.seedSession(t, "s1", "my-app", 1)
-	te.seedMessages(t, "s1", 1)
-
-	w := te.get(t, "/api/v1/sessions/s1/minimap?from=bad")
-	assertStatus(t, w, http.StatusBadRequest)
-}
-
-func TestGetMinimap_MaxSampled(t *testing.T) {
-	te := setup(t)
-	te.seedSession(t, "s1", "my-app", 10)
-	te.seedMessages(t, "s1", 10)
-
-	w := te.get(t, "/api/v1/sessions/s1/minimap?max=3")
-	assertStatus(t, w, http.StatusOK)
-
-	resp := decode[minimapResponse](t, w)
-	if len(resp.Entries) != 3 {
-		t.Fatalf("expected 3 entries, got %d",
-			len(resp.Entries))
-	}
-	if got := resp.Entries[0].Ordinal; got != 0 {
-		t.Fatalf("first ordinal = %d, want 0", got)
-	}
-	if got := resp.Entries[1].Ordinal; got != 4 {
-		t.Fatalf("second ordinal = %d, want 4", got)
-	}
-	if got := resp.Entries[2].Ordinal; got != 9 {
-		t.Fatalf("third ordinal = %d, want 9", got)
-	}
-}
-
-func TestGetMinimap_InvalidMax(t *testing.T) {
-	te := setup(t)
-	te.seedSession(t, "s1", "my-app", 1)
-	te.seedMessages(t, "s1", 1)
-
-	w := te.get(t, "/api/v1/sessions/s1/minimap?max=0")
-	assertStatus(t, w, http.StatusBadRequest)
-}
-
 func TestSearch_WithResults(t *testing.T) {
 	te := setup(t)
 	if !te.db.HasFTS() {
@@ -1085,12 +983,18 @@ func TestSearch_Limits(t *testing.T) {
 	if !te.db.HasFTS() {
 		t.Skip("skipping search test: no FTS support")
 	}
-	// Seed enough messages to test limits
-	te.seedSession(t, "s1", "my-app", 600)
-	te.seedMessages(t, "s1", 600, func(i int, m *db.Message) {
-		m.Content = "common search term"
-		m.ContentLength = 18
-	})
+	// Seed 600 distinct sessions, each with one matching message.
+	// Under session-grouped search, each session produces exactly one result,
+	// so limit/pagination operates at the session level.
+	const totalSessions = 600
+	for i := range totalSessions {
+		id := fmt.Sprintf("limit-test-%04d", i)
+		te.seedSession(t, id, "my-app", 1)
+		te.seedMessages(t, id, 1, func(_ int, m *db.Message) {
+			m.Content = "common search term"
+			m.ContentLength = 18
+		})
+	}
 
 	tests := []struct {
 		name      string
@@ -1183,6 +1087,50 @@ func TestSearch_ZeroResults(t *testing.T) {
 	}
 	if resp.Count != 0 {
 		t.Fatalf("expected count=0, got %d", resp.Count)
+	}
+}
+
+// TestSearch_Deduplication verifies that a session with many matching messages
+// produces exactly one search result. This guards against FTS5 segment
+// duplication bugs where multiple index segments could yield multiple rows
+// for the same session_id.
+func TestSearch_Deduplication(t *testing.T) {
+	te := setup(t)
+	if !te.db.HasFTS() {
+		t.Skip("skipping search test: no FTS support")
+	}
+
+	// Session s1: many messages all containing the search term.
+	te.seedSession(t, "s1", "proj-a", 1)
+	const n = 80
+	te.seedMessages(t, "s1", n, func(_ int, m *db.Message) {
+		m.Content = "needle in every message"
+		m.ContentLength = 23
+	})
+
+	// Session s2: one message containing the search term (control).
+	te.seedSession(t, "s2", "proj-b", 1)
+	te.seedMessages(t, "s2", 1, func(_ int, m *db.Message) {
+		m.Content = "needle single message"
+		m.ContentLength = 21
+	})
+
+	w := te.get(t, "/api/v1/search?q=needle&limit=100")
+	assertStatus(t, w, http.StatusOK)
+
+	resp := decode[searchResponse](t, w)
+	if resp.Count != 2 {
+		t.Errorf("got count=%d, want 2 (one result per session)", resp.Count)
+	}
+	// Verify no duplicate session_ids in the response.
+	seen := make(map[string]int)
+	for _, r := range resp.Results {
+		seen[r.SessionID]++
+	}
+	for sid, count := range seen {
+		if count > 1 {
+			t.Errorf("session_id %q appears %d times in results, want 1", sid, count)
+		}
 	}
 }
 
@@ -2067,9 +2015,29 @@ func TestExportSession_HTMLContent(t *testing.T) {
 func TestUploadSession(t *testing.T) {
 	te := setup(t)
 
+	assistantWithUsage, err := json.Marshal(map[string]any{
+		"type":      "assistant",
+		"timestamp": tsEarlyS5,
+		"message": map[string]any{
+			"model": "claude-sonnet-4-20250514",
+			"usage": map[string]any{
+				"input_tokens":                100,
+				"cache_creation_input_tokens": 200,
+				"cache_read_input_tokens":     200,
+				"output_tokens":               200,
+			},
+			"content": []map[string]any{
+				{"type": "text", "text": "Hi!"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal assistant fixture: %v", err)
+	}
+
 	content := testjsonl.NewSessionBuilder().
 		AddClaudeUser(tsEarly, "Hello upload").
-		AddClaudeAssistant(tsEarlyS5, "Hi!").
+		AddRaw(string(assistantWithUsage)).
 		String()
 
 	w := te.upload(t, "upload-test.jsonl", content,
@@ -2100,6 +2068,40 @@ func TestUploadSession(t *testing.T) {
 	}
 	if sess.Project != "myproj" {
 		t.Errorf("stored project = %q", sess.Project)
+	}
+	if !sess.HasTotalOutputTokens {
+		t.Error("stored HasTotalOutputTokens = false, want true")
+	}
+	if !sess.HasPeakContextTokens {
+		t.Error("stored HasPeakContextTokens = false, want true")
+	}
+	if sess.TotalOutputTokens != 200 {
+		t.Errorf("stored TotalOutputTokens = %d, want 200",
+			sess.TotalOutputTokens)
+	}
+	if sess.PeakContextTokens != 500 {
+		t.Errorf("stored PeakContextTokens = %d, want 500",
+			sess.PeakContextTokens)
+	}
+
+	msgs, err := te.db.GetMessages(context.Background(), "upload-test", 0, 10, true)
+	if err != nil {
+		t.Fatalf("GetMessages: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("message count = %d, want 2", len(msgs))
+	}
+	if !msgs[1].HasContextTokens {
+		t.Error("assistant HasContextTokens = false, want true")
+	}
+	if !msgs[1].HasOutputTokens {
+		t.Error("assistant HasOutputTokens = false, want true")
+	}
+	if msgs[1].OutputTokens != 200 {
+		t.Errorf("assistant OutputTokens = %d, want 200", msgs[1].OutputTokens)
+	}
+	if msgs[1].ContextTokens != 500 {
+		t.Errorf("assistant ContextTokens = %d, want 500", msgs[1].ContextTokens)
 	}
 }
 

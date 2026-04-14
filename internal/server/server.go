@@ -165,7 +165,7 @@ func (s *Server) routes() {
 		"GET /api/v1/sessions/{id}/children", s.withTimeout(s.handleGetChildSessions),
 	)
 	s.mux.Handle(
-		"GET /api/v1/sessions/{id}/minimap", s.withTimeout(s.handleGetMinimap),
+		"GET /api/v1/sessions/{id}/activity", s.withTimeout(s.handleGetSessionActivity),
 	)
 	// SSE: Do not use timeout, as this is a long-lived connection.
 	s.mux.HandleFunc(
@@ -201,6 +201,11 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/analytics/velocity", s.withTimeout(s.handleAnalyticsVelocity))
 	s.mux.Handle("GET /api/v1/analytics/tools", s.withTimeout(s.handleAnalyticsTools))
 	s.mux.Handle("GET /api/v1/analytics/top-sessions", s.withTimeout(s.handleAnalyticsTopSessions))
+
+	s.mux.Handle("GET /api/v1/usage/summary",
+		s.withTimeout(s.handleUsageSummary))
+	s.mux.Handle("GET /api/v1/usage/top-sessions",
+		s.withTimeout(s.handleUsageTopSessions))
 
 	s.mux.Handle("GET /api/v1/insights", s.withTimeout(s.handleListInsights))
 	s.mux.Handle("GET /api/v1/insights/{id}", s.withTimeout(s.handleGetInsight))
@@ -247,6 +252,22 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/sessions/{id}/pins", s.withTimeout(s.handleListSessionPins))
 	s.mux.Handle("POST /api/v1/sessions/{id}/messages/{messageId}/pin", s.withTimeout(s.handlePinMessage))
 	s.mux.Handle("DELETE /api/v1/sessions/{id}/messages/{messageId}/pin", s.withTimeout(s.handleUnpinMessage))
+	// Import: no timeout wrapper (large files may take longer).
+	s.mux.HandleFunc(
+		"POST /api/v1/import/claude-ai",
+		s.handleImportClaudeAI,
+	)
+	// ChatGPT import: no timeout wrapper.
+	s.mux.HandleFunc(
+		"POST /api/v1/import/chatgpt",
+		s.handleImportChatGPT,
+	)
+	// Assets: no timeout wrapper (static files).
+	s.mux.HandleFunc(
+		"GET /api/v1/assets/{filename}",
+		s.handleGetAsset,
+	)
+
 	// SPA fallback: serve embedded frontend
 	// Do not use timeout handler for static assets to avoid buffering.
 	s.mux.Handle("/", http.HandlerFunc(s.handleSPA))
@@ -362,11 +383,13 @@ func (s *Server) Handler() http.Handler {
 	if bindAll {
 		bindAllIPs = localInterfaceIPs()
 	}
-	h := s.authMiddleware(
-		hostCheckMiddleware(
-			allowedHosts, bindAll, s.cfg.Port, bindAllIPs,
-			corsMiddleware(
-				allowedOrigins, bindAll, s.cfg.Port, bindAllIPs, logMiddleware(s.mux),
+	h := cspMiddleware(s.cfg.Host, s.cfg.Port, s.cfg.PublicOrigins, bindAllIPs,
+		s.authMiddleware(
+			hostCheckMiddleware(
+				allowedHosts, bindAll, s.cfg.Port, bindAllIPs,
+				corsMiddleware(
+					allowedOrigins, bindAll, s.cfg.Port, bindAllIPs, logMiddleware(s.mux),
+				),
 			),
 		),
 	)
@@ -394,6 +417,108 @@ func (s *Server) Handler() http.Handler {
 		})
 	}
 	return h
+}
+
+// cspMiddleware sets a Content-Security-Policy header on non-API
+// responses. The policy pins the exact host:port origin so that
+// even if Tauri's compile-time CSP uses a wildcard port, the
+// intersection narrows to the actual runtime port.
+func cspMiddleware(host string, port int, publicOrigins []string, bindAllIPs map[string]bool, next http.Handler) http.Handler {
+	policy := buildCSPPolicy(host, port, publicOrigins, bindAllIPs)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Content-Security-Policy", policy)
+			w.Header().Set("X-Frame-Options", "DENY")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// buildCSPPolicy constructs the Content-Security-Policy string.
+// It uses the same loopback/bind-all logic as buildAllowedOrigins
+// to handle IPv6 bracketing, 0.0.0.0/:: normalization, and
+// public origins (proxy/TLS).
+//
+// The server's own origin (host:port) is included explicitly in
+// all directives because WebKitGTK in a Tauri webview may not
+// resolve 'self' to the Go server origin after navigating from
+// tauri://localhost. Public origins and LAN IPs are restricted
+// to connect-src only to limit the script execution surface.
+func buildCSPPolicy(host string, port int, publicOrigins []string, bindAllIPs map[string]bool) string {
+	// serverOrigin is the pinned http origin for the configured
+	// host:port, used in all directives so resources load
+	// correctly regardless of how the webview resolves 'self'.
+	serverOrigin := "http://" + net.JoinHostPort(host, strconv.Itoa(port))
+
+	// connectSrcs collects additional origins for connect-src
+	// (fetch, SSE, WebSocket) — loopback variants, LAN IPs,
+	// and public/proxy origins.
+	connectHTTP := []string{}
+	connectWS := []string{}
+
+	addConnectOrigin := func(h string) {
+		for _, o := range httpOrigin(h, port) {
+			connectHTTP = append(connectHTTP, o)
+			connectWS = append(connectWS, strings.Replace(o, "http://", "ws://", 1))
+		}
+	}
+
+	// Mirror buildAllowedOrigins: when binding to loopback,
+	// include the other loopback variant. When binding to all
+	// interfaces, include all loopback origins plus every
+	// concrete interface IP.
+	switch host {
+	case "127.0.0.1":
+		addConnectOrigin("localhost")
+	case "localhost":
+		addConnectOrigin("127.0.0.1")
+	case "0.0.0.0", "::":
+		addConnectOrigin("127.0.0.1")
+		addConnectOrigin("localhost")
+		addConnectOrigin("::1")
+		for ip := range bindAllIPs {
+			if ip != "127.0.0.1" && ip != "::1" {
+				addConnectOrigin(ip)
+			}
+		}
+	case "::1":
+		addConnectOrigin("127.0.0.1")
+		addConnectOrigin("localhost")
+	}
+
+	for _, origin := range publicOrigins {
+		connectHTTP = append(connectHTTP, origin)
+		connectWS = append(connectWS,
+			strings.NewReplacer(
+				"https://", "wss://",
+				"http://", "ws://",
+			).Replace(origin),
+		)
+	}
+
+	// resource-src: 'self' + pinned server origin (for all resource types)
+	resourceSrc := "'self' " + serverOrigin
+
+	// connect-src: resource-src + loopback/LAN/public origins + ws variants
+	connectParts := []string{resourceSrc}
+	wsOrigin := "ws://" + net.JoinHostPort(host, strconv.Itoa(port))
+	connectParts = append(connectParts, wsOrigin)
+	connectParts = append(connectParts, connectHTTP...)
+	connectParts = append(connectParts, connectWS...)
+	connectSrc := strings.Join(connectParts, " ")
+
+	return fmt.Sprintf(
+		"default-src %[1]s; "+
+			"script-src %[1]s; "+
+			"connect-src %[2]s; "+
+			"img-src %[1]s data:; "+
+			"style-src %[1]s 'unsafe-inline' https://fonts.googleapis.com; "+
+			"font-src %[1]s data: https://fonts.gstatic.com; "+
+			"object-src 'none'; "+
+			"base-uri 'none'; "+
+			"frame-ancestors 'none'",
+		resourceSrc, connectSrc,
+	)
 }
 
 // buildAllowedHosts returns the set of Host header values that

@@ -3,47 +3,38 @@ package main
 import (
 	"context"
 	"encoding/base64"
-	"flag"
+	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/wesm/agentsview/internal/config"
 	"github.com/wesm/agentsview/internal/db"
 	"github.com/wesm/agentsview/internal/postgres"
 	"github.com/wesm/agentsview/internal/server"
 )
 
-func runPG(args []string) {
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr,
-			"usage: agentsview pg <push|status|serve>")
-		os.Exit(1)
-	}
-	switch args[0] {
-	case "push":
-		runPGPush(args[1:])
-	case "status":
-		runPGStatus(args[1:])
-	case "serve":
-		runPGServe(args[1:])
-	default:
-		fmt.Fprintf(os.Stderr,
-			"unknown pg command: %s\n", args[0])
-		os.Exit(1)
-	}
+type PGPushConfig struct {
+	Full            bool
+	ProjectsFlag    string
+	ExcludeProjects string
+	AllProjects     bool
 }
 
-func runPGPush(args []string) {
-	fs := flag.NewFlagSet("pg push", flag.ExitOnError)
-	full := fs.Bool("full", false,
-		"Force full local resync and PG push")
-	if err := fs.Parse(args); err != nil {
-		log.Fatalf("parsing flags: %v", err)
+func runPGPush(cfg PGPushConfig) {
+	if cfg.ProjectsFlag != "" && cfg.ExcludeProjects != "" {
+		fatal("pg push: --projects and --exclude-projects " +
+			"are mutually exclusive")
+	}
+	if cfg.AllProjects &&
+		(cfg.ProjectsFlag != "" || cfg.ExcludeProjects != "") {
+		fatal("pg push: --all-projects cannot be combined " +
+			"with --projects or --exclude-projects")
 	}
 
 	appCfg, err := config.LoadMinimal()
@@ -54,6 +45,38 @@ func runPGPush(args []string) {
 		log.Fatalf("creating data dir: %v", err)
 	}
 	setupLogFile(appCfg.DataDir)
+
+	pgCfg, err := appCfg.ResolvePG()
+	if err != nil {
+		fatal("pg push: %v", err)
+	}
+	if pgCfg.URL == "" {
+		fatal("pg push: url not configured")
+	}
+
+	// CLI flags override config values entirely. When either
+	// flag is set, clear both config-derived lists so a CLI
+	// include can override a config exclude (and vice versa).
+	// --all-projects clears both lists for an unfiltered push.
+	projects := pgCfg.Projects
+	excludeProjects := pgCfg.ExcludeProjects
+	if cfg.AllProjects {
+		projects = nil
+		excludeProjects = nil
+	}
+	if cfg.ProjectsFlag != "" {
+		projects = splitProjectList(cfg.ProjectsFlag)
+		excludeProjects = nil
+	}
+	if cfg.ExcludeProjects != "" {
+		excludeProjects = splitProjectList(cfg.ExcludeProjects)
+		projects = nil
+	}
+
+	if len(projects) > 0 && len(excludeProjects) > 0 {
+		fatal("pg push: projects and exclude_projects " +
+			"are mutually exclusive")
+	}
 
 	database, err := db.Open(appCfg.DBPath)
 	if err != nil {
@@ -75,20 +98,16 @@ func runPGPush(args []string) {
 	// are available for push. If a full resync was performed
 	// (e.g. due to data version change), force a full PG push
 	// since watermarks become stale after a local rebuild.
-	didResync := runLocalSync(appCfg, database, *full)
-	forceFull := *full || didResync
-
-	pgCfg, err := appCfg.ResolvePG()
-	if err != nil {
-		fatal("pg push: %v", err)
-	}
-	if pgCfg.URL == "" {
-		fatal("pg push: url not configured")
-	}
+	didResync := runLocalSync(appCfg, database, cfg.Full)
+	forceFull := cfg.Full || didResync
 
 	ps, err := postgres.New(
 		pgCfg.URL, pgCfg.Schema, database,
 		pgCfg.MachineName, pgCfg.AllowInsecure,
+		postgres.SyncOptions{
+			Projects:        projects,
+			ExcludeProjects: excludeProjects,
+		},
 	)
 	if err != nil {
 		fatal("pg push: %v", err)
@@ -119,12 +138,7 @@ func runPGPush(args []string) {
 	}
 }
 
-func runPGStatus(args []string) {
-	fs := flag.NewFlagSet("pg status", flag.ExitOnError)
-	if err := fs.Parse(args); err != nil {
-		log.Fatalf("parsing flags: %v", err)
-	}
-
+func runPGStatus() {
 	appCfg, err := config.LoadMinimal()
 	if err != nil {
 		log.Fatalf("loading config: %v", err)
@@ -151,6 +165,7 @@ func runPGStatus(args []string) {
 	ps, err := postgres.New(
 		pgCfg.URL, pgCfg.Schema, database,
 		pgCfg.MachineName, pgCfg.AllowInsecure,
+		postgres.SyncOptions{},
 	)
 	if err != nil {
 		fatal("pg status: %v", err)
@@ -173,23 +188,37 @@ func runPGStatus(args []string) {
 	fmt.Printf("PG messages: %d\n", status.PGMessages)
 }
 
-func runPGServe(args []string) {
-	fs := flag.NewFlagSet("pg serve", flag.ExitOnError)
-	host := fs.String("host", "127.0.0.1",
-		"Host to bind to")
-	port := fs.Int("port", 8080,
-		"Port to listen on")
-	basePath := fs.String("base-path", "",
-		"URL prefix for reverse-proxy subpath (e.g. /agentsview)")
-	if err := fs.Parse(args); err != nil {
-		log.Fatalf("parsing flags: %v", err)
+func loadPGServeConfig(cmd *cobra.Command) (config.Config, string, error) {
+	basePath, err := cmd.Flags().GetString("base-path")
+	if err != nil {
+		return config.Config{}, "", fmt.Errorf("reading base-path: %w", err)
+	}
+	cfg, err := config.LoadPGServePFlags(cmd.Flags())
+	if err != nil {
+		return config.Config{}, "", fmt.Errorf("loading config: %w", err)
+	}
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+		return config.Config{}, "", fmt.Errorf("creating data dir: %w", err)
+	}
+	return cfg, basePath, nil
+}
+
+func runPGServe(appCfg config.Config, basePath string) {
+	setupLogFile(appCfg.DataDir)
+	// Enable remote access with auth when binding to a
+	// non-loopback address; keep it off for localhost.
+	if !isLoopbackHost(appCfg.Host) {
+		appCfg.RemoteAccess = true
+		if err := appCfg.EnsureAuthToken(); err != nil {
+			fatal("pg serve: generating auth token: %v", err)
+		}
+	} else {
+		appCfg.RemoteAccess = false
 	}
 
-	appCfg, err := config.LoadMinimal()
-	if err != nil {
-		log.Fatalf("loading config: %v", err)
+	if err := validateServeConfig(appCfg); err != nil {
+		fatal("invalid serve config: %v", err)
 	}
-	setupLogFile(appCfg.DataDir)
 
 	pgCfg, err := appCfg.ResolvePG()
 	if err != nil {
@@ -213,28 +242,35 @@ func runPGServe(args []string) {
 	)
 	defer stop()
 
+	// Attempt to apply any missing schema migrations before
+	// the compatibility check. This handles upgrades (e.g.
+	// new tables like tool_result_events) without requiring a
+	// manual schema drop. If the PG role is read-only the
+	// migration is skipped and the compat check reports what
+	// is missing.
+	if err := postgres.EnsureSchema(
+		ctx, store.DB(), pgCfg.Schema,
+	); err != nil {
+		if !postgres.IsReadOnlyError(err) {
+			fatal("pg serve: schema migration failed: %v", err)
+		}
+	}
+
 	if err := postgres.CheckSchemaCompat(
 		ctx, store.DB(),
 	); err != nil {
-		fatal("pg serve: schema incompatible: %v", err)
+		fatal("pg serve: schema incompatible: %v\n"+
+			"Drop and recreate the PG schema, then run "+
+			"'agentsview pg push --full' to repopulate.", err)
 	}
 
-	appCfg.Host = *host
-	// Enable remote access with auth when binding to a
-	// non-loopback address; keep it off for localhost.
-	if !isLoopbackHost(*host) {
-		appCfg.RemoteAccess = true
-		if err := appCfg.EnsureAuthToken(); err != nil {
-			fatal("pg serve: generating auth token: %v", err)
-		}
-		fmt.Printf("Auth token: %s\n", appCfg.AuthToken)
-	} else {
-		appCfg.RemoteAccess = false
+	rtOpts := serveRuntimeOptions{
+		Mode:          "pg-serve",
+		RequestedPort: appCfg.Port,
 	}
-	appCfg.Port = server.FindAvailablePort(*host, *port)
-	if appCfg.Port != *port {
-		fmt.Printf("Port %d in use, using %d\n",
-			*port, appCfg.Port)
+	appCfg, err = prepareServeRuntimeConfig(appCfg, rtOpts)
+	if err != nil {
+		fatal("pg serve: %v", err)
 	}
 
 	opts := []server.Option{
@@ -246,45 +282,57 @@ func runPGServe(args []string) {
 		}),
 		server.WithBaseContext(ctx),
 	}
-	if *basePath != "" {
-		opts = append(opts, server.WithBasePath(*basePath))
+	if basePath != "" {
+		opts = append(opts, server.WithBasePath(basePath))
 	}
 	srv := server.New(appCfg, store, nil, opts...)
 
-	serveErrCh := make(chan error, 1)
-	go func() {
-		serveErrCh <- srv.ListenAndServe()
-	}()
-	if err := waitForLocalPort(
-		ctx, appCfg.Host, appCfg.Port,
-		5*time.Second, serveErrCh,
-	); err != nil {
-		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(), 5*time.Second,
-		)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-		fatal("pg serve: server failed to start: %v", err)
-	}
-
-	fmt.Printf(
-		"agentsview %s (pg read-only) at http://%s:%d\n",
-		version, appCfg.Host, appCfg.Port,
+	rt, err := startServerWithOptionalCaddy(
+		ctx,
+		appCfg,
+		srv,
+		rtOpts,
 	)
-
-	select {
-	case err := <-serveErrCh:
-		if err != nil && err != http.ErrServerClosed {
-			fatal("pg serve: server error: %v", err)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
 		}
-	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(), 5*time.Second,
+		fatal("pg serve: %v", err)
+	}
+
+	if rt.Cfg.RemoteAccess && rt.Cfg.AuthToken != "" {
+		fmt.Printf("Auth token: %s\n", rt.Cfg.AuthToken)
+	}
+	if rt.PublicURL == rt.LocalURL {
+		fmt.Printf(
+			"agentsview %s (pg read-only) at %s\n",
+			version,
+			rt.LocalURL,
 		)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil &&
-			err != http.ErrServerClosed {
-			fatal("pg serve: shutdown error: %v", err)
+	} else {
+		fmt.Printf(
+			"agentsview %s (pg read-only) backend at %s, public at %s\n",
+			version,
+			rt.LocalURL,
+			rt.PublicURL,
+		)
+	}
+
+	if err := waitForServerRuntime(ctx, srv, rt); err != nil {
+		fatal("pg serve: %v", err)
+	}
+}
+
+// splitProjectList splits a comma-separated string into trimmed,
+// non-empty project names.
+func splitProjectList(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
 		}
 	}
+	return out
 }

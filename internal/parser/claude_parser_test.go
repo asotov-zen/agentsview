@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -141,22 +142,55 @@ func TestParseClaudeSession_SkippedMessages(t *testing.T) {
 			testjsonl.ClaudeUserJSON("This session is being continued from a previous conversation.", tsZero),
 			testjsonl.ClaudeUserJSON("[Request interrupted by user]", tsZeroS1),
 			testjsonl.ClaudeUserJSON("<task-notification>data</task-notification>", tsZeroS2),
-			testjsonl.ClaudeUserJSON("<command-message>x</command-message>", "2024-01-01T00:00:03Z"),
-			testjsonl.ClaudeUserJSON("<command-name>commit</command-name>", "2024-01-01T00:00:04Z"),
 			testjsonl.ClaudeUserJSON("<local-command-result>ok</local-command-result>", "2024-01-01T00:00:05Z"),
 			testjsonl.ClaudeUserJSON("Stop hook feedback: rejected", "2024-01-01T00:00:06Z"),
 			testjsonl.ClaudeUserJSON("real user message", "2024-01-01T00:00:07Z"),
 		)
 		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
-		assert.Equal(t, 8, sess.MessageCount)
+		assert.Equal(t, 6, sess.MessageCount)
 		assert.Equal(t, 1, sess.UserMessageCount)
-		// First 7 messages are system, last is regular.
-		for i := range 7 {
+		// First 5 messages are system, last is regular.
+		for i := range 5 {
 			assert.True(t, msgs[i].IsSystem, "msgs[%d] should be system", i)
 		}
-		assert.False(t, msgs[7].IsSystem)
-		assert.Equal(t, "real user message", msgs[7].Content)
+		assert.False(t, msgs[5].IsSystem)
+		assert.Equal(t, "real user message", msgs[5].Content)
 		assert.Equal(t, "real user message", sess.FirstMessage)
+	})
+
+	t.Run("skill invocation shown as user message", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.ClaudeUserJSON(
+				"<command-message>roborev-fix</command-message>\n<command-name>/roborev-fix</command-name>\n<command-args>450</command-args>",
+				tsZero,
+			),
+			testjsonl.ClaudeAssistantJSON([]map[string]any{
+				{"type": "text", "text": "Looking at issue 450..."},
+			}, tsZeroS1),
+		)
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		assert.Equal(t, 2, sess.MessageCount)
+		assert.Equal(t, 1, sess.UserMessageCount)
+		assert.Equal(t, "/roborev-fix 450", sess.FirstMessage)
+		assert.Equal(t, RoleUser, msgs[0].Role)
+		assert.Equal(t, "/roborev-fix 450", msgs[0].Content)
+	})
+
+	t.Run("skill invocation without args shown as user message", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.ClaudeUserJSON(
+				"<command-message>superpowers:brainstorming</command-message>\n<command-name>/superpowers:brainstorming</command-name>",
+				tsZero,
+			),
+			testjsonl.ClaudeAssistantJSON([]map[string]any{
+				{"type": "text", "text": "Starting brainstorming..."},
+			}, tsZeroS1),
+		)
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		assert.Equal(t, 2, sess.MessageCount)
+		assert.Equal(t, "/superpowers:brainstorming", sess.FirstMessage)
+		assert.Equal(t, RoleUser, msgs[0].Role)
+		assert.Equal(t, "/superpowers:brainstorming", msgs[0].Content)
 	})
 
 	t.Run("assistant with system-like content not marked system", func(t *testing.T) {
@@ -559,6 +593,25 @@ func TestParseClaudeSessionFrom_LinearUUID(
 }
 
 func TestParseClaudeSession_TokenUsage(t *testing.T) {
+	t.Run("explicit parser presence beats fallback inference", func(t *testing.T) {
+		msg := ParsedMessage{
+			TokenUsage:         json.RawMessage(`{"input_tokens":100,"output_tokens":50}`),
+			tokenPresenceKnown: true,
+		}
+		msgHasCtx, msgHasOut := msg.TokenPresence()
+		assert.False(t, msgHasCtx)
+		assert.False(t, msgHasOut)
+
+		sess := ParsedSession{
+			TotalOutputTokens:           50,
+			PeakContextTokens:           100,
+			aggregateTokenPresenceKnown: true,
+		}
+		sessHasTotal, sessHasPeak := sess.AggregateTokenPresence()
+		assert.False(t, sessHasTotal)
+		assert.False(t, sessHasPeak)
+	})
+
 	t.Run("per-message token fields from fixture", func(t *testing.T) {
 		content := loadFixture(t, "claude/valid_session.jsonl")
 		_, msgs := runClaudeParserTest(t, "test.jsonl", content)
@@ -567,21 +620,29 @@ func TestParseClaudeSession_TokenUsage(t *testing.T) {
 		// msgs[2] is user (no usage), msgs[3] is assistant (has usage).
 		assert.Equal(t, 0, msgs[0].ContextTokens)
 		assert.Equal(t, 0, msgs[0].OutputTokens)
+		assert.False(t, msgs[0].HasContextTokens)
+		assert.False(t, msgs[0].HasOutputTokens)
 		assert.Empty(t, msgs[0].Model)
 		assert.Empty(t, msgs[0].TokenUsage)
 
 		// input=100, cache_creation=200, cache_read=300 -> context=600
 		assert.Equal(t, 600, msgs[1].ContextTokens)
 		assert.Equal(t, 50, msgs[1].OutputTokens)
+		assert.True(t, msgs[1].HasContextTokens)
+		assert.True(t, msgs[1].HasOutputTokens)
 		assert.Equal(t, "claude-sonnet-4-20250514", msgs[1].Model)
 		assert.Contains(t, string(msgs[1].TokenUsage), `"input_tokens":100`)
 
 		assert.Equal(t, 0, msgs[2].ContextTokens)
 		assert.Equal(t, 0, msgs[2].OutputTokens)
+		assert.False(t, msgs[2].HasContextTokens)
+		assert.False(t, msgs[2].HasOutputTokens)
 
 		// input=150, cache_creation=0, cache_read=500 -> context=650
 		assert.Equal(t, 650, msgs[3].ContextTokens)
 		assert.Equal(t, 75, msgs[3].OutputTokens)
+		assert.True(t, msgs[3].HasContextTokens)
+		assert.True(t, msgs[3].HasOutputTokens)
 		assert.Equal(t, "claude-sonnet-4-20250514", msgs[3].Model)
 		assert.Contains(t, string(msgs[3].TokenUsage), `"input_tokens":150`)
 	})
@@ -592,6 +653,8 @@ func TestParseClaudeSession_TokenUsage(t *testing.T) {
 
 		assert.Equal(t, 125, sess.TotalOutputTokens)
 		assert.Equal(t, 650, sess.PeakContextTokens)
+		assert.True(t, sess.HasTotalOutputTokens)
+		assert.True(t, sess.HasPeakContextTokens)
 	})
 
 	t.Run("messages without usage get zero values", func(t *testing.T) {
@@ -606,10 +669,44 @@ func TestParseClaudeSession_TokenUsage(t *testing.T) {
 		assert.Equal(t, 0, msgs[0].ContextTokens)
 		assert.Equal(t, 0, msgs[1].ContextTokens)
 		assert.Equal(t, 0, msgs[1].OutputTokens)
+		assert.False(t, msgs[0].HasContextTokens)
+		assert.False(t, msgs[0].HasOutputTokens)
+		assert.False(t, msgs[1].HasContextTokens)
+		assert.False(t, msgs[1].HasOutputTokens)
 		assert.Empty(t, msgs[1].TokenUsage)
 
 		assert.Equal(t, 0, sess.TotalOutputTokens)
 		assert.Equal(t, 0, sess.PeakContextTokens)
+		assert.False(t, sess.HasTotalOutputTokens)
+		assert.False(t, sess.HasPeakContextTokens)
+	})
+
+	t.Run("zero-valued usage keys preserve coverage", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.ClaudeUserJSON("hello", tsZero),
+			`{"type":"assistant","timestamp":"`+tsZeroS1+`","message":{"model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"still counted"}],"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}`,
+		)
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+
+		require.Equal(t, 2, len(msgs))
+		assert.Equal(t, 0, msgs[1].ContextTokens)
+		assert.Equal(t, 0, msgs[1].OutputTokens)
+		assert.True(t, msgs[1].HasContextTokens)
+		assert.True(t, msgs[1].HasOutputTokens)
+		msgHasCtx, msgHasOut := msgs[1].TokenPresence()
+		assert.True(t, msgHasCtx)
+		assert.True(t, msgHasOut)
+
+		assert.Equal(t, 0, sess.TotalOutputTokens)
+		assert.Equal(t, 0, sess.PeakContextTokens)
+		assert.True(t, sess.HasTotalOutputTokens)
+		assert.True(t, sess.HasPeakContextTokens)
+		sessHasTotal, sessHasPeak := sess.AggregateTokenPresence()
+		assert.True(t, sessHasTotal)
+		assert.True(t, sessHasPeak)
+		coverageTotal, coveragePeak := sess.TokenCoverage(msgs)
+		assert.True(t, coverageTotal)
+		assert.True(t, coveragePeak)
 	})
 }
 
@@ -685,5 +782,43 @@ func TestTruncateRespectsRuneBoundaries(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestParseClaudeSession_ExtractsMessageIDAndRequestID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sess-1.jsonl")
+	// Single assistant line with usage + id + requestId.
+	line := `{"type":"assistant","uuid":"u1","parentUuid":"",` +
+		`"timestamp":"2026-04-10T10:00:00.000Z",` +
+		`"requestId":"req_01ABC",` +
+		`"message":{"id":"msg_01XYZ","model":"claude-opus-4-6",` +
+		`"content":[{"type":"text","text":"hi"}],` +
+		`"usage":{"input_tokens":10,"output_tokens":20,` +
+		`"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}`
+	if err := os.WriteFile(path, []byte(line+"\n"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	results, err := ParseClaudeSession(path, "proj", "m")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results = %d, want 1", len(results))
+	}
+	msgs := results[0].Messages
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %d, want 1", len(msgs))
+	}
+	m := msgs[0]
+	if m.ClaudeMessageID != "msg_01XYZ" {
+		t.Errorf("ClaudeMessageID = %q, want msg_01XYZ", m.ClaudeMessageID)
+	}
+	if m.ClaudeRequestID != "req_01ABC" {
+		t.Errorf("ClaudeRequestID = %q, want req_01ABC", m.ClaudeRequestID)
+	}
+	if m.OutputTokens != 20 {
+		t.Errorf("OutputTokens = %d, want 20", m.OutputTokens)
 	}
 }
