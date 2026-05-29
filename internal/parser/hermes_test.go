@@ -1,12 +1,14 @@
 package parser
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -39,6 +41,273 @@ func runHermesJSONTest(
 	)
 	require.NoError(t, err)
 	return sess, msgs
+}
+
+func createHermesStateDB(t *testing.T, root string) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", filepath.Join(root, "state.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	_, err = db.Exec(`
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			source TEXT NOT NULL,
+			user_id TEXT,
+			model TEXT,
+			model_config TEXT,
+			system_prompt TEXT,
+			parent_session_id TEXT,
+			started_at REAL NOT NULL,
+			ended_at REAL,
+			end_reason TEXT,
+			message_count INTEGER DEFAULT 0,
+			tool_call_count INTEGER DEFAULT 0,
+			input_tokens INTEGER DEFAULT 0,
+			output_tokens INTEGER DEFAULT 0,
+			cache_read_tokens INTEGER DEFAULT 0,
+			cache_write_tokens INTEGER DEFAULT 0,
+			reasoning_tokens INTEGER DEFAULT 0,
+			billing_provider TEXT,
+			billing_base_url TEXT,
+			billing_mode TEXT,
+			estimated_cost_usd REAL,
+			actual_cost_usd REAL,
+			cost_status TEXT,
+			cost_source TEXT,
+			pricing_version TEXT,
+			title TEXT,
+			api_call_count INTEGER DEFAULT 0
+		);
+		CREATE TABLE messages (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL,
+			role TEXT NOT NULL,
+			content TEXT,
+			tool_call_id TEXT,
+			tool_calls TEXT,
+			tool_name TEXT,
+			timestamp REAL NOT NULL,
+			token_count INTEGER,
+			finish_reason TEXT,
+			reasoning TEXT,
+			reasoning_content TEXT,
+			reasoning_details TEXT,
+			codex_reasoning_items TEXT,
+			codex_message_items TEXT
+		);
+		INSERT INTO sessions (
+			id, source, model, parent_session_id, started_at, ended_at,
+			message_count, input_tokens, output_tokens, cache_read_tokens,
+			cache_write_tokens, reasoning_tokens, estimated_cost_usd,
+			cost_status, cost_source, title, api_call_count
+		) VALUES (
+			'child', 'discord', 'gpt-5.4', 'parent',
+			1778767200.0, 1778767800.0, 1, 300, 70, 20, 5, 9,
+			0.123, 'estimated', 'hermes', 'Child Session', 4
+		);
+		INSERT INTO messages (
+			session_id, role, content, timestamp
+		) VALUES (
+			'child', 'user', 'state db only has one message', 1778767210.0
+		);
+	`)
+	require.NoError(t, err)
+}
+
+func TestParseHermesArchive_StateDBMetadataUsageAndTranscriptChoice(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	createHermesStateDB(t, root)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(sessionsDir, "session_child.json"),
+		[]byte(`{
+			"platform":"discord",
+			"session_start":"2026-05-14T10:00:00Z",
+			"last_updated":"2026-05-14T10:20:00Z",
+			"messages":[
+				{"role":"user","content":"hello from transcript","timestamp":"2026-05-14T10:01:00Z"},
+				{"role":"assistant","content":"reply from transcript","timestamp":"2026-05-14T10:02:00Z"}
+			]
+		}`),
+		0o644,
+	))
+
+	results, err := ParseHermesArchive(root, "", "local")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+
+	res := results[0]
+	assert.Equal(t, "hermes:child", res.Session.ID)
+	assert.Equal(t, "hermes:parent", res.Session.ParentSessionID)
+	assert.Equal(t, RelContinuation, res.Session.RelationshipType)
+	assert.Equal(t, "Child Session", res.Session.DisplayName)
+	assert.Equal(t, "hermes-discord", res.Session.Project)
+	assert.Equal(t, "child", res.Session.SourceSessionID)
+	assert.Equal(t, "hermes-state-db", res.Session.SourceVersion)
+	require.Len(t, res.Messages, 2)
+	assert.Equal(t, "hello from transcript", res.Messages[0].Content)
+	require.Len(t, res.UsageEvents, 1)
+	assert.Equal(t, "gpt-5.4", res.UsageEvents[0].Model)
+	assert.Equal(t, 300, res.UsageEvents[0].InputTokens)
+	assert.Equal(t, 70, res.UsageEvents[0].OutputTokens)
+	assert.Equal(t, 20, res.UsageEvents[0].CacheReadInputTokens)
+	assert.Equal(t, 5, res.UsageEvents[0].CacheCreationInputTokens)
+	assert.Equal(t, 9, res.UsageEvents[0].ReasoningTokens)
+}
+
+func TestParseHermesArchive_FallsBackToTranscriptsWhenStateDBUnreadable(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "state.db"),
+		[]byte("not sqlite"),
+		0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(sessionsDir, "session_child.json"),
+		[]byte(`{
+			"platform":"discord",
+			"session_start":"2026-05-14T10:00:00Z",
+			"last_updated":"2026-05-14T10:20:00Z",
+			"messages":[
+				{"role":"user","content":"hello from transcript","timestamp":"2026-05-14T10:01:00Z"},
+				{"role":"assistant","content":"reply from transcript","timestamp":"2026-05-14T10:02:00Z"}
+			]
+		}`),
+		0o644,
+	))
+
+	results, err := ParseHermesArchive(root, "override-project", "local")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+
+	res := results[0]
+	assert.Equal(t, "hermes:child", res.Session.ID)
+	assert.Equal(t, "override-project", res.Session.Project)
+	assert.Equal(t, "hello from transcript", res.Session.FirstMessage)
+	assert.Len(t, res.Messages, 2)
+	assert.Empty(t, res.UsageEvents)
+}
+
+func TestParseHermesArchive_UsesStateMessagesWhenJSONLIsLowerQuality(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	createHermesStateDB(t, root)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(sessionsDir, "child.jsonl"),
+		[]byte(strings.Join([]string{
+			`{"role":"session_meta","platform":"discord","timestamp":"2026-05-14T10:00:00Z"}`,
+			`{"role":"user","content":"x","timestamp":"2026-05-14T10:01:00Z"}`,
+		}, "\n")),
+		0o644,
+	))
+
+	results, err := ParseHermesArchive(root, "", "local")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+
+	res := results[0]
+	require.Len(t, res.Messages, 1)
+	assert.Equal(t, "state db only has one message", res.Messages[0].Content)
+	assert.Equal(t, "hermes-state-db", res.Session.SourceVersion)
+}
+
+func TestParseHermesArchiveIncludesTranscriptsMissingFromStateDB(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	createHermesStateDB(t, root)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(sessionsDir, "session_extra.json"),
+		[]byte(`{
+			"platform":"linux",
+			"session_start":"2026-05-14T11:00:00Z",
+			"messages":[
+				{"role":"user","content":"extra transcript","timestamp":"2026-05-14T11:01:00Z"}
+			]
+		}`),
+		0o644,
+	))
+
+	results, err := ParseHermesArchive(root, "", "local")
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+
+	ids := []string{results[0].Session.ID, results[1].Session.ID}
+	assert.Contains(t, ids, "hermes:child")
+	assert.Contains(t, ids, "hermes:extra")
+}
+
+func TestBuildHermesStateResultKeepsUsageOnlySessions(t *testing.T) {
+	res, ok := buildHermesStateResult(
+		hermesStateSession{
+			id:          "usage-only",
+			source:      "cli",
+			model:       "gpt-5.4",
+			startedAt:   time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC),
+			inputTokens: 10,
+		},
+		nil, t.TempDir(), "state.db", "", "local",
+	)
+	require.True(t, ok)
+	assert.Equal(t, "hermes:usage-only", res.Session.ID)
+	assert.Empty(t, res.Messages)
+	require.Len(t, res.UsageEvents, 1)
+	assert.Equal(t, 10, res.UsageEvents[0].InputTokens)
+}
+
+func TestCountHermesUsersSkipsToolResultOnlyMessages(t *testing.T) {
+	got := countHermesUsers([]ParsedMessage{
+		{Role: RoleUser, Content: "real prompt"},
+		{Role: RoleUser, ToolResults: []ParsedToolResult{{ToolUseID: "tc1"}}},
+		{Role: RoleUser, Content: "system", IsSystem: true},
+	})
+	assert.Equal(t, 1, got)
+}
+
+func TestDiscoverHermesSessionsFindsTranscriptOnlyRoot(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	path := filepath.Join(sessionsDir, "session_child.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"messages":[]}`), 0o644))
+
+	files := DiscoverHermesSessions(root)
+	require.Len(t, files, 1)
+	assert.Equal(t, path, files[0].Path)
+}
+
+func TestParseHermesSession_CompactionBoundaryIsSystem(t *testing.T) {
+	sess, msgs := runHermesJSONTest(t, "", `{
+		"platform":"darwin",
+		"session_start":"2026-05-14T10:00:00Z",
+		"last_updated":"2026-05-14T10:02:00Z",
+		"messages":[
+			{"role":"user","content":"[CONTEXT COMPACTION - REFERENCE ONLY]\nold context","timestamp":"2026-05-14T10:01:00Z"},
+			{"role":"user","content":"real prompt","timestamp":"2026-05-14T10:02:00Z"}
+		]
+	}`)
+
+	require.Len(t, msgs, 2)
+	assert.True(t, msgs[0].IsSystem)
+	assert.True(t, msgs[0].IsCompactBoundary)
+	assert.Equal(t, "system", msgs[0].SourceType)
+	assert.Equal(t, "compact_boundary", msgs[0].SourceSubtype)
+	assert.Equal(t, 1, sess.UserMessageCount)
+	assert.Equal(t, "real prompt", sess.FirstMessage)
 }
 
 // --- JSONL format tests ---

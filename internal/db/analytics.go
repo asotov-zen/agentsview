@@ -54,6 +54,7 @@ type AnalyticsFilter struct {
 	ExcludeOneShot   bool   // exclude sessions with user_message_count <= 1
 	ExcludeAutomated bool   // exclude automated (roborev) sessions
 	ActiveSince      string // ISO timestamp cutoff
+	Termination      string // "", "clean", or "unclean"
 }
 
 // location loads the timezone or returns UTC on error.
@@ -70,30 +71,78 @@ func (f AnalyticsFilter) location() *time.Location {
 
 // utcRange returns UTC time bounds padded by ±14h to cover
 // all possible timezone offsets. The WHERE clause uses these
-// to leverage the started_at index.
+// to leverage the started_at index. Empty From/To inputs
+// collapse to wide-open sentinels so a zero AnalyticsFilter
+// matches every session (mirrors the PG store).
 func (f AnalyticsFilter) utcRange() (string, string) {
-	from := f.From + "T00:00:00Z"
-	to := f.To + "T23:59:59Z"
+	const (
+		unboundedFrom = "0001-01-01T00:00:00Z"
+		unboundedTo   = "9999-12-31T23:59:59Z"
+	)
+	from := unboundedFrom
+	if f.From != "" {
+		from = f.From + "T00:00:00Z"
+	}
+	to := unboundedTo
+	if f.To != "" {
+		to = f.To + "T23:59:59Z"
+	}
 
 	tFrom, err := time.Parse(time.RFC3339, from)
 	if err != nil {
-		return from, to
+		return unboundedFrom, unboundedTo
 	}
 	tTo, err := time.Parse(time.RFC3339, to)
 	if err != nil {
-		return from, to
+		return unboundedFrom, unboundedTo
 	}
 
-	// Pad by max UTC offset (±14h)
-	paddedFrom := tFrom.Add(-14 * time.Hour).Format(time.RFC3339)
-	paddedTo := tTo.Add(14 * time.Hour).Format(time.RFC3339)
-	return paddedFrom, paddedTo
+	// Skip ±14h padding on the sentinels to avoid pushing the
+	// lower bound below year 1.
+	if f.From == "" {
+		from = unboundedFrom
+	} else {
+		from = tFrom.Add(-14 * time.Hour).Format(time.RFC3339)
+	}
+	if f.To == "" {
+		to = unboundedTo
+	} else {
+		to = tTo.Add(14 * time.Hour).Format(time.RFC3339)
+	}
+	return from, to
 }
 
 // buildWhere returns a WHERE clause and args for common
 // analytics filters.
 func (f AnalyticsFilter) buildWhere(
 	dateCol string,
+) (string, []any) {
+	return f.buildWhereWithDate(dateCol, true)
+}
+
+// buildWhereWithoutDate returns common analytics predicates
+// without adding session date bounds. Callers that evaluate
+// date windows against message timestamps should use this to
+// avoid pre-filtering by the parent session timestamp.
+func (f AnalyticsFilter) buildWhereWithoutDate() (string, []any) {
+	return f.buildWhereWithDate("", false)
+}
+
+func csvFilterValues(raw string) []string {
+	values := strings.Split(raw, ",")
+	out := values[:0]
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func (f AnalyticsFilter) buildWhereWithDate(
+	dateCol string,
+	includeDate bool,
 ) (string, []any) {
 	preds := []string{
 		"message_count > 0",
@@ -102,15 +151,33 @@ func (f AnalyticsFilter) buildWhere(
 	}
 	var args []any
 
-	utcFrom, utcTo := f.utcRange()
-	preds = append(preds, dateCol+" >= ?")
-	args = append(args, utcFrom)
-	preds = append(preds, dateCol+" <= ?")
-	args = append(args, utcTo)
+	if includeDate {
+		utcFrom, utcTo := f.utcRange()
+		preds = append(preds, dateCol+" >= ?")
+		args = append(args, utcFrom)
+		preds = append(preds, dateCol+" <= ?")
+		args = append(args, utcTo)
+	}
 
 	if f.Machine != "" {
-		preds = append(preds, "machine = ?")
-		args = append(args, f.Machine)
+		machines := csvFilterValues(f.Machine)
+		if len(machines) == 1 {
+			preds = append(preds, "machine = ?")
+			args = append(args, machines[0])
+		} else if len(machines) > 1 {
+			placeholders := make(
+				[]string, len(machines),
+			)
+			for i, machine := range machines {
+				placeholders[i] = "?"
+				args = append(args, machine)
+			}
+			preds = append(preds,
+				"machine IN ("+
+					strings.Join(placeholders, ",")+
+					")",
+			)
+		}
 	}
 
 	if f.Project != "" {
@@ -159,6 +226,11 @@ func (f AnalyticsFilter) buildWhere(
 		preds = append(preds,
 			"COALESCE(NULLIF(ended_at, ''), NULLIF(started_at, ''), created_at) >= ?")
 		args = append(args, f.ActiveSince)
+	}
+
+	if pred, pargs := buildTerminationPredSQLite(f.Termination); pred != "" {
+		preds = append(preds, pred)
+		args = append(args, pargs...)
 	}
 
 	return strings.Join(preds, " AND "), args
@@ -283,8 +355,16 @@ func percentileFloat(sorted []float64, pct float64) float64 {
 }
 
 // inDateRange checks if a local date falls within [from, to].
+// Empty bounds are treated as unbounded so callers can pass a
+// zero AnalyticsFilter to get every session.
 func inDateRange(date, from, to string) bool {
-	return date >= from && date <= to
+	if from != "" && date < from {
+		return false
+	}
+	if to != "" && date > to {
+		return false
+	}
+	return true
 }
 
 // medianInt returns the median of a sorted int slice of
@@ -1017,7 +1097,10 @@ func (db *DB) GetAnalyticsProjects(
 
 	projects := make([]ProjectAnalytics, 0, len(projectMap))
 	for _, name := range projectOrder {
-		pd := projectMap[name]
+		pd, ok := projectMap[name]
+		if !ok || pd == nil {
+			continue
+		}
 		sort.Ints(pd.counts)
 		n := len(pd.counts)
 
@@ -1726,6 +1809,198 @@ type velocityAccumulator struct {
 	sessions       int
 }
 
+// populateVelocityAccumulator fetches per-message timestamps and tool
+// counts for the given sessions and feeds them through
+// processSessionVelocity into a single accumulator. Used by
+// GetSessionStats, which already has its filtered session list and
+// only needs the overall velocity slice — no agent/complexity
+// breakdowns. Sessions with fewer than two messages are silently
+// skipped, matching GetAnalyticsVelocity.
+func populateVelocityAccumulator(
+	ctx context.Context, db *DB, sessionIDs []string,
+	loc *time.Location,
+) (*velocityAccumulator, error) {
+	accum := &velocityAccumulator{}
+	if len(sessionIDs) == 0 {
+		return accum, nil
+	}
+
+	sessionMsgs := make(map[string][]velocityMsg)
+	if err := queryChunked(sessionIDs,
+		func(chunk []string) error {
+			return db.queryVelocityMsgs(
+				ctx, chunk, loc, sessionMsgs,
+			)
+		}); err != nil {
+		return nil, err
+	}
+
+	toolCountMap := make(map[string]int)
+	err := queryChunked(sessionIDs,
+		func(chunk []string) error {
+			ph, chunkArgs := inPlaceholders(chunk)
+			q := `SELECT session_id, COUNT(*)
+				FROM tool_calls
+				WHERE session_id IN ` + ph + `
+				GROUP BY session_id`
+			rows, qErr := db.getReader().QueryContext(
+				ctx, q, chunkArgs...,
+			)
+			if qErr != nil {
+				return fmt.Errorf(
+					"querying velocity tool_calls: %w", qErr,
+				)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var sid string
+				var count int
+				if err := rows.Scan(&sid, &count); err != nil {
+					return fmt.Errorf(
+						"scanning velocity tool_call: %w", err,
+					)
+				}
+				toolCountMap[sid] = count
+			}
+			return rows.Err()
+		})
+	if err != nil {
+		return nil, err
+	}
+
+	for _, sid := range sessionIDs {
+		msgs := sessionMsgs[sid]
+		if len(msgs) < 2 {
+			continue
+		}
+		processSessionVelocity(
+			[]*velocityAccumulator{accum},
+			msgs, toolCountMap[sid],
+		)
+	}
+	return accum, nil
+}
+
+// processSessionVelocity updates every accumulator in accums with one
+// session's turn cycles, first response, and throughput contribution.
+// Shared by GetAnalyticsVelocity (which tracks overall/byAgent/
+// byComplexity) and GetSessionStats (which tracks a single overall).
+//
+// Caller must pass len(msgs) >= 2 in ordinal order. The function
+// itself bumps each accumulator's sessions counter.
+func processSessionVelocity(
+	accums []*velocityAccumulator,
+	msgs []velocityMsg,
+	toolCount int,
+) {
+	const maxCycleSec = 1800.0
+	const maxGapSec = 300.0
+
+	for _, a := range accums {
+		a.sessions++
+	}
+
+	// Turn cycles: user→assistant transitions
+	for i := 1; i < len(msgs); i++ {
+		prev := msgs[i-1]
+		cur := msgs[i]
+		if !prev.valid || !cur.valid {
+			continue
+		}
+		if prev.role == "user" && cur.role == "assistant" {
+			delta := cur.ts.Sub(prev.ts).Seconds()
+			if delta > 0 && delta <= maxCycleSec {
+				for _, a := range accums {
+					a.turnCycles = append(a.turnCycles, delta)
+				}
+			}
+		}
+	}
+
+	// First response: first user → first assistant after it.
+	// Scan by ordinal (conversation order), not timestamp.
+	var firstUser, firstAsst *velocityMsg
+	firstUserIdx := -1
+	for i := range msgs {
+		if msgs[i].role == "user" && msgs[i].valid {
+			firstUser = &msgs[i]
+			firstUserIdx = i
+			break
+		}
+	}
+	if firstUserIdx >= 0 {
+		for i := firstUserIdx + 1; i < len(msgs); i++ {
+			if msgs[i].role == "assistant" && msgs[i].valid {
+				firstAsst = &msgs[i]
+				break
+			}
+		}
+	}
+	if firstUser != nil && firstAsst != nil {
+		delta := firstAsst.ts.Sub(firstUser.ts).Seconds()
+		// Clamp negative deltas to 0: ordinal order is
+		// authoritative, so a negative delta means clock skew,
+		// not a missing response.
+		if delta < 0 {
+			delta = 0
+		}
+		for _, a := range accums {
+			a.firstResponses = append(a.firstResponses, delta)
+		}
+	}
+
+	// Active minutes and throughput
+	activeSec := 0.0
+	asstChars := 0
+	for i, m := range msgs {
+		if m.role == "assistant" {
+			asstChars += m.contentLength
+		}
+		if i > 0 && msgs[i-1].valid && m.valid {
+			gap := m.ts.Sub(msgs[i-1].ts).Seconds()
+			if gap > 0 {
+				if gap > maxGapSec {
+					gap = maxGapSec
+				}
+				activeSec += gap
+			}
+		}
+	}
+	activeMins := activeSec / 60.0
+	if activeMins > 0 {
+		for _, a := range accums {
+			a.totalMsgs += len(msgs)
+			a.totalChars += asstChars
+			a.totalToolCalls += toolCount
+			a.activeMinutes += activeMins
+		}
+	}
+}
+
+// turnCycleMean returns the arithmetic mean of turnCycles, or 0 when
+// empty. Session stats reports mean alongside p50/p90 — the retained
+// slice lets us compute both from the same sample.
+func (a *velocityAccumulator) turnCycleMean() float64 {
+	return meanFloats(a.turnCycles)
+}
+
+// firstResponseMean returns the arithmetic mean of firstResponses, or
+// 0 when empty. See turnCycleMean for rationale.
+func (a *velocityAccumulator) firstResponseMean() float64 {
+	return meanFloats(a.firstResponses)
+}
+
+func meanFloats(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, x := range xs {
+		sum += x
+	}
+	return sum / float64(len(xs))
+}
+
 func (a *velocityAccumulator) computeOverview() VelocityOverview {
 	sort.Float64s(a.turnCycles)
 	sort.Float64s(a.firstResponses)
@@ -1876,9 +2151,6 @@ func (db *DB) GetAnalyticsVelocity(
 	byAgent := make(map[string]*velocityAccumulator)
 	byComplexity := make(map[string]*velocityAccumulator)
 
-	const maxCycleSec = 1800.0
-	const maxGapSec = 300.0
-
 	for _, sid := range sessionIDs {
 		info := sessionMap[sid]
 		msgs := sessionMsgs[sid]
@@ -1896,95 +2168,12 @@ func (db *DB) GetAnalyticsVelocity(
 			byComplexity[compKey] = &velocityAccumulator{}
 		}
 
-		accums := []*velocityAccumulator{
-			overall, byAgent[agentKey], byComplexity[compKey],
-		}
-
-		for _, a := range accums {
-			a.sessions++
-		}
-
-		// Turn cycles: user→assistant transitions
-		for i := 1; i < len(msgs); i++ {
-			prev := msgs[i-1]
-			cur := msgs[i]
-			if !prev.valid || !cur.valid {
-				continue
-			}
-			if prev.role == "user" && cur.role == "assistant" {
-				delta := cur.ts.Sub(prev.ts).Seconds()
-				if delta > 0 && delta <= maxCycleSec {
-					for _, a := range accums {
-						a.turnCycles = append(
-							a.turnCycles, delta,
-						)
-					}
-				}
-			}
-		}
-
-		// First response: first user → first assistant after it
-		// Scan by ordinal (conversation order), not timestamp.
-		var firstUser, firstAsst *velocityMsg
-		firstUserIdx := -1
-		for i := range msgs {
-			if msgs[i].role == "user" && msgs[i].valid {
-				firstUser = &msgs[i]
-				firstUserIdx = i
-				break
-			}
-		}
-		if firstUserIdx >= 0 {
-			for i := firstUserIdx + 1; i < len(msgs); i++ {
-				if msgs[i].role == "assistant" &&
-					msgs[i].valid {
-					firstAsst = &msgs[i]
-					break
-				}
-			}
-		}
-		if firstUser != nil && firstAsst != nil {
-			delta := firstAsst.ts.Sub(firstUser.ts).Seconds()
-			// Clamp negative deltas to 0: ordinal order is
-			// authoritative, so a negative delta means clock
-			// skew, not a missing response.
-			if delta < 0 {
-				delta = 0
-			}
-			for _, a := range accums {
-				a.firstResponses = append(
-					a.firstResponses, delta,
-				)
-			}
-		}
-
-		// Active minutes and throughput
-		activeSec := 0.0
-		asstChars := 0
-		for i, m := range msgs {
-			if m.role == "assistant" {
-				asstChars += m.contentLength
-			}
-			if i > 0 && msgs[i-1].valid && m.valid {
-				gap := m.ts.Sub(msgs[i-1].ts).Seconds()
-				if gap > 0 {
-					if gap > maxGapSec {
-						gap = maxGapSec
-					}
-					activeSec += gap
-				}
-			}
-		}
-		activeMins := activeSec / 60.0
-		if activeMins > 0 {
-			tc := toolCountMap[sid]
-			for _, a := range accums {
-				a.totalMsgs += len(msgs)
-				a.totalChars += asstChars
-				a.totalToolCalls += tc
-				a.activeMinutes += activeMins
-			}
-		}
+		processSessionVelocity(
+			[]*velocityAccumulator{
+				overall, byAgent[agentKey], byComplexity[compKey],
+			},
+			msgs, toolCountMap[sid],
+		)
 	}
 
 	resp := VelocityResponse{
@@ -1999,7 +2188,10 @@ func (db *DB) GetAnalyticsVelocity(
 	sort.Strings(agentKeys)
 	resp.ByAgent = make([]VelocityBreakdown, 0, len(agentKeys))
 	for _, k := range agentKeys {
-		a := byAgent[k]
+		a, ok := byAgent[k]
+		if !ok || a == nil {
+			continue
+		}
 		resp.ByAgent = append(resp.ByAgent, VelocityBreakdown{
 			Label:    k,
 			Sessions: a.sessions,
@@ -2022,7 +2214,10 @@ func (db *DB) GetAnalyticsVelocity(
 		[]VelocityBreakdown, 0, len(compKeys),
 	)
 	for _, k := range compKeys {
-		a := byComplexity[k]
+		a, ok := byComplexity[k]
+		if !ok || a == nil {
+			continue
+		}
 		resp.ByComplexity = append(resp.ByComplexity,
 			VelocityBreakdown{
 				Label:    k,
@@ -2032,6 +2227,472 @@ func (db *DB) GetAnalyticsVelocity(
 	}
 
 	return resp, nil
+}
+
+// --- Signals ---
+
+// SignalsAnalyticsResponse holds aggregated session signal data.
+type SignalsAnalyticsResponse struct {
+	ScoredSessions                int                  `json:"scored_sessions"`
+	UnscoredSessions              int                  `json:"unscored_sessions"`
+	GradeDistribution             map[string]int       `json:"grade_distribution"`
+	AvgHealthScore                *float64             `json:"avg_health_score"`
+	OutcomeDistribution           map[string]int       `json:"outcome_distribution"`
+	OutcomeConfidenceDistribution map[string]int       `json:"outcome_confidence_distribution"`
+	ToolHealth                    SignalsToolHealth    `json:"tool_health"`
+	ContextHealth                 SignalsContextHealth `json:"context_health"`
+	Trend                         []SignalsTrendBucket `json:"trend"`
+	ByAgent                       []SignalsAgentRow    `json:"by_agent"`
+	ByProject                     []SignalsProjectRow  `json:"by_project"`
+}
+
+// SignalsToolHealth holds aggregate tool failure metrics.
+type SignalsToolHealth struct {
+	TotalFailureSignals  int     `json:"total_failure_signals"`
+	TotalRetries         int     `json:"total_retries"`
+	TotalEditChurn       int     `json:"total_edit_churn"`
+	SessionsWithFailures int     `json:"sessions_with_failures"`
+	FailureRate          float64 `json:"failure_rate"`
+}
+
+// SignalsContextHealth holds aggregate context pressure metrics.
+type SignalsContextHealth struct {
+	AvgCompactionCount        float64  `json:"avg_compaction_count"`
+	SessionsWithCompaction    int      `json:"sessions_with_compaction"`
+	MidTaskCompactionCount    int      `json:"mid_task_compaction_count"`
+	SessionsWithMidTaskCompac int      `json:"sessions_with_mid_task_compaction"`
+	SessionsWithContextData   int      `json:"sessions_with_context_data"`
+	AvgContextPressure        *float64 `json:"avg_context_pressure"`
+	HighPressureSessions      int      `json:"high_pressure_sessions"`
+}
+
+// SignalsTrendBucket holds signal data for one date bucket.
+type SignalsTrendBucket struct {
+	Date              string   `json:"date"`
+	SessionCount      int      `json:"session_count"`
+	AvgHealthScore    *float64 `json:"avg_health_score"`
+	Completed         int      `json:"completed"`
+	Errored           int      `json:"errored"`
+	Abandoned         int      `json:"abandoned"`
+	AvgFailureSignals float64  `json:"avg_failure_signals"`
+}
+
+// SignalsAgentRow holds signal data grouped by agent.
+type SignalsAgentRow struct {
+	Agent             string   `json:"agent"`
+	SessionCount      int      `json:"session_count"`
+	AvgHealthScore    *float64 `json:"avg_health_score"`
+	CompletedRate     float64  `json:"completed_rate"`
+	AvgFailureSignals float64  `json:"avg_failure_signals"`
+}
+
+// SignalsProjectRow holds signal data grouped by project.
+type SignalsProjectRow struct {
+	Project           string   `json:"project"`
+	SessionCount      int      `json:"session_count"`
+	AvgHealthScore    *float64 `json:"avg_health_score"`
+	CompletedRate     float64  `json:"completed_rate"`
+	AvgFailureSignals float64  `json:"avg_failure_signals"`
+}
+
+// SignalRow holds per-session signal data from the query.
+// Exported so the PostgreSQL store can build the same rows
+// from its own SELECT and feed them into AggregateSignals
+// without duplicating the aggregation logic.
+type SignalRow struct {
+	ID                     string
+	Agent                  string
+	Project                string
+	Date                   string
+	HealthScore            *int
+	HealthGrade            *string
+	Outcome                string
+	OutcomeConfidence      string
+	ToolFailureSignalCount int
+	ToolRetryCount         int
+	EditChurnCount         int
+	CompactionCount        int
+	MidTaskCompactionCount int
+	ContextPressureMax     *float64
+}
+
+// GetAnalyticsSignals returns aggregated session signal data.
+func (db *DB) GetAnalyticsSignals(
+	ctx context.Context, f AnalyticsFilter,
+) (SignalsAnalyticsResponse, error) {
+	loc := f.location()
+	dateCol := "COALESCE(NULLIF(started_at, ''), created_at)"
+	where, args := f.buildWhere(dateCol)
+
+	var timeIDs map[string]bool
+	if f.HasTimeFilter() {
+		var err error
+		timeIDs, err = db.filteredSessionIDs(ctx, f)
+		if err != nil {
+			return SignalsAnalyticsResponse{}, err
+		}
+	}
+
+	query := `SELECT id, agent, project,
+		` + dateCol + `,
+		health_score, health_grade, outcome,
+		outcome_confidence,
+		tool_failure_signal_count, tool_retry_count,
+		edit_churn_count, compaction_count,
+		mid_task_compaction_count,
+		context_pressure_max
+		FROM sessions WHERE ` + where
+
+	rows, err := db.getReader().QueryContext(
+		ctx, query, args...,
+	)
+	if err != nil {
+		return SignalsAnalyticsResponse{},
+			fmt.Errorf(
+				"querying analytics signals: %w", err,
+			)
+	}
+	defer rows.Close()
+
+	var all []SignalRow
+	for rows.Next() {
+		var r SignalRow
+		var ts string
+		if err := rows.Scan(
+			&r.ID, &r.Agent, &r.Project, &ts,
+			&r.HealthScore, &r.HealthGrade,
+			&r.Outcome, &r.OutcomeConfidence,
+			&r.ToolFailureSignalCount,
+			&r.ToolRetryCount, &r.EditChurnCount,
+			&r.CompactionCount, &r.MidTaskCompactionCount,
+			&r.ContextPressureMax,
+		); err != nil {
+			return SignalsAnalyticsResponse{},
+				fmt.Errorf(
+					"scanning signals row: %w", err,
+				)
+		}
+		r.Date = localDate(ts, loc)
+		if !inDateRange(r.Date, f.From, f.To) {
+			continue
+		}
+		if timeIDs != nil && !timeIDs[r.ID] {
+			continue
+		}
+		all = append(all, r)
+	}
+	if err := rows.Err(); err != nil {
+		return SignalsAnalyticsResponse{},
+			fmt.Errorf(
+				"iterating signals rows: %w", err,
+			)
+	}
+
+	return AggregateSignals(all), nil
+}
+
+// AggregateSignals builds the response from collected rows.
+// Exported so the PostgreSQL store can reuse the same
+// aggregation logic instead of re-implementing it.
+func AggregateSignals(
+	all []SignalRow,
+) SignalsAnalyticsResponse {
+	resp := SignalsAnalyticsResponse{
+		GradeDistribution:             make(map[string]int),
+		OutcomeDistribution:           make(map[string]int),
+		OutcomeConfidenceDistribution: make(map[string]int),
+	}
+
+	if len(all) == 0 {
+		resp.Trend = []SignalsTrendBucket{}
+		resp.ByAgent = []SignalsAgentRow{}
+		resp.ByProject = []SignalsProjectRow{}
+		return resp
+	}
+
+	type groupAccum struct {
+		count            int
+		healthScoreSum   int
+		healthScoreCount int
+		completed        int
+		failureSignalSum int
+	}
+
+	totalCount := len(all)
+	var healthScoreSum int
+	var healthScoreCount int
+
+	agentMap := make(map[string]*groupAccum)
+	projectMap := make(map[string]*groupAccum)
+	trendMap := make(map[string]*groupAccum)
+
+	// Also track trend-specific outcome counts.
+	type trendExtra struct {
+		errored   int
+		abandoned int
+	}
+	trendExtras := make(map[string]*trendExtra)
+
+	for _, r := range all {
+		// Scored vs unscored
+		if r.HealthScore != nil {
+			resp.ScoredSessions++
+			healthScoreSum += *r.HealthScore
+			healthScoreCount++
+		} else {
+			resp.UnscoredSessions++
+		}
+
+		// Grade distribution
+		if r.HealthGrade != nil && *r.HealthGrade != "" {
+			resp.GradeDistribution[*r.HealthGrade]++
+		}
+
+		// Outcome distribution
+		if r.Outcome != "" {
+			resp.OutcomeDistribution[r.Outcome]++
+		}
+		if r.OutcomeConfidence != "" {
+			resp.OutcomeConfidenceDistribution[r.OutcomeConfidence]++
+		}
+
+		// Tool health
+		resp.ToolHealth.TotalFailureSignals += r.ToolFailureSignalCount
+		resp.ToolHealth.TotalRetries += r.ToolRetryCount
+		resp.ToolHealth.TotalEditChurn += r.EditChurnCount
+		if r.ToolFailureSignalCount > 0 {
+			resp.ToolHealth.SessionsWithFailures++
+		}
+
+		// Context health
+		if r.CompactionCount > 0 {
+			resp.ContextHealth.SessionsWithCompaction++
+		}
+		resp.ContextHealth.AvgCompactionCount += float64(
+			r.CompactionCount,
+		)
+		resp.ContextHealth.MidTaskCompactionCount +=
+			r.MidTaskCompactionCount
+		if r.MidTaskCompactionCount > 0 {
+			resp.ContextHealth.SessionsWithMidTaskCompac++
+		}
+		if r.ContextPressureMax != nil {
+			resp.ContextHealth.SessionsWithContextData++
+			if *r.ContextPressureMax >= 0.8 {
+				resp.ContextHealth.HighPressureSessions++
+			}
+		}
+
+		// Accumulate by agent
+		ga := agentMap[r.Agent]
+		if ga == nil {
+			ga = &groupAccum{}
+			agentMap[r.Agent] = ga
+		}
+		ga.count++
+		ga.failureSignalSum += r.ToolFailureSignalCount
+		if r.HealthScore != nil {
+			ga.healthScoreSum += *r.HealthScore
+			ga.healthScoreCount++
+		}
+		if r.Outcome == "completed" {
+			ga.completed++
+		}
+
+		// Accumulate by project
+		gp := projectMap[r.Project]
+		if gp == nil {
+			gp = &groupAccum{}
+			projectMap[r.Project] = gp
+		}
+		gp.count++
+		gp.failureSignalSum += r.ToolFailureSignalCount
+		if r.HealthScore != nil {
+			gp.healthScoreSum += *r.HealthScore
+			gp.healthScoreCount++
+		}
+		if r.Outcome == "completed" {
+			gp.completed++
+		}
+
+		// Accumulate by date (trend)
+		gt := trendMap[r.Date]
+		if gt == nil {
+			gt = &groupAccum{}
+			trendMap[r.Date] = gt
+		}
+		gt.count++
+		gt.failureSignalSum += r.ToolFailureSignalCount
+		if r.HealthScore != nil {
+			gt.healthScoreSum += *r.HealthScore
+			gt.healthScoreCount++
+		}
+		if r.Outcome == "completed" {
+			gt.completed++
+		}
+		te := trendExtras[r.Date]
+		if te == nil {
+			te = &trendExtra{}
+			trendExtras[r.Date] = te
+		}
+		if r.Outcome == "errored" {
+			te.errored++
+		}
+		if r.Outcome == "abandoned" {
+			te.abandoned++
+		}
+	}
+
+	// Average health score
+	if healthScoreCount > 0 {
+		avg := math.Round(
+			float64(healthScoreSum)/
+				float64(healthScoreCount)*10,
+		) / 10
+		resp.AvgHealthScore = &avg
+	}
+
+	// Tool health failure rate
+	if totalCount > 0 {
+		resp.ToolHealth.FailureRate = math.Round(
+			float64(resp.ToolHealth.SessionsWithFailures)/
+				float64(totalCount)*1000,
+		) / 10
+	}
+
+	// Context health averages
+	if totalCount > 0 {
+		resp.ContextHealth.AvgCompactionCount = math.Round(
+			resp.ContextHealth.AvgCompactionCount/
+				float64(totalCount)*10,
+		) / 10
+	}
+	if resp.ContextHealth.SessionsWithContextData > 0 {
+		var pressureSum float64
+		for _, r := range all {
+			if r.ContextPressureMax != nil {
+				pressureSum += *r.ContextPressureMax
+			}
+		}
+		avg := math.Round(
+			pressureSum/
+				float64(
+					resp.ContextHealth.SessionsWithContextData,
+				)*1000,
+		) / 1000
+		resp.ContextHealth.AvgContextPressure = &avg
+	}
+
+	// Build trend (sorted by date)
+	resp.Trend = make(
+		[]SignalsTrendBucket, 0, len(trendMap),
+	)
+	for date, g := range trendMap {
+		bucket := SignalsTrendBucket{
+			Date:         date,
+			SessionCount: g.count,
+			Completed:    g.completed,
+		}
+		if te := trendExtras[date]; te != nil {
+			bucket.Errored = te.errored
+			bucket.Abandoned = te.abandoned
+		}
+		if g.healthScoreCount > 0 {
+			avg := math.Round(
+				float64(g.healthScoreSum)/
+					float64(g.healthScoreCount)*10,
+			) / 10
+			bucket.AvgHealthScore = &avg
+		}
+		if g.count > 0 {
+			bucket.AvgFailureSignals = math.Round(
+				float64(g.failureSignalSum)/
+					float64(g.count)*10,
+			) / 10
+		}
+		resp.Trend = append(resp.Trend, bucket)
+	}
+	sort.Slice(resp.Trend, func(i, j int) bool {
+		return resp.Trend[i].Date < resp.Trend[j].Date
+	})
+
+	// Build by-agent (sorted alphabetically)
+	agentKeys := make([]string, 0, len(agentMap))
+	for k := range agentMap {
+		agentKeys = append(agentKeys, k)
+	}
+	sort.Strings(agentKeys)
+	resp.ByAgent = make(
+		[]SignalsAgentRow, 0, len(agentKeys),
+	)
+	for _, agent := range agentKeys {
+		g, ok := agentMap[agent]
+		if !ok || g == nil {
+			continue
+		}
+		row := SignalsAgentRow{
+			Agent:        agent,
+			SessionCount: g.count,
+		}
+		if g.healthScoreCount > 0 {
+			avg := math.Round(
+				float64(g.healthScoreSum)/
+					float64(g.healthScoreCount)*10,
+			) / 10
+			row.AvgHealthScore = &avg
+		}
+		if g.count > 0 {
+			row.CompletedRate = math.Round(
+				float64(g.completed)/
+					float64(g.count)*1000,
+			) / 10
+			row.AvgFailureSignals = math.Round(
+				float64(g.failureSignalSum)/
+					float64(g.count)*10,
+			) / 10
+		}
+		resp.ByAgent = append(resp.ByAgent, row)
+	}
+
+	// Build by-project (sorted by session count desc)
+	resp.ByProject = make(
+		[]SignalsProjectRow, 0, len(projectMap),
+	)
+	for project, g := range projectMap {
+		row := SignalsProjectRow{
+			Project:      project,
+			SessionCount: g.count,
+		}
+		if g.healthScoreCount > 0 {
+			avg := math.Round(
+				float64(g.healthScoreSum)/
+					float64(g.healthScoreCount)*10,
+			) / 10
+			row.AvgHealthScore = &avg
+		}
+		if g.count > 0 {
+			row.CompletedRate = math.Round(
+				float64(g.completed)/
+					float64(g.count)*1000,
+			) / 10
+			row.AvgFailureSignals = math.Round(
+				float64(g.failureSignalSum)/
+					float64(g.count)*10,
+			) / 10
+		}
+		resp.ByProject = append(resp.ByProject, row)
+	}
+	sort.Slice(resp.ByProject, func(i, j int) bool {
+		if resp.ByProject[i].SessionCount !=
+			resp.ByProject[j].SessionCount {
+			return resp.ByProject[i].SessionCount >
+				resp.ByProject[j].SessionCount
+		}
+		return resp.ByProject[i].Project <
+			resp.ByProject[j].Project
+	})
+
+	return resp
 }
 
 // --- Top Sessions ---
@@ -2044,6 +2705,13 @@ type TopSession struct {
 	MessageCount int     `json:"message_count"`
 	OutputTokens int     `json:"output_tokens"`
 	DurationMin  float64 `json:"duration_min"`
+	// StartedAt and EndedAt are included so the frontend can
+	// derive a recency-based status tier — the StatusDot in the
+	// Top Sessions column needs the same time window inputs as
+	// the sidebar's session list.
+	StartedAt         *string `json:"started_at,omitempty"`
+	EndedAt           *string `json:"ended_at,omitempty"`
+	TerminationStatus *string `json:"termination_status,omitempty"`
 }
 
 // TopSessionsResponse wraps the top sessions list.
@@ -2091,7 +2759,8 @@ func (db *DB) GetAnalyticsTopSessions(
 
 	query := `SELECT id, ` + dateCol + `, project,
 		first_message, message_count,
-		total_output_tokens, started_at, ended_at
+		total_output_tokens, started_at, ended_at,
+		termination_status
 		FROM sessions WHERE ` + where +
 		` ORDER BY ` + orderExpr + ` LIMIT 200`
 
@@ -2105,11 +2774,12 @@ func (db *DB) GetAnalyticsTopSessions(
 	var sessions []TopSession
 	for rows.Next() {
 		var id, ts, project string
-		var firstMsg, startedAt, endedAt *string
+		var firstMsg, startedAt, endedAt, termStatus *string
 		var mc, outputTokens int
 		if err := rows.Scan(
 			&id, &ts, &project, &firstMsg,
 			&mc, &outputTokens, &startedAt, &endedAt,
+			&termStatus,
 		); err != nil {
 			return TopSessionsResponse{},
 				fmt.Errorf("scanning top session: %w", err)
@@ -2131,12 +2801,15 @@ func (db *DB) GetAnalyticsTopSessions(
 			}
 		}
 		sessions = append(sessions, TopSession{
-			ID:           id,
-			Project:      project,
-			FirstMessage: firstMsg,
-			MessageCount: mc,
-			OutputTokens: outputTokens,
-			DurationMin:  durMin,
+			ID:                id,
+			Project:           project,
+			FirstMessage:      firstMsg,
+			MessageCount:      mc,
+			OutputTokens:      outputTokens,
+			DurationMin:       durMin,
+			StartedAt:         startedAt,
+			EndedAt:           endedAt,
+			TerminationStatus: termStatus,
 		})
 	}
 	if err := rows.Err(); err != nil {

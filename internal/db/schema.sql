@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     file_path   TEXT,
     file_size   INTEGER,
     file_mtime  INTEGER,
+    file_inode  INTEGER,
+    file_device INTEGER,
     file_hash   TEXT,
     cwd         TEXT,
     local_modified_at TEXT,
@@ -23,8 +25,34 @@ CREATE TABLE IF NOT EXISTS sessions (
     has_total_output_tokens INTEGER NOT NULL DEFAULT 0,
     has_peak_context_tokens INTEGER NOT NULL DEFAULT 0,
     is_automated INTEGER NOT NULL DEFAULT 0,
+    tool_failure_signal_count INTEGER NOT NULL DEFAULT 0,
+    tool_retry_count INTEGER NOT NULL DEFAULT 0,
+    edit_churn_count INTEGER NOT NULL DEFAULT 0,
+    consecutive_failure_max INTEGER NOT NULL DEFAULT 0,
+    outcome TEXT NOT NULL DEFAULT 'unknown',
+    outcome_confidence TEXT NOT NULL DEFAULT 'low',
+    ended_with_role TEXT NOT NULL DEFAULT '',
+    final_failure_streak INTEGER NOT NULL DEFAULT 0,
+    signals_pending_since TEXT,
+    compaction_count INTEGER NOT NULL DEFAULT 0,
+    mid_task_compaction_count INTEGER NOT NULL DEFAULT 0,
+    context_pressure_max REAL,
+    health_score INTEGER,
+    health_grade TEXT,
+    has_tool_calls INTEGER NOT NULL DEFAULT 0,
+    has_context_data INTEGER NOT NULL DEFAULT 0,
+    data_version INTEGER NOT NULL DEFAULT 0,
+    cwd TEXT NOT NULL DEFAULT '',
+    git_branch TEXT NOT NULL DEFAULT '',
+    source_session_id TEXT NOT NULL DEFAULT '',
+    source_version TEXT NOT NULL DEFAULT '',
+    parser_malformed_lines INTEGER NOT NULL DEFAULT 0,
+    is_truncated INTEGER NOT NULL DEFAULT 0,
     deleted_at  TEXT,
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    termination_status TEXT,
+    secret_leak_count INTEGER NOT NULL DEFAULT 0,
+    secrets_rules_version TEXT NOT NULL DEFAULT ''
 );
 
 -- Messages table with ordinal for efficient range queries
@@ -34,6 +62,7 @@ CREATE TABLE IF NOT EXISTS messages (
     ordinal        INTEGER NOT NULL,
     role           TEXT NOT NULL,
     content        TEXT NOT NULL,
+    thinking_text  TEXT NOT NULL DEFAULT '',
     timestamp      TEXT,
     has_thinking   INTEGER NOT NULL DEFAULT 0,
     has_tool_use   INTEGER NOT NULL DEFAULT 0,
@@ -49,6 +78,12 @@ CREATE TABLE IF NOT EXISTS messages (
     has_output_tokens INTEGER NOT NULL DEFAULT 0,
     claude_message_id TEXT NOT NULL DEFAULT '',
     claude_request_id TEXT NOT NULL DEFAULT '',
+    source_type TEXT NOT NULL DEFAULT '',
+    source_subtype TEXT NOT NULL DEFAULT '',
+    source_uuid TEXT NOT NULL DEFAULT '',
+    source_parent_uuid TEXT NOT NULL DEFAULT '',
+    is_sidechain INTEGER NOT NULL DEFAULT 0,
+    is_compact_boundary INTEGER NOT NULL DEFAULT 0,
     UNIQUE(session_id, ordinal)
 );
 
@@ -108,6 +143,35 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user_message_count
 CREATE INDEX IF NOT EXISTS idx_sessions_agent
     ON sessions(agent);
 
+-- Session-level usage events. These complement message-level
+-- messages.token_usage rows for agents that only expose aggregate
+-- session accounting.
+CREATE TABLE IF NOT EXISTS usage_events (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    message_ordinal INTEGER,
+    source TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL,
+    cost_status TEXT NOT NULL DEFAULT '',
+    cost_source TEXT NOT NULL DEFAULT '',
+    occurred_at TEXT,
+    dedup_key TEXT NOT NULL DEFAULT ''
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_dedup
+    ON usage_events(session_id, source, dedup_key)
+    WHERE dedup_key != '';
+CREATE INDEX IF NOT EXISTS idx_usage_events_session
+    ON usage_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_usage_events_occurred
+    ON usage_events(occurred_at);
+
 -- Tool calls table
 CREATE TABLE IF NOT EXISTS tool_calls (
     id         INTEGER PRIMARY KEY,
@@ -127,6 +191,13 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session
     ON tool_calls(session_id);
+-- idx_tool_calls_message backs the ON DELETE CASCADE from
+-- messages(id). Without it SQLite full-scans tool_calls per
+-- deleted message row, which makes ReplaceSessionMessages
+-- O(messages * tool_calls) and stalls sync once tool_calls
+-- grows large.
+CREATE INDEX IF NOT EXISTS idx_tool_calls_message
+    ON tool_calls(message_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_category
     ON tool_calls(category);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_skill
@@ -198,6 +269,12 @@ CREATE TABLE IF NOT EXISTS pinned_messages (
 
 CREATE INDEX IF NOT EXISTS idx_pinned_session
     ON pinned_messages(session_id);
+-- idx_pinned_message backs the ON DELETE CASCADE from messages(id).
+-- The UNIQUE(session_id, message_id) constraint creates an index
+-- ordered (session_id, message_id), which the FK lookup on
+-- message_id alone cannot use (leftmost-prefix rule).
+CREATE INDEX IF NOT EXISTS idx_pinned_message
+    ON pinned_messages(message_id);
 CREATE INDEX IF NOT EXISTS idx_pinned_created
     ON pinned_messages(created_at DESC);
 
@@ -221,6 +298,32 @@ CREATE TABLE IF NOT EXISTS skipped_files (
     file_mtime INTEGER NOT NULL
 );
 
+-- Remote skip cache: tracks file mtimes per remote host
+-- for SSH sync incremental optimization.
+CREATE TABLE IF NOT EXISTS remote_skipped_files (
+    host       TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    file_mtime INTEGER NOT NULL,
+    PRIMARY KEY (host, path)
+);
+
+CREATE TABLE IF NOT EXISTS worktree_project_mappings (
+    id          INTEGER PRIMARY KEY,
+    machine     TEXT NOT NULL,
+    path_prefix TEXT NOT NULL,
+    project     TEXT NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(machine, path_prefix)
+);
+
+CREATE INDEX IF NOT EXISTS idx_worktree_project_mappings_match
+    ON worktree_project_mappings(machine, enabled, path_prefix);
+
+CREATE INDEX IF NOT EXISTS idx_worktree_project_mappings_project
+    ON worktree_project_mappings(machine, project);
+
 -- PG sync state: stores watermarks for push sync
 CREATE TABLE IF NOT EXISTS pg_sync_state (
     key   TEXT PRIMARY KEY,
@@ -237,3 +340,40 @@ CREATE TABLE IF NOT EXISTS model_pricing (
     updated_at       TEXT NOT NULL
         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+
+-- Git aggregation TTL cache: memoizes `git log --numstat` and
+-- `gh pr list` results per (repo, author, window) tuple so
+-- repeated `agentsview stats` invocations don't re-shell out.
+CREATE TABLE IF NOT EXISTS git_cache (
+    cache_key   TEXT PRIMARY KEY,          -- sha256(repo|author|since|until|kind)
+    kind        TEXT NOT NULL,             -- 'log' | 'pr'
+    payload     TEXT NOT NULL,             -- JSON-encoded result
+    computed_at TEXT NOT NULL              -- RFC3339
+);
+
+-- Secret findings: persisted detections from internal/secrets.
+-- Located by natural coordinates (no row IDs) so findings survive the
+-- full-resync orphan copy. Only redacted values are stored.
+CREATE TABLE IF NOT EXISTS secret_findings (
+    id              INTEGER PRIMARY KEY,
+    session_id      TEXT NOT NULL
+        REFERENCES sessions(id) ON DELETE CASCADE,
+    rule_name       TEXT NOT NULL,
+    confidence      TEXT NOT NULL,
+    location_kind   TEXT NOT NULL,
+    message_ordinal INTEGER NOT NULL,
+    call_index      INTEGER,
+    event_index     INTEGER,
+    match_start     INTEGER NOT NULL,
+    match_end       INTEGER NOT NULL,
+    match_index     INTEGER NOT NULL,
+    redacted_match  TEXT NOT NULL,
+    rules_version   TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_secret_findings_session
+    ON secret_findings(session_id);
+CREATE INDEX IF NOT EXISTS idx_secret_findings_rule
+    ON secret_findings(rule_name);

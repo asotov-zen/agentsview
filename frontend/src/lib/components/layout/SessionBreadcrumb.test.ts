@@ -46,6 +46,7 @@ function makeSession(
     user_message_count: 1,
     total_output_tokens: 0,
     peak_context_tokens: 0,
+    is_automated: false,
     created_at: "2026-02-20T12:30:00Z",
     ...overrides,
   };
@@ -225,4 +226,27 @@ describe("SessionBreadcrumb", () => {
 
     unmount(component);
   });
+
+  it("hides local-only actions for remote sessions", async () => {
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude", {
+          id: "devbox1~abc-123",
+          machine: "devbox1",
+        }),
+        onBack: () => {},
+      },
+    });
+
+    await tick();
+
+    // The dropdown trigger (.resume-btn) should not appear
+    // for remote sessions (no resume, no copy-dir, no open-in).
+    const resumeBtn = document.querySelector(".resume-btn");
+    expect(resumeBtn).toBeNull();
+
+    unmount(component);
+  });
+
 });

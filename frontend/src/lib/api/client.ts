@@ -1,6 +1,7 @@
 import type {
   SessionPage,
   Session,
+  SidebarSessionIndexResponse,
   MessagesResponse,
   SearchResponse,
   ProjectsResponse,
@@ -24,9 +25,12 @@ import type {
   VelocityResponse,
   ToolsAnalyticsResponse,
   TopSessionsResponse,
+  SignalsAnalyticsResponse,
   Granularity,
   HeatmapMetric,
   TopSessionsMetric,
+  TrendsGranularity,
+  TrendsTermsResponse,
   Insight,
   InsightsResponse,
   GenerateInsightRequest,
@@ -38,6 +42,7 @@ import type {
   UsageTopSessionsParams,
 } from "./types.js";
 import type { SessionActivityResponse } from "./types/session-activity.js";
+import type { SessionTiming } from "./types/timing.js";
 
 const SERVER_URL_KEY = "agentsview-server-url";
 const AUTH_TOKEN_KEY = "agentsview-auth-token";
@@ -113,14 +118,36 @@ export class ApiError extends Error {
 }
 
 function apiErrorMessage(status: number, body: string): string {
-  return body.trim() || `API ${status}`;
+  const text = body.trim();
+  if (!text) return `API ${status}`;
+
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      "error" in parsed &&
+      typeof parsed.error === "string" &&
+      parsed.error
+    ) {
+      return parsed.error;
+    }
+  } catch {
+    // Plain-text error body.
+  }
+
+  return text;
+}
+
+async function responseErrorMessage(res: Response): Promise<string> {
+  const body = await res.text().catch(() => "");
+  return apiErrorMessage(res.status, body);
 }
 
 async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${getBase()}${path}`, authHeaders(init));
   if (!res.ok) {
-    const body = await res.text();
-    throw new ApiError(res.status, apiErrorMessage(res.status, body));
+    throw new ApiError(res.status, await responseErrorMessage(res));
   }
   return res.json() as Promise<T>;
 }
@@ -145,6 +172,7 @@ export interface ListSessionsParams {
   exclude_project?: string;
   machine?: string;
   agent?: string;
+  termination?: string;
   date?: string;
   date_from?: string;
   date_to?: string;
@@ -153,15 +181,27 @@ export interface ListSessionsParams {
   max_messages?: number;
   min_user_messages?: number;
   include_one_shot?: boolean;
+  include_automated?: boolean;
   include_children?: boolean;
   cursor?: string;
   limit?: number;
 }
 
+export type SidebarSessionIndexParams = Omit<
+  ListSessionsParams,
+  "include_children" | "cursor" | "limit"
+>;
+
 export function listSessions(
   params: ListSessionsParams = {},
 ): Promise<SessionPage> {
   return fetchJSON(`/sessions${buildQuery({ ...params })}`);
+}
+
+export function getSidebarSessionIndex(
+  params: SidebarSessionIndexParams = {},
+): Promise<SidebarSessionIndexResponse> {
+  return fetchJSON(`/sessions/sidebar-index${buildQuery({ ...params })}`);
 }
 
 export function getSession(id: string, init?: RequestInit): Promise<Session> {
@@ -400,6 +440,11 @@ function processFrame(
   return undefined;
 }
 
+/** Event payload for /api/v1/events data_changed frames. */
+export interface DataChangedEvent {
+  scope: "messages" | "sessions" | "sync";
+}
+
 /** Watch a session for live updates via SSE.
  *
  * SECURITY NOTE: The native EventSource API does not support custom
@@ -409,9 +454,17 @@ function processFrame(
  * limitation of SSE — switching to a fetch-based streaming
  * approach would avoid this but adds significant complexity.
  */
+/** Number of consecutive onerror firings without a successful
+ * connection or event delivery before watchSession gives up. Guards
+ * against the browser hammering `/watch` forever when the session
+ * id is unknown (server returns 404 per the Session API contract)
+ * or the server is permanently refusing the stream. */
+export const WATCH_SESSION_MAX_CONSECUTIVE_ERRORS = 5;
+
 export function watchSession(
   sessionId: string,
   onUpdate: () => void,
+  onTiming?: (t: SessionTiming) => void,
 ): EventSource {
   const url = `${getBase()}/sessions/${sessionId}/watch`;
   const token = getAuthToken();
@@ -420,12 +473,140 @@ export function watchSession(
   const fullUrl = token ? `${url}?token=${encodeURIComponent(token)}` : url;
   const es = new EventSource(fullUrl);
 
+  // Circuit breaker: mirrors watchEvents. A 404 (unknown session)
+  // or other permanent failure would otherwise have EventSource
+  // reconnect in a loop. Counter resets on `open` or a delivered
+  // event so a healthy-but-quiet stream isn't tripped.
+  let consecutiveErrors = 0;
+
+  es.addEventListener("open", () => {
+    consecutiveErrors = 0;
+  });
+
   es.addEventListener("session_updated", () => {
+    consecutiveErrors = 0;
     onUpdate();
   });
 
+  if (onTiming) {
+    es.addEventListener("session.timing", (ev: MessageEvent) => {
+      try {
+        onTiming(JSON.parse(ev.data) as SessionTiming);
+      } catch (err) {
+        console.warn("session.timing parse failed", err);
+      }
+    });
+  }
+
   es.onerror = () => {
-    // Connection will auto-retry via EventSource spec
+    consecutiveErrors += 1;
+    if (consecutiveErrors >= WATCH_SESSION_MAX_CONSECUTIVE_ERRORS) {
+      es.close();
+    }
+  };
+
+  return es;
+}
+
+/** Watch the global sync event stream via SSE.
+ *
+ * Returns the underlying EventSource so callers can close() it
+ * when done. The browser's native EventSource auto-reconnects
+ * on transient errors; in PG serve mode the endpoint returns
+ * 503 and the browser will retry at its default interval.
+ *
+ * SECURITY NOTE: Same as watchSession — EventSource cannot set
+ * headers, so the auth token is passed as a query parameter
+ * for remote connections. This may leak the token into browser
+ * history / access logs; accepted per the project threat model.
+ */
+/** Number of consecutive onerror firings without any successful
+ * event delivery before watchEvents gives up and closes the
+ * underlying EventSource. This protects PG serve mode — where
+ * /api/v1/events returns 503 permanently — from turning into a
+ * forever retry loop in the browser.
+ */
+export const WATCH_EVENTS_MAX_CONSECUTIVE_ERRORS = 5;
+
+export interface WatchEventsOptions {
+  /** Called once when the circuit breaker trips WITHOUT the
+   * EventSource ever having reached the OPEN state. That pattern
+   * indicates the endpoint is permanently unreachable for this
+   * client (PG serve mode returning 503, incompatible server
+   * build, wrong URL, etc.), so callers should stop retrying.
+   * Transient failures — where `open` fired at least once before
+   * the breaker tripped — do not call this, letting callers
+   * recover on their own.
+   */
+  onPermanentFailure?: () => void;
+}
+
+export function watchEvents(
+  onEvent: (e: DataChangedEvent) => void,
+  opts: WatchEventsOptions = {},
+): EventSource {
+  const url = `${getBase()}/events`;
+  const token = getAuthToken();
+  const fullUrl = token
+    ? `${url}?token=${encodeURIComponent(token)}`
+    : url;
+  const es = new EventSource(fullUrl);
+
+  // Circuit breaker: on N consecutive onerror firings without any
+  // successful connection or event delivery, close the stream.
+  // The counter resets on both `open` (a successful (re)connect)
+  // and a delivered `data_changed` event, so a quiet but healthy
+  // stream isn't tripped by transient network blips.
+  //
+  // `hasOpened` distinguishes "never worked" (permanent failure,
+  // e.g. PG serve 503) from "worked once, then failed" (transient
+  // outage). Permanent failures invoke onPermanentFailure so the
+  // caller can stop retrying.
+  let consecutiveErrors = 0;
+  let hasOpened = false;
+
+  es.addEventListener("open", () => {
+    hasOpened = true;
+    consecutiveErrors = 0;
+  });
+
+  es.addEventListener("data_changed", (msg) => {
+    // Successful delivery also resets the circuit breaker.
+    consecutiveErrors = 0;
+    hasOpened = true;
+    // Parse and shape-check the payload. Anything that isn't an
+    // object with a known scope collapses to a safe refresh signal
+    // so subscribers never observe scope === undefined.
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse((msg as MessageEvent).data);
+    } catch {
+      onEvent({ scope: "sync" });
+      return;
+    }
+    const scope =
+      typeof parsed === "object" && parsed !== null
+        ? (parsed as { scope?: unknown }).scope
+        : undefined;
+    if (
+      scope === "messages" ||
+      scope === "sessions" ||
+      scope === "sync"
+    ) {
+      onEvent({ scope });
+    } else {
+      onEvent({ scope: "sync" });
+    }
+  });
+
+  es.onerror = () => {
+    consecutiveErrors += 1;
+    if (consecutiveErrors >= WATCH_EVENTS_MAX_CONSECUTIVE_ERRORS) {
+      es.close();
+      if (!hasOpened && opts.onPermanentFailure) {
+        opts.onPermanentFailure();
+      }
+    }
   };
 
   return es;
@@ -439,6 +620,21 @@ export function watchSession(
  */
 export function getExportUrl(sessionId: string): string {
   return `${getBase()}/sessions/${sessionId}/export`;
+}
+
+/** Get markdown export URL for a session, with optional child depth. */
+export function getMarkdownExportUrl(
+  sessionId: string,
+  depth?: 1 | "all",
+): string {
+  const url = new URL(
+    `${getBase()}/sessions/${sessionId}/md`,
+    window.location.origin,
+  );
+  if (depth !== undefined) {
+    url.searchParams.set("depth", String(depth));
+  }
+  return `${url.pathname}${url.search}`;
 }
 
 /** Download a session export using fetch with auth headers,
@@ -537,8 +733,7 @@ export async function starSession(id: string): Promise<void> {
     method: "PUT",
   }));
   if (!res.ok) {
-    const body = await res.text();
-    throw new ApiError(res.status, apiErrorMessage(res.status, body));
+    throw new ApiError(res.status, await responseErrorMessage(res));
   }
 }
 
@@ -547,8 +742,7 @@ export async function unstarSession(id: string): Promise<void> {
     method: "DELETE",
   }));
   if (!res.ok) {
-    const body = await res.text();
-    throw new ApiError(res.status, apiErrorMessage(res.status, body));
+    throw new ApiError(res.status, await responseErrorMessage(res));
   }
 }
 
@@ -561,8 +755,7 @@ export async function bulkStarSessions(
     body: JSON.stringify({ session_ids: sessionIds }),
   }));
   if (!res.ok) {
-    const body = await res.text();
-    throw new ApiError(res.status, apiErrorMessage(res.status, body));
+    throw new ApiError(res.status, await responseErrorMessage(res));
   }
 }
 
@@ -639,7 +832,7 @@ export interface AppSettings {
   host: string;
   port: number;
   auth_token?: string;
-  remote_access?: boolean;
+  require_auth?: boolean;
 }
 
 export function getSettings(): Promise<AppSettings> {
@@ -653,6 +846,74 @@ export function updateSettings(
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(patch),
+  });
+}
+
+export interface WorktreeProjectMapping {
+  id: number;
+  machine: string;
+  path_prefix: string;
+  project: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WorktreeMappingsResponse {
+  machine: string;
+  mappings: WorktreeProjectMapping[];
+}
+
+export interface WorktreeMappingInput {
+  path_prefix: string;
+  project: string;
+  enabled: boolean;
+}
+
+export interface ApplyWorktreeMappingsResponse {
+  machine: string;
+  matched_sessions: number;
+  updated_sessions: number;
+}
+
+export function getWorktreeMappings(): Promise<WorktreeMappingsResponse> {
+  return fetchJSON("/settings/worktree-mappings");
+}
+
+export function createWorktreeMapping(
+  input: WorktreeMappingInput,
+): Promise<WorktreeProjectMapping> {
+  return fetchJSON("/settings/worktree-mappings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateWorktreeMapping(
+  id: number,
+  input: WorktreeMappingInput,
+): Promise<WorktreeProjectMapping> {
+  return fetchJSON(`/settings/worktree-mappings/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function deleteWorktreeMapping(id: number): Promise<void> {
+  const res = await fetch(
+    `${getBase()}/settings/worktree-mappings/${id}`,
+    authHeaders({ method: "DELETE" }),
+  );
+  if (!res.ok) {
+    throw new ApiError(res.status, await responseErrorMessage(res));
+  }
+}
+
+export function applyWorktreeMappings(): Promise<ApplyWorktreeMappingsResponse> {
+  return fetchJSON("/settings/worktree-mappings/apply", {
+    method: "POST",
   });
 }
 
@@ -671,6 +932,7 @@ export interface AnalyticsParams {
   include_one_shot?: boolean;
   include_automated?: boolean;
   active_since?: string;
+  termination?: string;
 }
 
 export function getAnalyticsSummary(
@@ -733,6 +995,46 @@ export function getAnalyticsTopSessions(
   return fetchJSON(`/analytics/top-sessions${buildQuery({ ...params })}`);
 }
 
+export function getAnalyticsSignals(
+  params: AnalyticsParams,
+): Promise<SignalsAnalyticsResponse> {
+  return fetchJSON(
+    `/analytics/signals${buildQuery({ ...params })}`,
+  );
+}
+
+export interface TrendsTermsParams extends AnalyticsParams {
+  granularity?: TrendsGranularity;
+  terms: string[];
+}
+
+function buildTrendsTermsQuery(params: TrendsTermsParams): string {
+  const q = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (
+      key === "terms" ||
+      value === undefined ||
+      value === null ||
+      value === ""
+    ) {
+      continue;
+    }
+    // Match buildQuery semantics: 0 and false are valid query values.
+    q.set(key, String(value));
+  }
+  for (const term of params.terms) {
+    if (term.trim()) q.append("term", term);
+  }
+  const qs = q.toString();
+  return qs ? `?${qs}` : "";
+}
+
+export function getTrendsTerms(
+  params: TrendsTermsParams,
+): Promise<TrendsTermsResponse> {
+  return fetchJSON(`/trends/terms${buildTrendsTermsQuery(params)}`);
+}
+
 /* Insights */
 
 export interface ListInsightsParams {
@@ -755,8 +1057,7 @@ export async function deleteInsight(id: number): Promise<void> {
     method: "DELETE",
   }));
   if (!res.ok) {
-    const body = await res.text();
-    throw new ApiError(res.status, apiErrorMessage(res.status, body));
+    throw new ApiError(res.status, await responseErrorMessage(res));
   }
 }
 
@@ -785,8 +1086,11 @@ export function generateInsight(
       signal: controller.signal,
     }));
 
-    if (!res.ok || !res.body) {
-      throw new Error(`Generate request failed: ${res.status}`);
+    if (!res.ok) {
+      throw new ApiError(res.status, await responseErrorMessage(res));
+    }
+    if (!res.body) {
+      throw new Error("Generate request failed: empty response");
     }
 
     const reader = res.body.getReader();
@@ -896,8 +1200,7 @@ export async function deleteSession(id: string): Promise<void> {
     method: "DELETE",
   }));
   if (!res.ok) {
-    const body = await res.text();
-    throw new ApiError(res.status, apiErrorMessage(res.status, body));
+    throw new ApiError(res.status, await responseErrorMessage(res));
   }
 }
 
@@ -906,8 +1209,7 @@ export async function restoreSession(id: string): Promise<void> {
     method: "POST",
   }));
   if (!res.ok) {
-    const body = await res.text();
-    throw new ApiError(res.status, apiErrorMessage(res.status, body));
+    throw new ApiError(res.status, await responseErrorMessage(res));
   }
 }
 
@@ -918,8 +1220,7 @@ export async function permanentDeleteSession(
     method: "DELETE",
   }));
   if (!res.ok) {
-    const body = await res.text();
-    throw new ApiError(res.status, apiErrorMessage(res.status, body));
+    throw new ApiError(res.status, await responseErrorMessage(res));
   }
 }
 
@@ -1086,8 +1387,7 @@ export async function unpinMessage(
     authHeaders({ method: "DELETE" }),
   );
   if (!res.ok) {
-    const body = await res.text();
-    throw new ApiError(res.status, apiErrorMessage(res.status, body));
+    throw new ApiError(res.status, await responseErrorMessage(res));
   }
 }
 

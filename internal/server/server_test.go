@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"mime/multipart"
 	"net"
@@ -13,18 +14,23 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	stdlibsync "sync"
 	"testing"
 	"time"
 
-	"github.com/wesm/agentsview/internal/config"
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/dbtest"
-	"github.com/wesm/agentsview/internal/parser"
-	"github.com/wesm/agentsview/internal/server"
-	"github.com/wesm/agentsview/internal/sync"
-	"github.com/wesm/agentsview/internal/testjsonl"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/server"
+	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/sync"
+	"go.kenn.io/agentsview/internal/testjsonl"
 )
 
 // Timestamp constants for test data.
@@ -41,12 +47,13 @@ const (
 
 // testEnv sets up a server with a temporary database.
 type testEnv struct {
-	srv       *server.Server
-	handler   http.Handler
-	db        *db.DB
-	engine    *sync.Engine
-	claudeDir string
-	dataDir   string
+	srv         *server.Server
+	handler     http.Handler
+	db          *db.DB
+	engine      *sync.Engine
+	broadcaster *server.Broadcaster
+	claudeDir   string
+	dataDir     string
 }
 
 // setupOption customizes the config used by setup.
@@ -79,7 +86,7 @@ func setupWithServerOpts(
 	opts ...setupOption,
 ) *testEnv {
 	t.Helper()
-	dir := t.TempDir()
+	dir := tempDirWithRetryCleanup(t)
 	dbPath := filepath.Join(dir, "test.db")
 
 	database, err := db.Open(dbPath)
@@ -107,13 +114,20 @@ func setupWithServerOpts(
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	// Disable coalescing in tests so emits fan out deterministically.
+	broadcaster := server.NewBroadcaster(0)
+	engineCfg := sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeDir},
 			parser.AgentCodex:  {codexDir},
 		},
 		Machine: "test",
-	})
+		Emitter: broadcaster,
+	}
+	engine := sync.NewEngine(database, engineCfg)
+
+	// Prepend so caller-provided srvOpts can still override.
+	srvOpts = append([]server.Option{server.WithBroadcaster(broadcaster)}, srvOpts...)
 	srv := server.New(cfg, database, engine, srvOpts...)
 
 	// Wrap handler to set default Host header for all test
@@ -149,13 +163,75 @@ func setupWithServerOpts(
 	})
 
 	return &testEnv{
-		srv:       srv,
-		handler:   wrappedHandler,
-		db:        database,
-		engine:    engine,
-		claudeDir: claudeDir,
-		dataDir:   dir,
+		srv:         srv,
+		handler:     wrappedHandler,
+		db:          database,
+		engine:      engine,
+		broadcaster: broadcaster,
+		claudeDir:   claudeDir,
+		dataDir:     dir,
 	}
+}
+
+// setupPGMode builds a testEnv with engine == nil and no
+// broadcaster, mirroring the "pg serve" runtime mode where the
+// server reads from PostgreSQL and does not run a local sync
+// engine or live-refresh broadcaster.
+func setupPGMode(t *testing.T) *testEnv {
+	t.Helper()
+	dir := tempDirWithRetryCleanup(t)
+	dbPath := filepath.Join(dir, "test.db")
+
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening db: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	cfg := config.Config{
+		Host:         "127.0.0.1",
+		Port:         0,
+		DataDir:      dir,
+		DBPath:       dbPath,
+		WriteTimeout: 30 * time.Second,
+	}
+	srv := server.New(cfg, database, nil)
+
+	defaultHost := net.JoinHostPort(
+		cfg.Host, fmt.Sprintf("%d", cfg.Port),
+	)
+	defaultOrigin := fmt.Sprintf("http://%s", defaultHost)
+	baseHandler := srv.Handler()
+	wrappedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host == "example.com" || r.Host == "" {
+			r.Host = defaultHost
+		}
+		if r.RemoteAddr == "192.0.2.1:1234" {
+			r.RemoteAddr = "127.0.0.1:1234"
+		}
+		if r.Header.Get("Origin") == "" {
+			switch r.Method {
+			case http.MethodPost, http.MethodPut,
+				http.MethodPatch, http.MethodDelete:
+				r.Header.Set("Origin", defaultOrigin)
+			}
+		}
+		baseHandler.ServeHTTP(w, r)
+	})
+
+	return &testEnv{
+		srv:         srv,
+		handler:     wrappedHandler,
+		db:          database,
+		engine:      nil,
+		broadcaster: nil,
+		dataDir:     dir,
+	}
+}
+
+func tempDirWithRetryCleanup(t *testing.T) string {
+	t.Helper()
+	return dbtest.MkdirTempWithCleanup(t, "agentsview-server-test-*")
 }
 
 func (te *testEnv) writeProjectFile(
@@ -308,9 +384,9 @@ func (te *testEnv) seedSession(
 		s.Machine = "test"
 		s.MessageCount = msgCount
 		s.UserMessageCount = max(msgCount, 2)
-		s.StartedAt = dbtest.Ptr(tsSeed)
-		s.EndedAt = dbtest.Ptr(tsSeedEnd)
-		s.FirstMessage = dbtest.Ptr("Hello world")
+		s.StartedAt = new(tsSeed)
+		s.EndedAt = new(tsSeedEnd)
+		s.FirstMessage = new("Hello world")
 		for _, opt := range opts {
 			opt(s)
 		}
@@ -427,6 +503,16 @@ func decode[T any](
 			err, w.Body.String())
 	}
 	return result
+}
+
+func sidebarIndexRowsByID(
+	sessions []db.SidebarSessionIndexRow,
+) map[string]db.SidebarSessionIndexRow {
+	rows := make(map[string]db.SidebarSessionIndexRow, len(sessions))
+	for _, s := range sessions {
+		rows[s.ID] = s
+	}
+	return rows
 }
 
 func assertStatus(
@@ -721,6 +807,68 @@ func TestListSessions_ExcludeOneShotDefault(t *testing.T) {
 	}
 }
 
+func TestSidebarIndexReturnsSkinnyRows(t *testing.T) {
+	te := setup(t)
+
+	displayName := "Important investigation"
+	te.seedSession(t, "named", "my-app", 5, func(s *db.Session) {
+		s.DisplayName = &displayName
+		s.UserMessageCount = 2
+	})
+	teammateFirstMessage := "<teammate-message from=\"codex\">review"
+	te.seedSession(t, "teammate", "my-app", 5, func(s *db.Session) {
+		s.FirstMessage = &teammateFirstMessage
+		s.UserMessageCount = 2
+	})
+	te.seedSession(t, "review", "my-app", 3, func(s *db.Session) {
+		fm := "You are a code reviewer. Review the code."
+		s.FirstMessage = &fm
+		s.UserMessageCount = 1
+	})
+
+	w := te.get(t, "/api/v1/sessions/sidebar-index")
+	assertStatus(t, w, http.StatusOK)
+	resp := decode[db.SidebarSessionIndex](t, w)
+	rows := sidebarIndexRowsByID(resp.Sessions)
+
+	if got := rows["named"].DisplayName; got == nil || *got != displayName {
+		t.Fatalf("display_name = %v, want %q", got, displayName)
+	}
+	if !rows["teammate"].IsTeammate {
+		t.Fatal("teammate is_teammate = false, want true")
+	}
+	if _, ok := rows["review"]; ok {
+		t.Fatal("automated review row returned without include_automated=true")
+	}
+
+	w = te.get(t, "/api/v1/sessions/sidebar-index?include_automated=true")
+	assertStatus(t, w, http.StatusOK)
+	resp = decode[db.SidebarSessionIndex](t, w)
+	rows = sidebarIndexRowsByID(resp.Sessions)
+	if _, ok := rows["review"]; !ok {
+		t.Fatal("automated review row missing with include_automated=true")
+	}
+}
+
+func TestSidebarIndexValidatesParams(t *testing.T) {
+	tests := []string{
+		"/api/v1/sessions/sidebar-index?min_messages=bad",
+		"/api/v1/sessions/sidebar-index?max_messages=bad",
+		"/api/v1/sessions/sidebar-index?min_user_messages=bad",
+		"/api/v1/sessions/sidebar-index?date=2024-99-99",
+		"/api/v1/sessions/sidebar-index?date_from=2024-06-02&date_to=2024-06-01",
+		"/api/v1/sessions/sidebar-index?active_since=not-a-timestamp",
+	}
+
+	for _, path := range tests {
+		t.Run(path, func(t *testing.T) {
+			te := setup(t)
+			w := te.get(t, path)
+			assertStatus(t, w, http.StatusBadRequest)
+		})
+	}
+}
+
 func TestGetSession_Found(t *testing.T) {
 	te := setup(t)
 	te.seedSession(t, "s1", "my-app", 5)
@@ -741,20 +889,74 @@ func TestGetSession_NotFound(t *testing.T) {
 	assertStatus(t, w, http.StatusNotFound)
 }
 
+// TestGetSession_HealthBreakdownIncludesMidTaskCompactions
+// guards against a regression where the recomputed
+// health_penalties / health_score_basis on the session detail
+// response omitted MidTaskCompactionCount, so a session
+// penalized for mid-task compactions would show a breakdown
+// inconsistent with its persisted health_score.
+func TestGetSession_HealthBreakdownIncludesMidTaskCompactions(
+	t *testing.T,
+) {
+	te := setup(t)
+	te.seedSession(t, "mt-1", "demo", 12)
+	score := 82
+	grade := "B"
+	if err := te.db.UpdateSessionSignals("mt-1", db.SessionSignalUpdate{
+		Outcome:                "completed",
+		OutcomeConfidence:      "medium",
+		EndedWithRole:          "assistant",
+		HasToolCalls:           true,
+		HasContextData:         true,
+		CompactionCount:        2,
+		MidTaskCompactionCount: 2,
+		HealthScore:            &score,
+		HealthGrade:            &grade,
+	}); err != nil {
+		t.Fatalf("UpdateSessionSignals: %v", err)
+	}
+
+	w := te.get(t, "/api/v1/sessions/mt-1")
+	assertStatus(t, w, http.StatusOK)
+
+	var resp struct {
+		HealthScoreBasis []string       `json:"health_score_basis"`
+		HealthPenalties  map[string]int `json:"health_penalties"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+
+	got, ok := resp.HealthPenalties["mid_task_compactions"]
+	if !ok {
+		t.Fatalf("mid_task_compactions missing from penalties: %+v",
+			resp.HealthPenalties)
+	}
+	// 2 mid-task compactions * 8 = 16 (cap is 18).
+	if got != 16 {
+		t.Errorf("mid_task_compactions penalty = %d, want 16", got)
+	}
+
+	if !slices.Contains(resp.HealthScoreBasis, "context_pressure") {
+		t.Errorf("basis missing context_pressure: %v",
+			resp.HealthScoreBasis)
+	}
+}
+
 func TestGetChildSessions_Found(t *testing.T) {
 	te := setup(t)
 	te.seedSession(t, "parent-1", "my-app", 10)
 	te.seedSession(t, "child-a", "my-app", 3, func(s *db.Session) {
-		s.ParentSessionID = dbtest.Ptr("parent-1")
+		s.ParentSessionID = new("parent-1")
 		s.RelationshipType = "subagent"
-		s.StartedAt = dbtest.Ptr("2025-01-15T10:05:00Z")
-		s.EndedAt = dbtest.Ptr("2025-01-15T10:10:00Z")
+		s.StartedAt = new("2025-01-15T10:05:00Z")
+		s.EndedAt = new("2025-01-15T10:10:00Z")
 	})
 	te.seedSession(t, "child-b", "my-app", 2, func(s *db.Session) {
-		s.ParentSessionID = dbtest.Ptr("parent-1")
+		s.ParentSessionID = new("parent-1")
 		s.RelationshipType = "fork"
-		s.StartedAt = dbtest.Ptr("2025-01-15T10:15:00Z")
-		s.EndedAt = dbtest.Ptr("2025-01-15T10:20:00Z")
+		s.StartedAt = new("2025-01-15T10:15:00Z")
+		s.EndedAt = new("2025-01-15T10:20:00Z")
 	})
 
 	w := te.get(t, "/api/v1/sessions/parent-1/children")
@@ -1375,6 +1577,23 @@ func TestHostHeaderRejectsDNSRebinding(t *testing.T) {
 	assertStatus(t, w, http.StatusForbidden)
 }
 
+func TestHostHeaderRejectionBodyIsDescriptive(t *testing.T) {
+	te := setup(t)
+
+	// A forwarded port produces a Host the server does not trust.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	req.Host = "127.0.0.1:18080"
+	w := httptest.NewRecorder()
+	te.srv.Handler().ServeHTTP(w, req)
+
+	assertStatus(t, w, http.StatusForbidden)
+	body := w.Body.String()
+	// The body must name the rejected Host and point at the fix so a
+	// user can self-diagnose without devtools.
+	assert.Contains(t, body, "127.0.0.1:18080")
+	assert.Contains(t, body, "--public-url")
+}
+
 func TestHostHeaderAllowsLegitimate(t *testing.T) {
 	te := setup(t)
 
@@ -1576,8 +1795,8 @@ func TestHostHeaderBindAllPort80AllowsPortlessLANIP(t *testing.T) {
 			te := setup(t, func(c *config.Config) {
 				c.Host = bindHost
 				c.Port = 80
-				// LAN access now requires remote_access + auth token.
-				c.RemoteAccess = true
+				// LAN access requires require_auth + auth token.
+				c.RequireAuth = true
 				c.AuthToken = "test-token"
 			})
 
@@ -1693,8 +1912,8 @@ func TestHostHeaderBindAllAllowsLANIP(t *testing.T) {
 		t.Run(bindHost, func(t *testing.T) {
 			te := setup(t, func(c *config.Config) {
 				c.Host = bindHost
-				// LAN access now requires remote_access + auth token.
-				c.RemoteAccess = true
+				// LAN access requires require_auth + auth token.
+				c.RequireAuth = true
 				c.AuthToken = "test-token"
 			})
 
@@ -1837,7 +2056,7 @@ func TestCORSAllowMethods(t *testing.T) {
 func TestAuthErrorIncludesCORSHeaders(t *testing.T) {
 	te := setup(t, func(c *config.Config) {
 		c.Host = "0.0.0.0"
-		c.RemoteAccess = true
+		c.RequireAuth = true
 		c.AuthToken = "secret-token"
 	})
 
@@ -1864,7 +2083,7 @@ func TestAuthErrorIncludesCORSHeaders(t *testing.T) {
 func TestAuthErrorNoCORSWithoutOrigin(t *testing.T) {
 	te := setup(t, func(c *config.Config) {
 		c.Host = "0.0.0.0"
-		c.RemoteAccess = true
+		c.RequireAuth = true
 		c.AuthToken = "secret-token"
 	})
 
@@ -1887,27 +2106,51 @@ func TestAuthErrorNoCORSWithoutOrigin(t *testing.T) {
 	}
 }
 
-func TestForbiddenNoCORSWhenRemoteDisabled(t *testing.T) {
+func TestNoAuthWhenRemoteDisabled(t *testing.T) {
 	te := setup(t, func(c *config.Config) {
 		c.Host = "0.0.0.0"
-		// remote_access is false — non-loopback requests are
-		// rejected with 403 and no CORS headers.
+		// require_auth is false — auth is not enforced, so
+		// non-loopback requests pass through without a token.
 	})
 
 	req := httptest.NewRequest(
 		http.MethodGet, "/api/v1/stats", nil,
 	)
-	req.Header.Set("Origin", "http://192.168.1.50:8080")
+	// Use localhost Host header to pass host-check; the point
+	// of this test is that auth middleware doesn't block when
+	// require_auth is off.
+	req.Host = "127.0.0.1:0"
 	req.RemoteAddr = "192.168.1.50:9999"
 	w := httptest.NewRecorder()
 	te.srv.Handler().ServeHTTP(w, req)
-	assertStatus(t, w, http.StatusForbidden)
 
-	cors := w.Header().Get("Access-Control-Allow-Origin")
-	if cors != "" {
+	if w.Code == http.StatusForbidden ||
+		w.Code == http.StatusUnauthorized {
 		t.Fatalf(
-			"expected no CORS on 403 when remote disabled, got %q",
-			cors,
+			"expected no auth gate when remote disabled, got %d",
+			w.Code,
+		)
+	}
+}
+
+func TestAuthRequiredButNoToken(t *testing.T) {
+	te := setup(t, func(c *config.Config) {
+		c.Host = "0.0.0.0"
+		c.RequireAuth = true
+		// AuthToken intentionally left empty.
+	})
+
+	req := httptest.NewRequest(
+		http.MethodGet, "/api/v1/stats", nil,
+	)
+	req.Host = "127.0.0.1:0"
+	w := httptest.NewRecorder()
+	te.srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf(
+			"expected 500 when auth required but no token, got %d",
+			w.Code,
 		)
 	}
 }
@@ -1948,6 +2191,138 @@ func TestExportSession_NotFound(t *testing.T) {
 
 	w := te.get(t, "/api/v1/sessions/nonexistent/export")
 	assertStatus(t, w, http.StatusNotFound)
+}
+
+func TestMarkdownSessionExport(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "s1", "my-app", 3)
+	te.seedMessages(t, "s1", 3)
+
+	w := te.get(t, "/api/v1/sessions/s1/md")
+	assertStatus(t, w, http.StatusOK)
+
+	ct := w.Header().Get("Content-Type")
+	if !strings.Contains(ct, "text/markdown") {
+		t.Fatalf("expected text/markdown content type, got %q", ct)
+	}
+	cd := w.Header().Get("Content-Disposition")
+	if !strings.Contains(cd, "inline") {
+		t.Fatalf("expected inline disposition, got %q", cd)
+	}
+	assertBodyContains(t, w, "# Session: my-app")
+}
+
+func TestMarkdownSessionExport_NotFound(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, "/api/v1/sessions/nonexistent/md")
+	assertStatus(t, w, http.StatusNotFound)
+}
+
+func TestMarkdownSessionExport_InvalidDepth(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "s1", "my-app", 1)
+
+	w := te.get(t, "/api/v1/sessions/s1/md?depth=2")
+	assertStatus(t, w, http.StatusBadRequest)
+}
+
+func TestMarkdownSessionExport_DepthOneIncludesChildSessions(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "parent", "my-app", 1)
+	te.seedMessages(t, "parent", 1, func(i int, m *db.Message) {
+		m.Role = "assistant"
+		m.Content = "[Task]\nchild work"
+		m.HasToolUse = true
+		m.ToolCalls = []db.ToolCall{{
+			ToolName:          "Task",
+			Category:          "Task",
+			ToolUseID:         "toolu_child",
+			InputJSON:         `{"prompt":"inspect child"}`,
+			SubagentSessionID: "child-a",
+		}}
+	})
+	te.seedSession(t, "child-a", "my-app", 1, func(s *db.Session) {
+		s.ParentSessionID = new("parent")
+		s.RelationshipType = "subagent"
+	})
+	te.seedMessages(t, "child-a", 1)
+
+	w := te.get(t, "/api/v1/sessions/parent/md?depth=1")
+	assertStatus(t, w, http.StatusOK)
+	assertBodyContains(t, w, `<subagent_anchor session_id="child-a" tool_call_id="toolu_child" depth="1">`)
+	assertBodyContains(t, w, `<subagent_session id="child-a" parent_session_id="parent" relationship="subagent"`)
+}
+
+func TestMarkdownSessionExport_DefaultOmitsChildSessions(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "parent", "my-app", 1)
+	te.seedMessages(t, "parent", 1, func(i int, m *db.Message) {
+		m.Role = "assistant"
+		m.Content = "[Task]\nchild work"
+		m.HasToolUse = true
+		m.ToolCalls = []db.ToolCall{{
+			ToolName:          "Task",
+			Category:          "Task",
+			ToolUseID:         "toolu_child",
+			InputJSON:         `{"prompt":"inspect child"}`,
+			SubagentSessionID: "child-a",
+		}}
+	})
+	te.seedSession(t, "child-a", "my-app", 1, func(s *db.Session) {
+		s.ParentSessionID = new("parent")
+		s.RelationshipType = "subagent"
+	})
+	te.seedMessages(t, "child-a", 1)
+
+	w := te.get(t, "/api/v1/sessions/parent/md")
+	assertStatus(t, w, http.StatusOK)
+	if strings.Contains(w.Body.String(), `<subagent_session id="child-a"`) {
+		t.Fatalf("expected default markdown export to omit child session, got:\n%s", w.Body.String())
+	}
+}
+
+func TestMarkdownSessionExport_DepthAllRecurses(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "root", "my-app", 1)
+	te.seedMessages(t, "root", 1, func(i int, m *db.Message) {
+		m.Role = "assistant"
+		m.Content = "[Task]\nchild work"
+		m.HasToolUse = true
+		m.ToolCalls = []db.ToolCall{{
+			ToolName:          "Task",
+			Category:          "Task",
+			ToolUseID:         "toolu_child",
+			InputJSON:         `{"prompt":"inspect child"}`,
+			SubagentSessionID: "child-a",
+		}}
+	})
+	te.seedSession(t, "child-a", "my-app", 1, func(s *db.Session) {
+		s.ParentSessionID = new("root")
+		s.RelationshipType = "subagent"
+	})
+	te.seedMessages(t, "child-a", 1, func(i int, m *db.Message) {
+		m.Role = "assistant"
+		m.Content = "[Task]\ngrandchild work"
+		m.HasToolUse = true
+		m.ToolCalls = []db.ToolCall{{
+			ToolName:          "Task",
+			Category:          "Task",
+			ToolUseID:         "toolu_grandchild",
+			InputJSON:         `{"prompt":"inspect grandchild"}`,
+			SubagentSessionID: "child-b",
+		}}
+	})
+	te.seedSession(t, "child-b", "my-app", 1, func(s *db.Session) {
+		s.ParentSessionID = new("child-a")
+		s.RelationshipType = "subagent"
+	})
+	te.seedMessages(t, "child-b", 1)
+
+	w := te.get(t, "/api/v1/sessions/root/md?depth=all")
+	assertStatus(t, w, http.StatusOK)
+	assertBodyContains(t, w, `<subagent_session id="child-a" parent_session_id="root" relationship="subagent"`)
+	assertBodyContains(t, w, `<subagent_session id="child-b" parent_session_id="child-a" relationship="subagent"`)
 }
 
 func TestPublishSession_NoToken(t *testing.T) {
@@ -2183,6 +2558,137 @@ func TestUploadSession_Errors(t *testing.T) {
 				tt.filename, tt.content, tt.query)
 			assertStatus(t, w, http.StatusBadRequest)
 		})
+	}
+}
+
+func TestUploadSession_ExcludedOrTrashedConflict(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, te *testEnv, id string)
+	}{
+		{
+			name: "excluded",
+			setup: func(t *testing.T, te *testEnv, id string) {
+				t.Helper()
+				require.NoError(t, te.db.UpsertSession(db.Session{
+					ID: id, Project: "myproj", Machine: "remote", Agent: "claude",
+				}), "seed session")
+				require.NoError(t, te.db.DeleteSession(id), "DeleteSession")
+			},
+		},
+		{
+			name: "trashed",
+			setup: func(t *testing.T, te *testEnv, id string) {
+				t.Helper()
+				require.NoError(t, te.db.UpsertSession(db.Session{
+					ID: id, Project: "myproj", Machine: "remote", Agent: "claude",
+				}), "seed session")
+				require.NoError(t, te.db.SoftDeleteSession(id), "SoftDeleteSession")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			te := setup(t)
+			const id = "upload-conflict"
+			tt.setup(t, te, id)
+
+			content := testjsonl.NewSessionBuilder().
+				AddClaudeUser(tsEarly, "Hello upload").
+				AddClaudeAssistant(tsEarlyS5, "Done.").
+				String()
+			w := te.upload(t, id+".jsonl", content, "project=myproj&machine=remote")
+			assertStatus(t, w, http.StatusConflict)
+			assertErrorResponse(t, w, "session upload rejected: session is excluded or trashed")
+			destPath := filepath.Join(
+				te.dataDir, "uploads", "myproj", id+".jsonl",
+			)
+			if _, err := os.Stat(destPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("rejected upload file exists at %s: %v", destPath, err)
+			}
+		})
+	}
+}
+
+func TestUploadSession_MultiSessionConflictDoesNotPartiallyWrite(t *testing.T) {
+	te := setup(t)
+
+	const filename = "upload-multi-conflict.jsonl"
+	const mainID = "upload-multi-conflict"
+	const forkID = "upload-multi-conflict-i"
+
+	require.NoError(t, te.db.UpsertSession(db.Session{
+		ID: forkID, Project: "myproj", Machine: "remote", Agent: "claude",
+	}), "seed fork session")
+	require.NoError(t, te.db.DeleteSession(forkID), "DeleteSession")
+
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUserWithUUID(tsEarly, "q1", "a", "").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:01Z", "a1", "b", "a").
+		AddClaudeUserWithUUID(tsEarlyS5, "q2", "c", "b").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:06Z", "a2", "d", "c").
+		AddClaudeUserWithUUID("2024-01-01T10:00:07Z", "q3", "e", "d").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:08Z", "a3", "f", "e").
+		AddClaudeUserWithUUID("2024-01-01T10:00:09Z", "q4", "g", "f").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:10Z", "a4", "h", "g").
+		AddClaudeUserWithUUID("2024-01-01T10:00:11Z", "q5", "k", "h").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:12Z", "a5", "l", "k").
+		AddClaudeUserWithUUID("2024-01-01T10:00:13Z", "fork q", "i", "b").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:14Z", "fork a", "j", "i").
+		String()
+
+	w := te.upload(t, filename, content, "project=myproj&machine=remote")
+	assertStatus(t, w, http.StatusConflict)
+	assertErrorResponse(t, w, "session upload rejected: session is excluded or trashed")
+
+	main, err := te.db.GetSessionFull(context.Background(), mainID)
+	require.NoError(t, err, "GetSessionFull main")
+	if main != nil {
+		t.Fatalf("main session was partially written: %+v", main)
+	}
+	destPath := filepath.Join(te.dataDir, "uploads", "myproj", filename)
+	if _, err := os.Stat(destPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected upload file exists at %s: %v", destPath, err)
+	}
+}
+
+func TestUploadSession_ReuploadPreservesPins(t *testing.T) {
+	te := setup(t)
+
+	initial := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "original upload").
+		AddClaudeAssistant(tsEarlyS5, "original reply").
+		String()
+	w := te.upload(t, "upload-pinned.jsonl", initial,
+		"project=myproj&machine=remote")
+	assertStatus(t, w, http.StatusOK)
+
+	msgs, err := te.db.GetAllMessages(context.Background(), "upload-pinned")
+	require.NoError(t, err, "GetAllMessages")
+	require.Len(t, msgs, 2, "initial messages")
+	note := "keep this"
+	_, err = te.db.PinMessage("upload-pinned", msgs[0].ID, &note)
+	require.NoError(t, err, "PinMessage")
+
+	updated := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "updated upload").
+		AddClaudeAssistant(tsEarlyS5, "updated reply").
+		String()
+	w = te.upload(t, "upload-pinned.jsonl", updated,
+		"project=myproj&machine=remote")
+	assertStatus(t, w, http.StatusOK)
+
+	pins, err := te.db.ListPinnedMessages(
+		context.Background(), "upload-pinned", "",
+	)
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1, "pins after re-upload")
+	if pins[0].Ordinal != 0 {
+		t.Fatalf("pin ordinal = %d, want 0", pins[0].Ordinal)
+	}
+	if pins[0].Note == nil || *pins[0].Note != note {
+		t.Fatalf("pin note = %v, want %q", pins[0].Note, note)
 	}
 }
 
@@ -2752,6 +3258,31 @@ func TestGetMessages_Limits(t *testing.T) {
 	}
 }
 
+// TestGetMessages_InvalidDirection verifies that the HTTP
+// endpoint rejects direction values outside {asc, desc} with
+// 400 instead of silently coercing to asc. The CLI enforces the
+// same contract; both must agree.
+func TestGetMessages_InvalidDirection(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "s1", "my-app", 1)
+
+	w := te.get(t, "/api/v1/sessions/s1/messages?direction=backwards")
+	assertStatus(t, w, http.StatusBadRequest)
+	assert.Contains(t, w.Body.String(), "direction",
+		"error body should mention 'direction'")
+}
+
+// TestHandleWatchSession_UnknownID_Returns404 verifies that the
+// SSE watch endpoint fails fast on an unknown session id so a
+// typo doesn't leave a heartbeat stream open indefinitely.
+func TestHandleWatchSession_UnknownID_Returns404(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, "/api/v1/sessions/no-such-id/watch")
+	assertStatus(t, w, http.StatusNotFound)
+	assert.Contains(t, w.Body.String(), "no-such-id")
+}
+
 func TestGetVersion(t *testing.T) {
 	v := server.VersionInfo{
 		Version:   "v1.2.3",
@@ -2828,9 +3359,7 @@ func TestRawDownload(t *testing.T) {
 	// Create a temp file to act as the raw session file.
 	tmpFile := filepath.Join(te.dataDir, "test-session.jsonl")
 	content := `{"type":"user","message":{"content":[{"type":"text","text":"hello"}]}}`
-	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
-		t.Fatalf("writing temp file: %v", err)
-	}
+	require.NoError(t, os.WriteFile(tmpFile, []byte(content), 0o644))
 
 	te.seedSession(t, "raw-1", "proj", 1, func(s *db.Session) {
 		s.FilePath = dbtest.Ptr(tmpFile)
@@ -2841,12 +3370,9 @@ func TestRawDownload(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 
 	cd := w.Header().Get("Content-Disposition")
-	if !strings.Contains(cd, "test-session.jsonl") {
-		t.Errorf("expected filename in Content-Disposition, got %q", cd)
-	}
-	if w.Body.String() != content {
-		t.Errorf("body = %q, want %q", w.Body.String(), content)
-	}
+	assert.Contains(t, cd, "test-session.jsonl",
+		"expected filename in Content-Disposition")
+	assert.Equal(t, content, w.Body.String())
 }
 
 func TestRawDownload_NotFound(t *testing.T) {
@@ -2871,4 +3397,249 @@ func TestRawDownload_FileNotOnDisk(t *testing.T) {
 
 	w := te.get(t, "/api/v1/sessions/raw-missing/raw")
 	assertStatus(t, w, http.StatusNotFound)
+}
+
+func TestFindAvailablePortZeroReturnsAssignedPort(t *testing.T) {
+	got := server.FindAvailablePort("127.0.0.1", 0)
+	if got == 0 {
+		t.Fatal("FindAvailablePort returned literal port 0")
+	}
+
+	// The returned ephemeral port should be bindable on the same host.
+	ln, err := net.Listen(
+		"tcp",
+		fmt.Sprintf("127.0.0.1:%d", got),
+	)
+	if err != nil {
+		t.Fatalf(
+			"returned port %d not bindable: %v", got, err,
+		)
+	}
+	ln.Close()
+}
+
+func TestEvents_StreamsDataChangedAfterSync(t *testing.T) {
+	te := setup(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil).WithContext(ctx)
+	w := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	done := make(chan struct{})
+	go func() {
+		te.handler.ServeHTTP(w, req)
+		close(done)
+	}()
+
+	// Give the handler time to subscribe.
+	time.Sleep(100 * time.Millisecond)
+
+	// Emit directly via the broadcaster to isolate the handler
+	// from sync engine timing.
+	te.broadcaster.Emit("messages")
+
+	te.waitForSSEEvent(t, w, "data_changed", 3*time.Second)
+	cancel()
+	<-done
+}
+
+func TestEvents_ReturnsServiceUnavailableInPGMode(t *testing.T) {
+	// A server with engine == nil (PG serve mode) must not stream.
+	te := setupPGMode(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil)
+	w := httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("got status %d, want 503", w.Code)
+	}
+	if got := w.Header().Get("Retry-After"); got != "300" {
+		t.Errorf("got Retry-After %q, want 300", got)
+	}
+}
+
+func withAuth(token string) setupOption {
+	return func(c *config.Config) {
+		c.RequireAuth = true
+		c.AuthToken = token
+	}
+}
+
+func TestEvents_AuthViaQueryTokenSucceeds(t *testing.T) {
+	te := setup(t, withAuth("secret"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/events?token=secret", nil).WithContext(ctx)
+	w := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	done := make(chan struct{})
+	go func() {
+		te.handler.ServeHTTP(w, req)
+		close(done)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	te.broadcaster.Emit("messages")
+	te.waitForSSEEvent(t, w, "data_changed", 2*time.Second)
+
+	cancel()
+	<-done
+}
+
+func TestEvents_AuthViaBearerHeaderSucceeds(t *testing.T) {
+	te := setup(t, withAuth("secret"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/events", nil).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer secret")
+	w := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	done := make(chan struct{})
+	go func() {
+		te.handler.ServeHTTP(w, req)
+		close(done)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	te.broadcaster.Emit("messages")
+	te.waitForSSEEvent(t, w, "data_changed", 2*time.Second)
+
+	cancel()
+	<-done
+}
+
+func TestEvents_AuthMissingTokenReturns401(t *testing.T) {
+	te := setup(t, withAuth("secret"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil)
+	w := httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("got status %d, want 401", w.Code)
+	}
+}
+
+func TestEvents_AuthInvalidTokenReturns401(t *testing.T) {
+	te := setup(t, withAuth("secret"))
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/events?token=wrong", nil)
+	w := httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("got status %d, want 401", w.Code)
+	}
+}
+
+// TestSessionWatch_AuthViaQueryTokenSucceeds guards the existing
+// /api/v1/sessions/{id}/watch query-token flow against future
+// isSSEPath changes. The auth path now routes both /watch and
+// /api/v1/events through the same helper; this test ensures the
+// session-watch branch keeps working.
+func TestSessionWatch_AuthViaQueryTokenSucceeds(t *testing.T) {
+	te := setup(t, withAuth("secret"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/sessions/missing/watch?token=secret", nil).WithContext(ctx)
+	w := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	done := make(chan struct{})
+	go func() {
+		te.handler.ServeHTTP(w, req)
+		close(done)
+	}()
+
+	// The handler opens an SSE stream and starts emitting
+	// heartbeats even for unknown sessions; a quick wait
+	// confirms we got past auth (anything non-401 counts).
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	<-done
+
+	if w.Code == http.StatusUnauthorized {
+		t.Fatalf("query-token auth failed on /watch: status %d", w.Code)
+	}
+}
+
+func TestHandleToolCalls_Basic(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "tc-1", "my-app", 2)
+	te.seedMessages(t, "tc-1", 2, func(i int, m *db.Message) {
+		if i == 1 {
+			m.Role = "assistant"
+			m.HasToolUse = true
+			m.ToolCalls = []db.ToolCall{
+				{
+					ToolName:  "Read",
+					Category:  "Read",
+					ToolUseID: "toolu_1",
+					InputJSON: `{"file_path":"/tmp/x"}`,
+				},
+				{
+					ToolName:  "Bash",
+					Category:  "Bash",
+					ToolUseID: "toolu_2",
+					InputJSON: `{"command":"ls"}`,
+				},
+			}
+		}
+	})
+
+	w := te.get(t, "/api/v1/sessions/tc-1/tool-calls")
+	assertStatus(t, w, http.StatusOK)
+
+	var body struct {
+		ToolCalls []service.ToolCall `json:"tool_calls"`
+		Count     int                `json:"count"`
+	}
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&body))
+	require.Equal(t, 2, body.Count)
+	require.Len(t, body.ToolCalls, 2)
+	assert.Equal(t, "Read", body.ToolCalls[0].ToolName)
+	assert.Equal(t, "toolu_1", body.ToolCalls[0].ToolUseID)
+	assert.Equal(t, `{"file_path":"/tmp/x"}`, body.ToolCalls[0].InputJSON)
+	assert.Equal(t, "Bash", body.ToolCalls[1].ToolName)
+	assert.NotEmpty(t, body.ToolCalls[0].Timestamp)
+	assert.Equal(t, 1, body.ToolCalls[0].Ordinal)
+}
+
+func TestHandleSyncSession_MissingFields(t *testing.T) {
+	te := setup(t)
+	body := strings.NewReader(`{}`)
+	req := httptest.NewRequest(http.MethodPost,
+		"/api/v1/sessions/sync", body)
+	w := httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+	assertStatus(t, w, http.StatusBadRequest)
+}
+
+func TestHandleSyncSession_BothFields(t *testing.T) {
+	te := setup(t)
+	body := strings.NewReader(
+		`{"path":"/tmp/a","id":"s-1"}`)
+	req := httptest.NewRequest(http.MethodPost,
+		"/api/v1/sessions/sync", body)
+	w := httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+	assertStatus(t, w, http.StatusBadRequest)
+}
+
+func TestHandleSyncSession_InvalidJSON(t *testing.T) {
+	te := setup(t)
+	body := strings.NewReader(`not json`)
+	req := httptest.NewRequest(http.MethodPost,
+		"/api/v1/sessions/sync", body)
+	w := httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+	assertStatus(t, w, http.StatusBadRequest)
 }

@@ -16,9 +16,27 @@
     toolCall?: ToolCall;
     highlightQuery?: string;
     isCurrentHighlight?: boolean;
+    /** Pre-formatted duration label (e.g. "2.4s", "running 1m 28s+"). Null/undefined renders no badge. */
+    durationLabel?: string;
+    /** Tints the duration badge with the slow color family. */
+    isSlow?: boolean;
+    /** Tints the duration badge green and pulses it. */
+    isRunning?: boolean;
+    /** When true, the block sits inside a ParallelGroup — flatten outer margin and corner radii. */
+    inGroup?: boolean;
   }
 
-  let { content, label, toolCall, highlightQuery = "", isCurrentHighlight = false }: Props = $props();
+  let {
+    content,
+    label,
+    toolCall,
+    highlightQuery = "",
+    isCurrentHighlight = false,
+    durationLabel,
+    isSlow = false,
+    isRunning = false,
+    inGroup = false,
+  }: Props = $props();
   let userCollapsed: boolean = $state(true);
   let userOutputCollapsed: boolean = $state(true);
   let userHistoryCollapsed: boolean = $state(true);
@@ -104,8 +122,59 @@
   });
 
   let previewLine = $derived.by(() => {
+    // Tool-specific summaries take precedence over the first line of
+    // content, which for these tools is a generic header (e.g.
+    // "[Todo List]") that hides the meaningful info.
+    const toolName = toolCall?.tool_name;
+    if (toolName === "TodoWrite") {
+      const todos = inputParams?.todos;
+      if (Array.isArray(todos) && todos.length) {
+        const target =
+          todos.find((t) => t?.status === "in_progress") ??
+          todos[todos.length - 1];
+        const text = target?.content ? String(target.content) : "";
+        if (text) return `→ ${text}`.slice(0, 100);
+      }
+    } else if (toolName === "TaskCreate" && inputParams?.subject) {
+      return String(inputParams.subject).slice(0, 100);
+    } else if (toolName === "TaskUpdate") {
+      const parts: string[] = [];
+      if (inputParams?.taskId != null) parts.push(`#${inputParams.taskId}`);
+      if (inputParams?.status) parts.push(String(inputParams.status));
+      if (inputParams?.subject) parts.push(String(inputParams.subject));
+      if (parts.length) return parts.join(" · ").slice(0, 100);
+    } else if (toolName === "Skill" || toolName === "skill") {
+      const skill = inputParams?.skill ?? inputParams?.name;
+      if (skill) return String(skill).slice(0, 100);
+    } else if (toolName === "ToolSearch") {
+      const query = inputParams?.query;
+      if (query) {
+        const firstLine = String(query).split("\n")[0] ?? "";
+        return firstLine.slice(0, 100);
+      }
+    } else if (
+      toolName === "Task" ||
+      toolName === "Agent" ||
+      toolCall?.category === "Task" ||
+      (toolName?.includes("subagent") ?? false)
+    ) {
+      const desc = inputParams?.description ?? inputParams?.prompt;
+      if (desc) {
+        const firstLine = String(desc).split("\n")[0] ?? "";
+        return firstLine.slice(0, 100);
+      }
+    }
+
     const line = content.split("\n")[0]?.slice(0, 100) ?? "";
     if (line) return line;
+    // For Bash tools, surface the command in the collapsed header so
+    // codex exec_command (cmd) and Claude Bash (command) are both
+    // legible without expanding the block.
+    const cmd = inputParams?.command ?? inputParams?.cmd;
+    if (cmd) {
+      const firstLine = String(cmd).split("\n")[0] ?? "";
+      return `$ ${firstLine}`.slice(0, 100);
+    }
     // For Edit/Write/Read with no content, show file path as preview
     const filePath =
       inputParams?.file_path ?? inputParams?.path ?? inputParams?.filePath;
@@ -218,7 +287,7 @@
   });
 </script>
 
-<div class="tool-block">
+<div class="tool-block" class:in-group={inGroup}>
   <button
     class="tool-header"
     onclick={() => {
@@ -236,6 +305,15 @@
     {/if}
     {#if collapsed && previewLine}
       <span class="tool-preview">{previewLine}</span>
+    {/if}
+    {#if durationLabel}
+      <span
+        class="tool-duration"
+        class:slow={isSlow}
+        class:running={isRunning}
+      >
+        {durationLabel}
+      </span>
     {/if}
   </button>
   {#if !collapsed}
@@ -344,6 +422,12 @@
     margin: 0;
   }
 
+  .tool-block.in-group {
+    margin: 0;
+    border-left: none;
+    border-radius: 0;
+  }
+
   .tool-header {
     display: flex;
     align-items: center;
@@ -393,6 +477,31 @@
     overflow: hidden;
     text-overflow: ellipsis;
     min-width: 0;
+  }
+
+  .tool-duration {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-muted);
+    padding: 2px 7px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.04);
+    border-radius: var(--radius-sm);
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+
+  .tool-duration.slow {
+    color: var(--slow-fg);
+    background: var(--slow-bg);
+    border-color: var(--slow-ring);
+  }
+
+  .tool-duration.running {
+    color: var(--running-fg);
+    background: var(--running-bg);
+    border-color: var(--running-ring);
+    animation: duration-pulse 1.6s ease-in-out infinite;
   }
 
   .tool-meta {

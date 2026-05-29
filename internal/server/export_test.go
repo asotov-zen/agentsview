@@ -6,11 +6,14 @@ import (
 	"html/template"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/dbtest"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/db"
 )
 
 // testSession returns a *db.Session with sensible defaults.
@@ -23,7 +26,7 @@ func testSession(
 		Project:      "proj",
 		Agent:        "claude",
 		MessageCount: 0,
-		StartedAt:    dbtest.Ptr("2025-01-15T10:00:00Z"),
+		StartedAt:    new("2025-01-15T10:00:00Z"),
 	}
 	for _, o := range opts {
 		o(s)
@@ -40,16 +43,9 @@ func stubServer(
 	return httptest.NewServer(
 		http.HandlerFunc(
 			func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != expectedMethod {
-					t.Errorf("expected method %q, got %q", expectedMethod, r.Method)
-				}
-				if r.Header.Get("User-Agent") != "agentsview" {
-					t.Errorf("expected User-Agent %q, got %q", "agentsview", r.Header.Get("User-Agent"))
-				}
-				expectedAuth := "token " + expectedToken
-				if auth := r.Header.Get("Authorization"); auth != expectedAuth {
-					t.Errorf("expected Authorization header %q, got %q", expectedAuth, auth)
-				}
+				assert.Equal(t, expectedMethod, r.Method)
+				assert.Equal(t, "agentsview", r.Header.Get("User-Agent"))
+				assert.Equal(t, "token "+expectedToken, r.Header.Get("Authorization"))
 				w.WriteHeader(status)
 				if body != "" {
 					w.Write([]byte(body))
@@ -62,27 +58,22 @@ func stubServer(
 // assertErrorContains checks that err is non-nil and contains want.
 func assertErrorContains(t *testing.T, err error, want string) {
 	t.Helper()
-	if err == nil {
-		t.Fatalf("expected error containing %q, got nil", want)
-	}
-	if !strings.Contains(err.Error(), want) {
-		t.Errorf("expected error containing %q, got: %v", want, err)
-	}
+	require.Error(t, err, "expected error containing %q", want)
+	assert.Contains(t, err.Error(), want)
 }
 
 // assertContextCancelled checks that err is non-nil and
 // wraps context.Canceled.
 func assertContextCancelled(t *testing.T, err error) {
 	t.Helper()
-	if err == nil {
-		t.Fatal("expected error for cancelled context")
-	}
+	require.Error(t, err, "expected error for cancelled context")
 	if !errors.Is(err, context.Canceled) &&
 		!strings.Contains(
 			err.Error(), "context canceled",
 		) {
-		t.Errorf(
-			"expected context.Canceled, got: %v", err,
+		assert.Fail(t,
+			"expected context.Canceled",
+			"got: %v", err,
 		)
 	}
 }
@@ -129,12 +120,7 @@ func TestFormatTimestamp(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			got := formatTimestamp(tt.in)
-			if got != tt.want {
-				t.Errorf(
-					"formatTimestamp(%q) = %q, want %q",
-					tt.in, got, tt.want,
-				)
-			}
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -148,20 +134,20 @@ func TestFormatDateShort(t *testing.T) {
 		want string
 	}{
 		{"Nil", nil, "unknown"},
-		{"Empty", dbtest.Ptr(""), "unknown"},
+		{"Empty", new(""), "unknown"},
 		{
 			"Valid",
-			dbtest.Ptr("2025-01-15T10:30:00Z"),
+			new("2025-01-15T10:30:00Z"),
 			"20250115",
 		},
 		{
 			"Nano",
-			dbtest.Ptr("2025-06-01T08:15:30.999Z"),
+			new("2025-06-01T08:15:30.999Z"),
 			"20250601",
 		},
 		{
 			"Unparseable",
-			dbtest.Ptr("garbage"),
+			new("garbage"),
 			"unknown",
 		},
 	}
@@ -169,12 +155,7 @@ func TestFormatDateShort(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			got := formatDateShort(tt.in)
-			if got != tt.want {
-				t.Errorf(
-					"formatDateShort(%v) = %q, want %q",
-					tt.in, got, tt.want,
-				)
-			}
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -196,12 +177,7 @@ func TestParseTimestamp(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			_, ok := parseTimestamp(tt.in)
-			if ok != tt.valid {
-				t.Errorf(
-					"parseTimestamp(%q) ok=%v, want %v",
-					tt.in, ok, tt.valid,
-				)
-			}
+			assert.Equal(t, tt.valid, ok)
 		})
 	}
 }
@@ -260,8 +236,20 @@ func TestFormatContentForExport_Escaping(t *testing.T) {
 			nil,
 		},
 		{
+			"SkillBlock",
+			"[Skill: planner]\nuse the plan\n[/Skill]",
+			[]string{"[Skill: planner]"},
+			[]string{`class="tool-block"`},
+		},
+		{
 			"BashToolBlock",
 			"[Bash ls -la]\noutput",
+			[]string{`class="tool-block"`},
+			nil,
+		},
+		{
+			"TaskCreateToolBlock",
+			"[TaskCreate: worker]\nrun task",
 			[]string{`class="tool-block"`},
 			nil,
 		},
@@ -346,12 +334,7 @@ func TestIsThinkingOnly(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			got := isThinkingOnly(tt.in)
-			if got != tt.want {
-				t.Errorf(
-					"isThinkingOnly(%q) = %v, want %v",
-					tt.in, got, tt.want,
-				)
-			}
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -361,7 +344,7 @@ func TestGenerateExportHTML_Structure(t *testing.T) {
 	session := testSession(func(s *db.Session) {
 		s.Project = "my-project"
 		s.MessageCount = 2
-		s.FirstMessage = dbtest.Ptr("Hello")
+		s.FirstMessage = new("Hello")
 	})
 	msgs := []db.Message{
 		{
@@ -408,10 +391,8 @@ func TestGenerateExportHTML_ThinkingOnlyClass(t *testing.T) {
 	}
 
 	html := generateExportHTML(session, msgs)
-	if !strings.Contains(html, "thinking-only") {
-		t.Error("expected thinking-only class for" +
-			" thinking-only message")
-	}
+	assert.Contains(t, html, "thinking-only",
+		"expected thinking-only class for thinking-only message")
 }
 
 func TestGenerateExportHTML_EscapesHostileInput(t *testing.T) {
@@ -432,13 +413,11 @@ func TestGenerateExportHTML_EscapesHostileInput(t *testing.T) {
 	out := generateExportHTML(session, msgs)
 
 	// Template auto-escapes the <img> tag in project name
-	if strings.Contains(out, "<img src=x") {
-		t.Error("project name XSS: raw <img> tag not escaped")
-	}
+	assert.NotContains(t, out, "<img src=x",
+		"project name XSS: raw <img> tag not escaped")
 	// Content is escaped by formatContentForExport
-	if strings.Contains(out, "<script>alert") {
-		t.Error("message content XSS not escaped")
-	}
+	assert.NotContains(t, out, "<script>alert",
+		"message content XSS not escaped")
 }
 
 func TestGenerateExportHTML_CodexAgent(t *testing.T) {
@@ -448,9 +427,8 @@ func TestGenerateExportHTML_CodexAgent(t *testing.T) {
 	})
 
 	html := generateExportHTML(session, nil)
-	if !strings.Contains(html, "Codex") {
-		t.Error("expected Codex display name for codex agent")
-	}
+	assert.Contains(t, html, "Codex",
+		"expected Codex display name for codex agent")
 }
 
 func TestGenerateExportHTML_NilStartedAt(t *testing.T) {
@@ -460,9 +438,526 @@ func TestGenerateExportHTML_NilStartedAt(t *testing.T) {
 	})
 
 	html := generateExportHTML(session, nil)
-	if !strings.Contains(html, "<!DOCTYPE html>") {
-		t.Error("expected valid HTML even with nil StartedAt")
+	assert.Contains(t, html, "<!DOCTYPE html>",
+		"expected valid HTML even with nil StartedAt")
+}
+
+func TestGenerateExportHTML_TranscriptModeControls(t *testing.T) {
+	t.Parallel()
+	session := testSession()
+	msgs := []db.Message{
+		{
+			SessionID: "test-id", Ordinal: 0,
+			Role: "user", Content: "Please inspect",
+			Timestamp: "2025-01-15T10:00:00Z",
+		},
+		{
+			SessionID: "test-id", Ordinal: 1,
+			Role: "assistant", Content: "I'll check that",
+			Timestamp: "2025-01-15T10:00:01Z",
+		},
+		{
+			SessionID: "test-id", Ordinal: 2,
+			Role: "assistant", Content: "[Bash]\nls",
+			Timestamp:  "2025-01-15T10:00:02Z",
+			HasToolUse: true,
+		},
+		{
+			SessionID: "test-id", Ordinal: 3,
+			Role: "assistant", Content: "The answer",
+			Timestamp: "2025-01-15T10:00:03Z",
+		},
 	}
+
+	html := generateExportHTML(session, msgs)
+
+	assertContainsAll(t, html, []string{
+		`id="transcript-normal" name="transcript-mode" class="toggle-input" checked`,
+		`id="transcript-focused" name="transcript-mode" class="toggle-input"`,
+		`<label for="transcript-normal" class="toggle-label">Normal</label>`,
+		`<label for="transcript-focused" class="toggle-label">Focused</label>`,
+		`#transcript-focused:checked ~ main .message.focused-hidden`,
+		`class="message assistant focused-hidden" data-ordinal="1"`,
+		`class="message assistant focused-hidden" data-ordinal="2"`,
+		`class="message assistant" data-ordinal="3"`,
+	})
+	assert.GreaterOrEqual(t,
+		strings.Index(html,
+			`#transcript-focused:checked ~ main .message.focused-hidden`,
+		),
+		strings.Index(html,
+			`#thinking-toggle:checked ~ main .message.thinking-only`,
+		),
+		"focused hide rule must follow thinking display rule",
+	)
+	assertContainsNone(t, html, []string{
+		`class="message user focused-hidden" data-ordinal="0"`,
+		`class="message assistant focused-hidden" data-ordinal="3"`,
+	})
+}
+
+func TestFocusedExportOrdinals(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		msgs []db.Message
+		want []int
+	}{
+		{
+			name: "keeps final assistant before next user",
+			msgs: []db.Message{
+				exportUserMsg(0),
+				exportAssistantMsg(1, "working"),
+				exportToolMsg(2, "[Read]\nfile"),
+				exportAssistantMsg(3, "final"),
+				exportUserMsg(4),
+			},
+			want: []int{0, 3, 4},
+		},
+		{
+			name: "drops terminal tool-only stretch",
+			msgs: []db.Message{
+				exportUserMsg(0),
+				exportToolMsg(1, "[Bash]\nmake test"),
+			},
+			want: []int{0},
+		},
+		{
+			name: "drops consecutive tool blocks in one message",
+			msgs: []db.Message{
+				exportUserMsg(0),
+				exportToolMsg(1, "[Read]\nold\n[Write]\nnew"),
+			},
+			want: []int{0},
+		},
+		{
+			name: "keeps terminal final assistant",
+			msgs: []db.Message{
+				exportUserMsg(0),
+				exportToolMsg(1, "[Bash]\nmake test"),
+				exportAssistantMsg(2, "done"),
+			},
+			want: []int{0, 2},
+		},
+		{
+			name: "keeps only last assistant in consecutive assistant run",
+			msgs: []db.Message{
+				exportUserMsg(0),
+				exportAssistantMsg(1, "first"),
+				exportAssistantMsg(2, "second"),
+				exportUserMsg(3),
+			},
+			want: []int{0, 2, 3},
+		},
+		{
+			name: "ignores thinking-only tail after final assistant",
+			msgs: []db.Message{
+				exportUserMsg(0),
+				exportAssistantMsg(1, "answer"),
+				exportAssistantMsg(2, "[Thinking]\nfollow-up notes"),
+			},
+			want: []int{0, 1},
+		},
+		{
+			name: "ignores system messages",
+			msgs: []db.Message{
+				exportUserMsg(0),
+				exportAssistantMsg(1, "answer"),
+				{
+					SessionID: "test-id",
+					Ordinal:   2,
+					Role:      "assistant",
+					Content:   "system progress",
+					IsSystem:  true,
+				},
+				{
+					SessionID: "test-id",
+					Ordinal:   3,
+					Role:      "user",
+					Content:   "system user event",
+					IsSystem:  true,
+				},
+				exportUserMsg(4),
+			},
+			want: []int{0, 1, 4},
+		},
+		{
+			name: "keeps answer before compact boundary",
+			msgs: []db.Message{
+				exportUserMsg(0),
+				exportAssistantMsg(1, "answer"),
+				{
+					SessionID:         "test-id",
+					Ordinal:           2,
+					Role:              "assistant",
+					Content:           "[compact summary]",
+					IsSystem:          true,
+					IsCompactBoundary: true,
+				},
+				exportUserMsg(3),
+			},
+			want: []int{0, 1, 2, 3},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			visible := focusedExportOrdinals(tt.msgs)
+			got := make([]int, 0, len(tt.msgs))
+			for _, msg := range tt.msgs {
+				if visible[msg.Ordinal] {
+					got = append(got, msg.Ordinal)
+				}
+			}
+			assert.True(t, slices.Equal(got, tt.want),
+				"visible ordinals = %v, want %v", got, tt.want)
+		})
+	}
+}
+
+func exportUserMsg(ordinal int) db.Message {
+	return db.Message{
+		SessionID: "test-id",
+		Ordinal:   ordinal,
+		Role:      "user",
+		Content:   "user",
+	}
+}
+
+func exportAssistantMsg(ordinal int, content string) db.Message {
+	return db.Message{
+		SessionID: "test-id",
+		Ordinal:   ordinal,
+		Role:      "assistant",
+		Content:   content,
+	}
+}
+
+func exportToolMsg(ordinal int, content string) db.Message {
+	return db.Message{
+		SessionID:   "test-id",
+		Ordinal:     ordinal,
+		Role:        "assistant",
+		Content:     content,
+		HasToolUse:  true,
+		HasThinking: strings.Contains(content, "[Thinking]"),
+	}
+}
+
+func TestGenerateExportMarkdown_Structure(t *testing.T) {
+	t.Parallel()
+	session := testSession(func(s *db.Session) {
+		s.Project = "my-project"
+		s.MessageCount = 2
+	})
+	msgs := []db.Message{
+		{
+			SessionID: "test-id",
+			Ordinal:   0,
+			Role:      "user",
+			Content:   "Hello <agent>",
+			Timestamp: "2025-01-15T10:00:00Z",
+		},
+		{
+			SessionID:   "test-id",
+			Ordinal:     1,
+			Role:        "assistant",
+			Content:     "[Thinking]\nNeed inspect.\n\n[Task]\nworking",
+			Timestamp:   "2025-01-15T10:00:05Z",
+			HasThinking: true,
+			HasToolUse:  true,
+			ToolCalls: []db.ToolCall{{
+				ToolName:      "Task",
+				Category:      "Task",
+				ToolUseID:     "toolu_1",
+				InputJSON:     `{"prompt":"inspect repo"}`,
+				ResultContent: "done",
+			}},
+		},
+	}
+
+	out := generateExportMarkdown(session, msgs, exportMarkdownOptions{})
+	assertContainsAll(t, out, []string{
+		"# Session: my-project",
+		`<session id="test-id" project="my-project" agent="Claude"`,
+		`<message role="user" ordinal="0"`,
+		"Hello &lt;agent&gt;",
+		`<thinking><![CDATA[` + "\nNeed inspect.\n" + `]]></thinking>`,
+		`<tool_call id="toolu_1" name="Task" category="Task">`,
+		`<arguments><![CDATA[` + "\n{\"prompt\":\"inspect repo\"}\n" + `]]></arguments>`,
+		`<tool_body><![CDATA[` + "\ninspect repo\n" + `]]></tool_body>`,
+		`<tool_result><![CDATA[` + "\ndone\n" + `]]></tool_result>`,
+	})
+}
+
+func TestGenerateExportMarkdown_SerializesCodeSkillAndCDATAFallback(t *testing.T) {
+	t.Parallel()
+	session := testSession()
+	msgs := []db.Message{{
+		SessionID: "test-id",
+		Ordinal:   0,
+		Role:      "assistant",
+		Content: "```go\nfmt.Println(\"hi\")\n```\n\n" +
+			"[Skill: planner]\nuse ]]> carefully\n[/Skill]",
+		Timestamp: "2025-01-15T10:00:00Z",
+	}}
+
+	out := generateExportMarkdown(session, msgs, exportMarkdownOptions{})
+	assertContainsAll(t, out, []string{
+		`<code_block language="go"><![CDATA[` + "\nfmt.Println(\"hi\")\n" + `]]></code_block>`,
+		`<skill name="planner">use ]]&gt; carefully</skill>`,
+	})
+}
+
+func TestGenerateExportMarkdown_OmitsEmptyOptionalAttributes(t *testing.T) {
+	t.Parallel()
+	session := testSession(func(s *db.Session) {
+		s.StartedAt = nil
+	})
+	childStarted := "2025-01-15T10:05:00Z"
+	out := generateExportMarkdownTree(&exportSessionTree{
+		Session: session,
+		Messages: []db.Message{{
+			SessionID:  "test-id",
+			Ordinal:    0,
+			Role:       "assistant",
+			Content:    "[Read file.go]\nbody",
+			HasToolUse: true,
+			ToolCalls: []db.ToolCall{{
+				ToolName:  "Read",
+				Category:  "Read",
+				ToolUseID: "toolu_1",
+			}},
+		}},
+		AppendedChildren: []*exportSessionTree{{
+			Session: &db.Session{
+				ID:              "child-1",
+				Project:         "proj",
+				Agent:           "claude",
+				ParentSessionID: new("test-id"),
+				StartedAt:       &childStarted,
+			},
+		}},
+	}, exportMarkdownOptions{})
+	assertContainsAll(t, out, []string{
+		`<tool_call id="toolu_1" name="Read" category="Read">`,
+		`<child_session id="child-1" parent_session_id="test-id" project="proj" agent="Claude" started_at="2025-01-15T10:05:00Z">`,
+	})
+	assertContainsNone(t, out, []string{
+		`relationship=""`,
+		`started_at=""`,
+	})
+}
+
+func TestGenerateExportMarkdown_PreservesMultiWordToolNamesAndResultEvents(t *testing.T) {
+	t.Parallel()
+	session := testSession()
+	msgs := []db.Message{{
+		SessionID:   "test-id",
+		Ordinal:     0,
+		Role:        "assistant",
+		Content:     "[Todo List]\nplan work",
+		HasToolUse:  true,
+		Timestamp:   "2025-01-15T10:00:00Z",
+		ToolCalls:   nil,
+		HasThinking: false,
+	}}
+	out := generateExportMarkdown(session, msgs, exportMarkdownOptions{})
+	assertContainsAll(t, out, []string{
+		`<tool_call name="Todo List" category="Todo List">`,
+		`<tool_body><![CDATA[` + "\nplan work\n" + `]]></tool_body>`,
+	})
+
+	msgs[0].Content = "[Bash]\n$ echo hi"
+	msgs[0].ToolCalls = []db.ToolCall{{
+		ToolName:  "Bash",
+		Category:  "Bash",
+		ToolUseID: "toolu_bash",
+		ResultEvents: []db.ToolResultEvent{{
+			ToolUseID: "toolu_bash",
+			Source:    "subagent_notification",
+			Status:    "running",
+			Content:   "still working",
+		}},
+	}}
+	out = generateExportMarkdown(session, msgs, exportMarkdownOptions{})
+	assertContainsAll(t, out, []string{
+		`<tool_result tool_call_id="toolu_bash" source="subagent_notification" status="running"><![CDATA[` + "\nstill working\n" + `]]></tool_result>`,
+	})
+}
+
+func TestGenerateExportMarkdown_EmitsEmptyMessages(t *testing.T) {
+	t.Parallel()
+	session := testSession()
+	msgs := []db.Message{{
+		SessionID: "test-id",
+		Ordinal:   0,
+		Role:      "assistant",
+		Content:   "",
+	}}
+	out := generateExportMarkdown(session, msgs, exportMarkdownOptions{})
+	assertContainsAll(t, out, []string{
+		`<message role="assistant" ordinal="0"></message>`,
+	})
+}
+
+func TestGenerateExportMarkdown_SanitizesHeadingAndAvoidsDuplicateAnchors(t *testing.T) {
+	t.Parallel()
+	session := testSession(func(s *db.Session) {
+		s.Project = "proj\n<script>alert(1)</script>"
+	})
+	child := &exportSessionTree{
+		Session: &db.Session{
+			ID:               "child-a",
+			Project:          "proj",
+			Agent:            "claude",
+			ParentSessionID:  new("test-id"),
+			RelationshipType: "subagent",
+		},
+		Messages: []db.Message{{
+			SessionID: "child-a",
+			Ordinal:   0,
+			Role:      "assistant",
+			Content:   "child message",
+		}},
+	}
+	msgs := []db.Message{{
+		SessionID:  "test-id",
+		Ordinal:    0,
+		Role:       "assistant",
+		Content:    "[Task]\none\n\n[Task]\ntwo",
+		HasToolUse: true,
+		ToolCalls: []db.ToolCall{
+			{ToolName: "Task", Category: "Task", ToolUseID: "toolu_1", SubagentSessionID: "child-a"},
+			{ToolName: "Task", Category: "Task", ToolUseID: "toolu_2", SubagentSessionID: "child-a"},
+		},
+	}}
+	out := generateExportMarkdownTree(&exportSessionTree{
+		Session:          session,
+		Messages:         msgs,
+		AnchoredChildren: map[string]*exportSessionTree{"child-a": child},
+	}, exportMarkdownOptions{Depth: "all"})
+	assertContainsNone(t, out, []string{"# Session: proj\n<script>alert(1)</script>"})
+	assert.Equal(t, 1, strings.Count(out, `<subagent_session id="child-a"`),
+		"expected child session once, got:\n%s", out)
+}
+
+func TestGenerateExportMarkdown_DoesNotParseToolMarkersInsideCodeBlocks(t *testing.T) {
+	t.Parallel()
+	session := testSession(func(s *db.Session) {
+		s.Project = "proj\\[link]\x00"
+	})
+	msgs := []db.Message{{
+		SessionID: "test-id",
+		Ordinal:   0,
+		Role:      "assistant",
+		Content:   "```txt\n[Task]\nnot tool\n```",
+	}}
+	out := generateExportMarkdown(session, msgs, exportMarkdownOptions{})
+	assertContainsAll(t, out, []string{
+		`<code_block language="txt"><![CDATA[` + "\n[Task]\nnot tool\n" + `]]></code_block>`,
+	})
+	assertContainsNone(t, out, []string{`<tool_call`, "\x00", "# Session: proj\\[link]"})
+}
+
+func TestGenerateExportMarkdown_StripsXMLInvalidControlChars(t *testing.T) {
+	t.Parallel()
+	session := testSession()
+	msgs := []db.Message{{
+		SessionID:  "test-id",
+		Ordinal:    0,
+		Role:       "assistant",
+		Content:    "[Bash]\n$ printf hi",
+		HasToolUse: true,
+		ToolCalls: []db.ToolCall{{
+			ToolName:      "Bash",
+			Category:      "Bash",
+			ResultContent: "ok\x1b[31mred\x00",
+		}},
+	}}
+	out := generateExportMarkdown(session, msgs, exportMarkdownOptions{})
+	assertContainsNone(t, out, []string{"\x1b", "\x00"})
+}
+
+func TestGenerateExportMarkdown_SeparatesAdjacentLegacyBlocks(t *testing.T) {
+	t.Parallel()
+	session := testSession()
+	msgs := []db.Message{{
+		SessionID:  "test-id",
+		Ordinal:    0,
+		Role:       "assistant",
+		Content:    "[Read file-a.go]\nbody one\n[Grep TODO]\nbody two\n```txt\n[Task]\ncode only\n```",
+		HasToolUse: true,
+	}}
+	out := generateExportMarkdown(session, msgs, exportMarkdownOptions{})
+	assertContainsAll(t, out, []string{
+		`<tool_call name="Read" category="Read">`,
+		`<tool_body><![CDATA[` + "\nbody one\n" + `]]></tool_body>`,
+		`<tool_call name="Grep" category="Grep">`,
+		`<tool_body><![CDATA[` + "\nbody two\n" + `]]></tool_body>`,
+		`<code_block language="txt"><![CDATA[` + "\n[Task]\ncode only\n" + `]]></code_block>`,
+	})
+}
+
+func TestGenerateExportMarkdown_PreservesFollowingTextAfterMultilineBash(t *testing.T) {
+	t.Parallel()
+	session := testSession()
+	cmd := "for x in a; do\n  echo done\ndone"
+	msgs := []db.Message{{
+		SessionID:  "test-id",
+		Ordinal:    0,
+		Role:       "assistant",
+		Content:    "[Bash]\n$ " + cmd + "\n\ndone",
+		HasToolUse: true,
+		ToolCalls: []db.ToolCall{{
+			ToolName:  "Bash",
+			Category:  "Bash",
+			InputJSON: `{"command":"` + "for x in a; do\\n  echo done\\ndone" + `"}`,
+		}},
+	}}
+	out := generateExportMarkdown(session, msgs, exportMarkdownOptions{})
+	assertContainsAll(t, out, []string{
+		`<tool_body><![CDATA[` + "\n$ " + cmd + "\n" + `]]></tool_body>`,
+		"\ndone\n</message>",
+	})
+}
+
+func TestGenerateExportMarkdown_SeparatesEmptyLegacyBlocks(t *testing.T) {
+	t.Parallel()
+	session := testSession()
+	msgs := []db.Message{{
+		SessionID:  "test-id",
+		Ordinal:    0,
+		Role:       "assistant",
+		Content:    "[Task]\n[Grep TODO]\nbody two\n[Thinking]\n```txt\ncode only\n```",
+		HasToolUse: true,
+	}}
+	out := generateExportMarkdown(session, msgs, exportMarkdownOptions{})
+	assertContainsAll(t, out, []string{
+		`<tool_call name="Task" category="Task">`,
+		`<tool_call name="Grep" category="Grep">`,
+		`<tool_body><![CDATA[` + "\nbody two\n" + `]]></tool_body>`,
+		`<thinking><![CDATA[` + "\n\n" + `]]></thinking>`,
+		`<code_block language="txt"><![CDATA[` + "\ncode only\n" + `]]></code_block>`,
+	})
+}
+
+func TestGenerateExportMarkdown_PreservesInlineBracketsInLegacyBodies(t *testing.T) {
+	t.Parallel()
+	session := testSession()
+	msgs := []db.Message{{
+		SessionID:  "test-id",
+		Ordinal:    0,
+		Role:       "assistant",
+		Content:    "[Bash]\n$ test [ -f foo ] && echo ```not fence```",
+		HasToolUse: true,
+	}}
+	out := generateExportMarkdown(session, msgs, exportMarkdownOptions{})
+	assertContainsAll(t, out, []string{
+		`<tool_call name="Bash" category="Bash">`,
+		`<tool_body><![CDATA[` + "\n$ test [ -f foo ] && echo ```not fence```\n" + `]]></tool_body>`,
+	})
 }
 
 func TestSanitizeFilename(t *testing.T) {
@@ -484,12 +979,7 @@ func TestSanitizeFilename(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			got := sanitizeFilename(tt.in)
-			if got != tt.want {
-				t.Errorf(
-					"sanitizeFilename(%q) = %q, want %q",
-					tt.in, got, tt.want,
-				)
-			}
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -510,12 +1000,7 @@ func TestTruncateStr(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			got := truncateStr(tt.in, tt.max)
-			if got != tt.want {
-				t.Errorf(
-					"truncateStr(%q, %d) = %q, want %q",
-					tt.in, tt.max, got, tt.want,
-				)
-			}
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -539,12 +1024,10 @@ func TestExportTemplateValid(t *testing.T) {
 		},
 	}
 	var b strings.Builder
-	if err := exportTmpl.Execute(&b, data); err != nil {
-		t.Fatalf("template execution failed: %v", err)
-	}
-	if !strings.Contains(b.String(), "<!DOCTYPE html>") {
-		t.Error("expected valid HTML doctype")
-	}
+	require.NoError(t, exportTmpl.Execute(&b, data),
+		"template execution failed")
+	assert.Contains(t, b.String(), "<!DOCTYPE html>",
+		"expected valid HTML doctype")
 }
 
 func TestExportTemplateAccentColors(t *testing.T) {
@@ -564,9 +1047,8 @@ func TestExportTemplateAccentColors(t *testing.T) {
 		"--accent-indigo",
 	}
 	for _, v := range required {
-		if !strings.Contains(exportTemplateStr, v) {
-			t.Errorf("export template missing CSS variable %s", v)
-		}
+		assert.Contains(t, exportTemplateStr, v,
+			"export template missing CSS variable %s", v)
 	}
 }
 
@@ -644,19 +1126,11 @@ func TestCreateGist(t *testing.T) {
 				assertErrorContains(t, err, tt.wantErr)
 				return
 			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			require.NoError(t, err)
 
-			if got.ID != tt.wantID {
-				t.Errorf("expected ID %q, got %q", tt.wantID, got.ID)
-			}
-			if got.HTMLURL != tt.wantURL {
-				t.Errorf("expected HTMLURL %q, got %q", tt.wantURL, got.HTMLURL)
-			}
-			if got.Owner.Login != tt.wantLogin {
-				t.Errorf("expected Owner.Login %q, got %q", tt.wantLogin, got.Owner.Login)
-			}
+			assert.Equal(t, tt.wantID, got.ID)
+			assert.Equal(t, tt.wantURL, got.HTMLURL)
+			assert.Equal(t, tt.wantLogin, got.Owner.Login)
 		})
 	}
 }
@@ -730,13 +1204,9 @@ func TestValidateGithubToken(t *testing.T) {
 				assertErrorContains(t, err, tt.wantErr)
 				return
 			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			require.NoError(t, err)
 
-			if login != tt.wantLogin {
-				t.Errorf("expected login %q, got %q", tt.wantLogin, login)
-			}
+			assert.Equal(t, tt.wantLogin, login)
 		})
 	}
 }

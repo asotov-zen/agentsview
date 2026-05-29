@@ -1,18 +1,30 @@
 package sync
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
+
+type RecursiveWatchResult struct {
+	Watched             int
+	Unwatched           int
+	Err                 error
+	BudgetExhausted     bool
+	ResourceExhausted   bool
+	ResourceExhaustedAt string
+}
 
 // Watcher uses fsnotify to watch session directories for changes
 // and triggers a callback with debouncing.
@@ -60,27 +72,58 @@ func NewWatcher(debounce time.Duration, onChange func(paths []string), excludes 
 // subdirectories to the watch list. Returns the number
 // of directories watched and unwatched (failed to add).
 func (w *Watcher) WatchRecursive(root string) (watched int, unwatched int, err error) {
+	result := w.WatchRecursiveBudgeted(root, math.MaxInt)
+	return result.Watched, result.Unwatched, result.Err
+}
+
+// WatchRecursiveBudgeted walks a directory tree and adds at most
+// budget subdirectories to the watch list. The walk stops as soon
+// as the budget is exhausted or fsnotify reports resource
+// exhaustion, so the caller can degrade the rest of the tree to
+// polling without continuing to traverse it.
+func (w *Watcher) WatchRecursiveBudgeted(root string, budget int) RecursiveWatchResult {
+	var result RecursiveWatchResult
 	root = filepath.Clean(root)
 	w.addRoot(root)
-	err = filepath.WalkDir(root,
+
+	remaining := budget
+	result.Err = filepath.WalkDir(root,
 		func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return nil // skip inaccessible dirs
 			}
-			if d.IsDir() {
-				// Skip entire excluded subtrees, but always keep the root.
-				if path != root && w.shouldExcludeForRoot(path, root) {
-					return filepath.SkipDir
-				}
-				if addErr := w.watcher.Add(path); addErr != nil {
-					unwatched++
-				} else {
-					watched++
-				}
+			if !d.IsDir() {
+				return nil
 			}
+			// Skip entire excluded subtrees, but always keep the root.
+			if path != root && w.shouldExcludeForRoot(path, root) {
+				return filepath.SkipDir
+			}
+			if remaining <= 0 {
+				result.BudgetExhausted = true
+				return filepath.SkipAll
+			}
+			if addErr := w.watcher.Add(path); addErr != nil {
+				result.Unwatched++
+				if isWatchResourceExhaustion(addErr) {
+					result.ResourceExhausted = true
+					result.ResourceExhaustedAt = path
+					return filepath.SkipAll
+				}
+				return nil
+			}
+			remaining--
+			result.Watched++
 			return nil
 		})
-	return watched, unwatched, err
+	if errors.Is(result.Err, filepath.SkipAll) {
+		result.Err = nil
+	}
+	return result
+}
+
+func isWatchResourceExhaustion(err error) bool {
+	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENOSPC)
 }
 
 // WatchShallow adds only the root directory to the watch list,
@@ -138,7 +181,10 @@ func (w *Watcher) loop() {
 // handleEvent processes a single fsnotify event, auto-watching
 // newly created directories and recording pending changes.
 func (w *Watcher) handleEvent(event fsnotify.Event) {
-	if event.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+	if event.Op&(fsnotify.Write|
+		fsnotify.Create|
+		fsnotify.Remove|
+		fsnotify.Rename) == 0 {
 		return
 	}
 

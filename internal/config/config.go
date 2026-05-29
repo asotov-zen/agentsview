@@ -22,7 +22,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/spf13/pflag"
-	"github.com/wesm/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 // TerminalConfig holds terminal launch preferences.
@@ -65,26 +65,48 @@ type PGConfig struct {
 	ExcludeProjects []string `toml:"exclude_projects" json:"exclude_projects,omitempty"`
 }
 
+// AutomatedConfig holds user-supplied additions to the
+// automated-session classifier. Parse-only; all semantic
+// normalization (trim, dedupe, length cap, built-in overlap
+// drop) happens inside db.SetUserAutomationPrefixes.
+type AutomatedConfig struct {
+	Prefixes []string `toml:"prefixes" json:"prefixes,omitempty"`
+}
+
+// AgentConfig holds per-agent runtime overrides.
+type AgentConfig struct {
+	Binary string `json:"binary,omitempty" toml:"binary"`
+}
+
+type CustomModelRate struct {
+	Input         float64 `json:"input" toml:"input"`
+	Output        float64 `json:"output" toml:"output"`
+	CacheCreation float64 `json:"cache_creation,omitempty" toml:"cache_creation"`
+	CacheRead     float64 `json:"cache_read,omitempty" toml:"cache_read"`
+}
+
 // Config holds all application configuration.
 type Config struct {
-	Host                 string         `json:"host" toml:"host"`
-	Port                 int            `json:"port" toml:"port"`
-	DataDir              string         `json:"data_dir" toml:"data_dir"`
-	DBPath               string         `json:"-" toml:"-"`
-	PublicURL            string         `json:"public_url,omitempty" toml:"public_url"`
-	PublicOrigins        []string       `json:"public_origins,omitempty" toml:"public_origins"`
-	Proxy                ProxyConfig    `json:"proxy,omitempty" toml:"proxy"`
-	WatchExcludePatterns []string       `json:"watch_exclude_patterns,omitempty" toml:"watch_exclude_patterns"`
-	CursorSecret         string         `json:"cursor_secret" toml:"cursor_secret"`
-	GithubToken          string         `json:"github_token,omitempty" toml:"github_token"`
-	Terminal             TerminalConfig `json:"terminal,omitempty" toml:"terminal"`
-	AuthToken            string         `json:"auth_token,omitempty" toml:"auth_token"`
-	RemoteAccess         bool           `json:"remote_access" toml:"remote_access"`
-	NoBrowser            bool           `json:"no_browser" toml:"no_browser"`
-	DisableUpdateCheck   bool           `json:"disable_update_check" toml:"disable_update_check"`
-	NoSync               bool           `json:"-" toml:"-"`
-	PG                   PGConfig       `json:"pg,omitempty" toml:"pg"`
-	WriteTimeout         time.Duration  `json:"-" toml:"-"`
+	Host                 string                 `json:"host" toml:"host"`
+	Port                 int                    `json:"port" toml:"port"`
+	DataDir              string                 `json:"data_dir" toml:"data_dir"`
+	DBPath               string                 `json:"-" toml:"-"`
+	PublicURL            string                 `json:"public_url,omitempty" toml:"public_url"`
+	PublicOrigins        []string               `json:"public_origins,omitempty" toml:"public_origins"`
+	Proxy                ProxyConfig            `json:"proxy,omitempty" toml:"proxy"`
+	WatchExcludePatterns []string               `json:"watch_exclude_patterns,omitempty" toml:"watch_exclude_patterns"`
+	CursorSecret         string                 `json:"cursor_secret" toml:"cursor_secret"`
+	GithubToken          string                 `json:"github_token,omitempty" toml:"github_token"`
+	Terminal             TerminalConfig         `json:"terminal,omitempty" toml:"terminal"`
+	AuthToken            string                 `json:"auth_token,omitempty" toml:"auth_token"`
+	RequireAuth          bool                   `json:"require_auth" toml:"require_auth"`
+	NoBrowser            bool                   `json:"no_browser" toml:"no_browser"`
+	DisableUpdateCheck   bool                   `json:"disable_update_check" toml:"disable_update_check"`
+	NoSync               bool                   `json:"-" toml:"-"`
+	PG                   PGConfig               `json:"pg,omitempty" toml:"pg"`
+	Automated            AutomatedConfig        `json:"automated,omitempty" toml:"automated"`
+	Agent                map[string]AgentConfig `json:"agent,omitempty" toml:"agent"`
+	WriteTimeout         time.Duration          `json:"-" toml:"-"`
 
 	// AgentDirs maps each AgentType to its configured
 	// directories. Single-dir agents store a one-element
@@ -96,6 +118,15 @@ type Config struct {
 	agentDirSource map[parser.AgentType]dirSource
 
 	ResultContentBlockedCategories []string `json:"result_content_blocked_categories,omitempty" toml:"result_content_blocked_categories"`
+
+	// EventsCoalesceInterval is the minimum wall-clock time between
+	// SSE data_changed broadcasts to connected clients. Emits that
+	// arrive within this window after a prior broadcast are coalesced
+	// into a single trailing broadcast, bounding dashboard refetch
+	// work during bursts of sync activity. Zero disables coalescing.
+	EventsCoalesceInterval time.Duration `json:"events_coalesce_interval,omitempty" toml:"events_coalesce_interval"`
+
+	CustomModelPricing map[string]CustomModelRate `json:"custom_model_pricing,omitempty" toml:"custom_model_pricing"`
 
 	// HostExplicit is true when the user passed --host on the CLI.
 	// Used to prevent auto-bind to 0.0.0.0 when the user
@@ -158,6 +189,8 @@ func Default() (Config, error) {
 		agentDirSource:                 agentDirSource,
 		WatchExcludePatterns:           []string{".git", "node_modules", "__pycache__", ".venv", "venv", "vendor", ".next"},
 		ResultContentBlockedCategories: []string{"Read", "Glob"},
+		EventsCoalesceInterval:         10 * time.Second,
+		Agent:                          map[string]AgentConfig{},
 	}, nil
 }
 
@@ -242,7 +275,6 @@ func loadPGServeBase() (Config, error) {
 	cfg.PublicURL = ""
 	cfg.PublicOrigins = nil
 	cfg.Proxy = ProxyConfig{}
-	cfg.RemoteAccess = false
 	cfg.NoBrowser = false
 	cfg.HostExplicit = false
 	return cfg, nil
@@ -326,20 +358,26 @@ func (c *Config) loadFile() error {
 	}
 
 	var file struct {
-		GithubToken                    string         `toml:"github_token"`
-		CursorSecret                   string         `toml:"cursor_secret"`
-		PublicURL                      string         `toml:"public_url"`
-		PublicOrigins                  []string       `toml:"public_origins"`
-		Proxy                          ProxyConfig    `toml:"proxy"`
-		WatchExcludePatterns           []string       `toml:"watch_exclude_patterns"`
-		ResultContentBlockedCategories []string       `toml:"result_content_blocked_categories"`
-		Terminal                       TerminalConfig `toml:"terminal"`
-		AuthToken                      string         `toml:"auth_token"`
-		RemoteAccess                   bool           `toml:"remote_access"`
-		DisableUpdateCheck             bool           `toml:"disable_update_check"`
-		PG                             PGConfig       `toml:"pg"`
+		GithubToken                    string                     `toml:"github_token"`
+		CursorSecret                   string                     `toml:"cursor_secret"`
+		PublicURL                      string                     `toml:"public_url"`
+		PublicOrigins                  []string                   `toml:"public_origins"`
+		Proxy                          ProxyConfig                `toml:"proxy"`
+		WatchExcludePatterns           []string                   `toml:"watch_exclude_patterns"`
+		ResultContentBlockedCategories []string                   `toml:"result_content_blocked_categories"`
+		Terminal                       TerminalConfig             `toml:"terminal"`
+		AuthToken                      string                     `toml:"auth_token"`
+		RequireAuth                    bool                       `toml:"require_auth"`
+		RemoteAccess                   bool                       `toml:"remote_access"`
+		DisableUpdateCheck             bool                       `toml:"disable_update_check"`
+		PG                             PGConfig                   `toml:"pg"`
+		Automated                      AutomatedConfig            `toml:"automated"`
+		Agent                          map[string]AgentConfig     `toml:"agent"`
+		EventsCoalesceInterval         time.Duration              `toml:"events_coalesce_interval"`
+		CustomModelPricing             map[string]CustomModelRate `toml:"custom_model_pricing"`
 	}
-	if _, err := toml.DecodeFile(path, &file); err != nil {
+	meta, err := toml.DecodeFile(path, &file)
+	if err != nil {
 		return fmt.Errorf("parsing config: %w", err)
 	}
 	if file.GithubToken != "" {
@@ -372,7 +410,7 @@ func (c *Config) loadFile() error {
 	if file.AuthToken != "" {
 		c.AuthToken = file.AuthToken
 	}
-	c.RemoteAccess = file.RemoteAccess
+	c.RequireAuth = file.RequireAuth || file.RemoteAccess
 	c.DisableUpdateCheck = file.DisableUpdateCheck
 	// Merge pg field-by-field so env vars override only
 	// the fields they set, preserving config-file settings.
@@ -393,6 +431,31 @@ func (c *Config) loadFile() error {
 	}
 	if file.PG.ExcludeProjects != nil && c.PG.ExcludeProjects == nil {
 		c.PG.ExcludeProjects = file.PG.ExcludeProjects
+	}
+	// IsDefined distinguishes "unset" (leave default 10s) from an
+	// explicit "0s" (disable coalescing). Checking != 0 would silently
+	// ignore the latter.
+	if meta.IsDefined("events_coalesce_interval") {
+		c.EventsCoalesceInterval = file.EventsCoalesceInterval
+	}
+	if file.Automated.Prefixes != nil {
+		c.Automated.Prefixes = file.Automated.Prefixes
+	}
+	if len(file.Agent) > 0 {
+		if c.Agent == nil {
+			c.Agent = map[string]AgentConfig{}
+		}
+		for name, cfg := range file.Agent {
+			name = strings.TrimSpace(strings.ToLower(name))
+			if name == "" {
+				continue
+			}
+			cfg.Binary = strings.TrimSpace(cfg.Binary)
+			c.Agent[name] = cfg
+		}
+	}
+	if len(file.CustomModelPricing) > 0 {
+		c.CustomModelPricing = file.CustomModelPricing
 	}
 
 	// Parse config-file dir arrays for agents that have a
@@ -495,6 +558,16 @@ func (c *Config) writeConfigMap(m map[string]any) error {
 	return nil
 }
 
+// dataDirFromEnv returns the data directory from the environment, preferring
+// AGENTSVIEW_DATA_DIR and falling back to the legacy AGENT_VIEWER_DATA_DIR.
+// Returns "" when neither is set.
+func dataDirFromEnv() string {
+	if v := os.Getenv("AGENTSVIEW_DATA_DIR"); v != "" {
+		return v
+	}
+	return os.Getenv("AGENT_VIEWER_DATA_DIR")
+}
+
 func (c *Config) loadEnv() {
 	for _, def := range parser.Registry {
 		if v := os.Getenv(def.EnvVar); v != "" {
@@ -502,7 +575,7 @@ func (c *Config) loadEnv() {
 			c.agentDirSource[def.Type] = dirEnv
 		}
 	}
-	if v := os.Getenv("AGENT_VIEWER_DATA_DIR"); v != "" {
+	if v := dataDirFromEnv(); v != "" {
 		c.DataDir = v
 	}
 	if v := os.Getenv("AGENTSVIEW_PG_URL"); v != "" {
@@ -595,6 +668,14 @@ func RegisterServeFlags(fs *flag.FlagSet) {
 		"no-update-check", false,
 		"Disable the update check API endpoint",
 	)
+	fs.Bool(
+		"require-auth", false,
+		"Require a bearer token for all API requests",
+	)
+	fs.Duration(
+		"events-coalesce-interval", 10*time.Second,
+		"Minimum interval between SSE data_changed broadcasts (0 disables coalescing)",
+	)
 }
 
 // RegisterServePFlags registers serve-command flags on fs.
@@ -651,6 +732,14 @@ func RegisterServePFlags(fs *pflag.FlagSet) {
 		"no-update-check", false,
 		"Disable the update check API endpoint",
 	)
+	fs.Bool(
+		"require-auth", false,
+		"Require a bearer token for all API requests",
+	)
+	fs.Duration(
+		"events-coalesce-interval", 10*time.Second,
+		"Minimum interval between SSE data_changed broadcasts (0 disables coalescing)",
+	)
 }
 
 // applyFlags copies explicitly-set flags from fs into cfg.
@@ -704,6 +793,12 @@ func applyFlagValue(cfg *Config, name, value string) {
 		cfg.NoSync = value == "true"
 	case "no-update-check":
 		cfg.DisableUpdateCheck = value == "true"
+	case "require-auth":
+		cfg.RequireAuth = value == "true"
+	case "events-coalesce-interval":
+		if d, err := time.ParseDuration(value); err == nil {
+			cfg.EventsCoalesceInterval = d
+		}
 	}
 }
 
@@ -988,7 +1083,7 @@ func ResolveDataDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if v := os.Getenv("AGENT_VIEWER_DATA_DIR"); v != "" {
+	if v := dataDirFromEnv(); v != "" {
 		cfg.DataDir = v
 	}
 	return cfg.DataDir, nil
@@ -1109,6 +1204,12 @@ func (c *Config) SaveSettings(patch map[string]any) error {
 
 	maps.Copy(existing, patch)
 
+	// When require_auth is written, remove the legacy
+	// remote_access key so it cannot override on next load.
+	if _, ok := patch["require_auth"]; ok {
+		delete(existing, "remote_access")
+	}
+
 	if err := c.writeConfigMap(existing); err != nil {
 		return err
 	}
@@ -1139,16 +1240,16 @@ func (c *Config) SaveSettings(patch map[string]any) error {
 			c.AuthToken = s
 		}
 	}
-	if v, ok := patch["remote_access"]; ok {
+	if v, ok := patch["require_auth"]; ok {
 		if b, ok := v.(bool); ok {
-			c.RemoteAccess = b
+			c.RequireAuth = b
 		}
 	}
 	return nil
 }
 
 // EnsureAuthToken generates and persists an auth token if one does
-// not already exist. Called when remote_access is enabled.
+// not already exist. Called when require_auth is enabled.
 func (c *Config) EnsureAuthToken() error {
 	if c.AuthToken != "" {
 		return nil

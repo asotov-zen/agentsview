@@ -1,5 +1,8 @@
 <script lang="ts">
+  import { onDestroy } from "svelte";
+  import { copyToClipboard } from "../../utils/clipboard.js";
   import { applyHighlight, escapeHTML } from "../../utils/highlight.js";
+  import CopyButton from "../shared/CopyButton.svelte";
 
   interface Props {
     content: string;
@@ -9,9 +12,35 @@
   }
 
   let { content, language, highlightQuery = "", isCurrentHighlight = false }: Props = $props();
+  let copied = $state(false);
+  let copyTimer: ReturnType<typeof setTimeout> | undefined;
+
+  async function handleCopy() {
+    const ok = await copyToClipboard(content);
+    if (!ok) return;
+
+    clearTimeout(copyTimer);
+    copied = true;
+    copyTimer = setTimeout(() => {
+      copied = false;
+    }, 1500);
+  }
+
+  onDestroy(() => {
+    clearTimeout(copyTimer);
+  });
 </script>
 
 <div class="code-block">
+  <CopyButton
+    class="code-copy"
+    {copied}
+    ariaLabel="Copy code block"
+    copiedAriaLabel="Copied code block"
+    title="Copy code"
+    copiedTitle="Copied!"
+    onclick={handleCopy}
+  />
   {#if language}
     <div class="code-lang">{language}</div>
   {/if}
@@ -23,10 +52,22 @@
 
 <style>
   .code-block {
+    position: relative;
     background: var(--code-bg);
     border-radius: var(--radius-md);
     margin: 4px 0;
     overflow: hidden;
+  }
+
+  :global(.code-copy.copy-btn) {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    z-index: 1;
+  }
+
+  .code-block:hover :global(.code-copy.copy-btn) {
+    opacity: 1;
   }
 
   .code-lang {

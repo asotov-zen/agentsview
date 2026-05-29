@@ -8,16 +8,53 @@ import {
 import {
   createSessionsStore,
   buildSessionGroups,
+  getSessionStatus,
+  parseFiltersFromParams,
+  filtersToParams,
+  splitExcludeProjectParam,
 } from "./sessions.svelte.js";
+import type { Filters } from "./sessions.svelte.js";
 import type { Session } from "../api/types.js";
 import * as api from "../api/client.js";
 import type { ListSessionsParams } from "../api/client.js";
 
+// Install a minimal localStorage mock for the test environment.
+const storageData = new Map<string, string>();
+Object.defineProperty(globalThis, "localStorage", {
+  value: {
+    getItem: (key: string) => storageData.get(key) ?? null,
+    setItem: (key: string, value: string) => { storageData.set(key, value); },
+    removeItem: (key: string) => { storageData.delete(key); },
+    clear: () => { storageData.clear(); },
+  },
+  configurable: true,
+  writable: true,
+});
+
 vi.mock("../api/client.js", () => ({
   listSessions: vi.fn(),
+  getSidebarSessionIndex: vi.fn(),
   getSession: vi.fn(),
   getProjects: vi.fn(),
   getAgents: vi.fn(),
+  getMachines: vi.fn(),
+  deleteSession: vi.fn(),
+  restoreSession: vi.fn(),
+  renameSession: vi.fn(),
+  // invalidateFilterCaches() triggers sync.loadStats() which calls
+  // getStats(). Provide a default so the stale-state guards we
+  // exercise don't trip noisy "no export" stderr from the mock.
+  getStats: vi.fn().mockResolvedValue({
+    session_count: 0,
+    message_count: 0,
+    project_count: 0,
+    machine_count: 0,
+    earliest_session: null,
+  }),
+  // Live-refresh subscription opens an EventSource via watchEvents.
+  // Stub it so the mocked client doesn't blow up when the store
+  // calls events.subscribeDebounced() during load().
+  watchEvents: vi.fn(() => ({ close: () => {} })),
 }));
 
 function mockListSessions(
@@ -30,6 +67,51 @@ function mockListSessions(
   });
 }
 
+type SkinnySessionRow = {
+  id: string;
+  parent_session_id?: string | null;
+  relationship_type?: string | null;
+  project: string;
+  machine: string;
+  agent: string;
+  display_name?: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  created_at: string;
+  termination_status?: string | null;
+  message_count: number;
+  user_message_count: number;
+  is_automated: boolean;
+  is_teammate?: boolean;
+};
+
+function makeSkinnyRow(
+  overrides: Partial<SkinnySessionRow> & { id: string },
+): SkinnySessionRow {
+  return {
+    project: "proj",
+    machine: "local",
+    agent: "claude",
+    display_name: null,
+    started_at: null,
+    ended_at: null,
+    created_at: "2024-01-01T00:00:00Z",
+    termination_status: null,
+    message_count: 1,
+    user_message_count: 1,
+    is_automated: false,
+    is_teammate: false,
+    ...overrides,
+  };
+}
+
+function mockSidebarIndex(sessions: SkinnySessionRow[] = []) {
+  vi.mocked((api as any).getSidebarSessionIndex).mockResolvedValue({
+    sessions,
+    total: sessions.length,
+  });
+}
+
 function mockGetProjects() {
   vi.mocked(api.getProjects).mockResolvedValue({
     projects: [{ name: "proj", session_count: 1 }],
@@ -37,6 +119,14 @@ function mockGetProjects() {
 }
 
 function expectListSessionsCalledWith(
+  expected: Partial<ListSessionsParams>,
+) {
+  expect((api as any).getSidebarSessionIndex).toHaveBeenLastCalledWith(
+    expect.objectContaining(expected),
+  );
+}
+
+function expectPaginatedListSessionsCalledWith(
   expected: Partial<ListSessionsParams>,
 ) {
   expect(api.listSessions).toHaveBeenLastCalledWith(
@@ -49,7 +139,9 @@ describe("SessionsStore", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    storageData.clear();
     mockListSessions();
+    mockSidebarIndex();
     sessions = createSessionsStore();
   });
 
@@ -97,6 +189,571 @@ describe("SessionsStore", () => {
       expect(sessions.filters.date).toBe("");
       expect(sessions.filters.minMessages).toBe(0);
       expect(sessions.filters.maxMessages).toBe(0);
+    });
+  });
+
+  describe("localStorage persistence", () => {
+    it("should save filters to localStorage on load", async () => {
+      sessions.filters.project = "myproj";
+      sessions.filters.agent = "claude";
+      await sessions.load();
+
+      const saved = JSON.parse(
+        localStorage.getItem("session-filters") ?? "{}",
+      );
+      expect(saved.project).toBe("myproj");
+      expect(saved.agent).toBe("claude");
+    });
+
+    it("should restore filters from localStorage on create", async () => {
+      localStorage.setItem(
+        "session-filters",
+        JSON.stringify({ project: "saved-proj", agent: "codex" }),
+      );
+      const store = createSessionsStore();
+      expect(store.filters.project).toBe("saved-proj");
+      expect(store.filters.agent).toBe("codex");
+      // Defaults for fields not in localStorage
+      expect(store.filters.minMessages).toBe(0);
+      expect(store.filters.includeOneShot).toBe(true);
+    });
+
+    it("should fall back to defaults on corrupted localStorage", () => {
+      localStorage.setItem("session-filters", "not json");
+      const store = createSessionsStore();
+      expect(store.filters.project).toBe("");
+      expect(store.filters.includeOneShot).toBe(true);
+    });
+  });
+
+  describe("sidebar index loading", () => {
+    it("uses getSidebarSessionIndex instead of paginating listSessions", async () => {
+      const manyRows = Array.from({ length: 750 }, (_, i) =>
+        makeSkinnyRow({ id: `s${i}` })
+      );
+      mockSidebarIndex(manyRows);
+
+      await sessions.load();
+
+      expect((api as any).getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+      expect(api.listSessions).not.toHaveBeenCalled();
+      expect(sessions.sessions).toHaveLength(750);
+      expect(sessions.nextCursor).toBeNull();
+    });
+
+    it("serializes only the sidebar filter subset for the index request", async () => {
+      sessions.filters.project = "proj";
+      sessions.filters.machine = "host-a";
+      sessions.filters.agent = "codex";
+      sessions.filters.date = "2026-05-23";
+      sessions.filters.dateFrom = "2026-05-01";
+      sessions.filters.dateTo = "2026-05-31";
+      sessions.filters.recentlyActive = true;
+      sessions.filters.minMessages = 2;
+      sessions.filters.maxMessages = 20;
+      sessions.filters.minUserMessages = 1;
+      sessions.filters.includeOneShot = false;
+      sessions.filters.includeAutomated = true;
+      sessions.filters.hideUnknownProject = true;
+
+      await sessions.load();
+
+      const params = vi.mocked((api as any).getSidebarSessionIndex)
+        .mock.calls[0]![0];
+      expect(params).toMatchObject({
+        project: "proj",
+        exclude_project: "unknown",
+        machine: "host-a",
+        agent: "codex",
+        date: "2026-05-23",
+        date_from: "2026-05-01",
+        date_to: "2026-05-31",
+        min_messages: 2,
+        max_messages: 20,
+        min_user_messages: 1,
+        include_one_shot: undefined,
+        include_automated: true,
+      });
+      expect(typeof params.active_since).toBe("string");
+      expect(params.cursor).toBeUndefined();
+      expect(params.limit).toBeUndefined();
+      expect(params.include_children).toBeUndefined();
+      expect(params.health_grade).toBeUndefined();
+      expect(params.outcome).toBeUndefined();
+      expect(params.min_tool_failures).toBeUndefined();
+      expect(params.starred).toBeUndefined();
+    });
+
+    it("keeps display_name available without hydration", async () => {
+      mockSidebarIndex([
+        makeSkinnyRow({
+          id: "renamed",
+          display_name: "Renamed sidebar title",
+        }),
+      ]);
+
+      await sessions.load();
+
+      expect(sessions.sessions[0]!.display_name).toBe(
+        "Renamed sidebar title",
+      );
+      expect(sessions.sessions[0]!.first_message).toBeNull();
+    });
+
+    it("marks skinny sidebar rows as index-only until hydrated", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "skinny" })]);
+
+      await sessions.load();
+
+      expect(sessions.sessions[0]!.is_index_only).toBe(true);
+    });
+
+    it("preserves hydrated active rows when reloading the index", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "active", message_count: 1 })]);
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({
+          id: "active",
+          first_message: "hydrated active detail",
+          message_count: 1,
+        }),
+      );
+
+      await sessions.load();
+      sessions.selectSession("active");
+      await vi.waitFor(() => {
+        expect(sessions.activeSession?.first_message).toBe(
+          "hydrated active detail",
+        );
+      });
+
+      mockSidebarIndex([makeSkinnyRow({ id: "active", message_count: 9 })]);
+      await sessions.load();
+
+      expect(sessions.sessions).toHaveLength(1);
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+      expect(sessions.sessions[0]!.message_count).toBe(9);
+      expect(sessions.activeSession?.first_message).toBe(
+        "hydrated active detail",
+      );
+    });
+
+    it("clears stale display names from hydrated rows when the index has none", async () => {
+      mockSidebarIndex([
+        makeSkinnyRow({
+          id: "renamed",
+          display_name: "Old custom name",
+        }),
+      ]);
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({
+          id: "renamed",
+          display_name: "Old custom name",
+          first_message: "hydrated detail",
+        }),
+      );
+
+      await sessions.load();
+      await sessions.hydrateVisibleSessions(["renamed"]);
+      expect(sessions.sessions[0]!.display_name).toBe("Old custom name");
+
+      mockSidebarIndex([
+        makeSkinnyRow({
+          id: "renamed",
+          display_name: null,
+        }),
+      ]);
+      await sessions.load();
+
+      expect(sessions.sessions[0]!.display_name).toBeNull();
+      expect(sessions.sessions[0]!.first_message).toBe("hydrated detail");
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+    });
+
+    it("merges hydrated full rows without changing index order", async () => {
+      mockSidebarIndex([
+        makeSkinnyRow({ id: "second" }),
+        makeSkinnyRow({ id: "first" }),
+      ]);
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({ id: "first", first_message: "full detail" }),
+      );
+
+      await sessions.load();
+      await (sessions as any).hydrateVisibleSessions(["first"]);
+
+      expect(sessions.sessions.map((s) => s.id)).toEqual([
+        "second",
+        "first",
+      ]);
+      expect(sessions.sessions[1]!.first_message).toBe("full detail");
+      expect(sessions.sessions[1]!.is_index_only).toBe(false);
+    });
+
+    it("drops stale-version hydration results", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "stale" })]);
+      await sessions.load();
+      const staleVersion = (sessions as any).sidebarIndexVersion;
+
+      let resolveDetail: ((session: Session) => void) | null = null;
+      vi.mocked(api.getSession).mockReturnValueOnce(
+        new Promise<Session>((resolve) => {
+          resolveDetail = resolve;
+        }),
+      );
+      const hydratePromise = (sessions as any).hydrateVisibleSessions(
+        ["stale"],
+        staleVersion,
+      );
+
+      mockSidebarIndex([makeSkinnyRow({ id: "fresh" })]);
+      await sessions.load();
+      resolveDetail!(makeSession({
+        id: "stale",
+        first_message: "stale detail",
+      }));
+      await hydratePromise;
+
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["fresh"]);
+      expect(sessions.sessions[0]!.first_message).toBeNull();
+    });
+
+    it("prunes hydration caches from stale index versions", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "old" })]);
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({ id: "old", first_message: "old detail" }),
+      );
+      await sessions.load();
+      const oldVersion = (sessions as any).sidebarIndexVersion;
+      await (sessions as any).hydrateVisibleSessions(["old"]);
+
+      expect((sessions as any).hydratedSessionsByVersion.has(oldVersion))
+        .toBe(true);
+      expect(
+        (sessions as any).sidebarHydrationInflightByVersion.has(oldVersion),
+      ).toBe(true);
+      expect(
+        (sessions as any).sidebarHydrationEpochByVersion.has(oldVersion),
+      ).toBe(true);
+
+      mockSidebarIndex([makeSkinnyRow({ id: "new" })]);
+      await sessions.load();
+      const newVersion = (sessions as any).sidebarIndexVersion;
+
+      expect(oldVersion).not.toBe(newVersion);
+      expect((sessions as any).hydratedSessionsByVersion.has(oldVersion))
+        .toBe(false);
+      expect(
+        (sessions as any).sidebarHydrationInflightByVersion.has(oldVersion),
+      ).toBe(false);
+      expect(
+        (sessions as any).sidebarHydrationEpochByVersion.has(oldVersion),
+      ).toBe(false);
+      expect([...((sessions as any).hydratedSessionsByVersion.keys())])
+        .toEqual([newVersion]);
+      expect([...((sessions as any).sidebarHydrationEpochByVersion.keys())])
+        .toEqual([newVersion]);
+    });
+
+    it("dedupes overlapping visible hydration for the same session", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "same" })]);
+      await sessions.load();
+
+      let resolveDetail!: (session: Session) => void;
+      vi.mocked(api.getSession).mockReturnValue(
+        new Promise<Session>((resolve) => {
+          resolveDetail = resolve;
+        }),
+      );
+
+      const first = (sessions as any).hydrateVisibleSessions(["same"]);
+      const second = (sessions as any).hydrateVisibleSessions(["same"]);
+      await Promise.resolve();
+
+      expect(api.getSession).toHaveBeenCalledTimes(1);
+
+      resolveDetail(makeSession({ id: "same", first_message: "detail" }));
+      await Promise.all([first, second]);
+
+      expect(sessions.sessions[0]!.first_message).toBe("detail");
+    });
+
+    it("bounds visible hydration concurrency", async () => {
+      const rows = Array.from({ length: 10 }, (_, i) =>
+        makeSkinnyRow({ id: `s${i}` })
+      );
+      mockSidebarIndex(rows);
+      await sessions.load();
+
+      const resolvers: Array<() => void> = [];
+      let inFlight = 0;
+      let maxInFlight = 0;
+      vi.mocked(api.getSession).mockImplementation((id: string) => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        return new Promise<Session>((resolve) => {
+          resolvers.push(() => {
+            inFlight--;
+            resolve(makeSession({ id }));
+          });
+        });
+      });
+
+      const hydrate = (sessions as any).hydrateVisibleSessions(
+        rows.map((row) => row.id),
+      );
+
+      await vi.waitFor(() => {
+        expect(resolvers.length).toBeGreaterThan(0);
+      });
+      expect(maxInFlight).toBeLessThanOrEqual(6);
+
+      while (resolvers.length > 0) {
+        resolvers.shift()!();
+        await Promise.resolve();
+      }
+      await hydrate;
+      expect(api.getSession).toHaveBeenCalledTimes(10);
+    });
+
+    it("refreshing the active session preserves teammate metadata", async () => {
+      mockSidebarIndex([
+        makeSkinnyRow({ id: "team", is_teammate: true }),
+      ]);
+      await sessions.load();
+      sessions.selectSession("team");
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({ id: "team", first_message: "full detail" }),
+      );
+
+      await sessions.refreshActiveSession();
+
+      expect(sessions.sessions[0]!.first_message).toBe("full detail");
+      expect(sessions.sessions[0]!.is_teammate).toBe(true);
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+    });
+
+    it("selecting an index-only session hydrates it", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "select-me" })]);
+      await sessions.load();
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({
+          id: "select-me",
+          first_message: "hydrated on select",
+        }),
+      );
+
+      sessions.selectSession("select-me");
+
+      await vi.waitFor(() => {
+        expect(sessions.sessions[0]!.first_message).toBe(
+          "hydrated on select",
+        );
+      });
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+    });
+
+    it("does not expose index-only rows through activeSession", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "active" })]);
+      await sessions.load();
+      let resolveDetail!: (session: Session) => void;
+      vi.mocked(api.getSession).mockReturnValue(
+        new Promise<Session>((resolve) => {
+          resolveDetail = resolve;
+        }),
+      );
+
+      sessions.selectSession("active");
+
+      expect(sessions.activeSession).toBeUndefined();
+
+      resolveDetail(makeSession({
+        id: "active",
+        first_message: "ready for detail consumers",
+      }));
+      await vi.waitFor(() => {
+        expect(sessions.activeSession?.first_message).toBe(
+          "ready for detail consumers",
+        );
+      });
+    });
+
+    it("delete removes an index row locally and invalidates metadata", async () => {
+      mockSidebarIndex([
+        makeSkinnyRow({ id: "remove-me" }),
+        makeSkinnyRow({ id: "keep-me" }),
+      ]);
+      vi.mocked((api as any).deleteSession).mockResolvedValue(undefined);
+      vi.mocked(api.getProjects).mockResolvedValue({ projects: [] });
+      vi.mocked(api.getAgents).mockResolvedValue({ agents: [] });
+      vi.mocked((api as any).getMachines).mockResolvedValue({ machines: [] });
+
+      await sessions.load();
+      await sessions.deleteSession("remove-me");
+
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["keep-me"]);
+      expect(sessions.total).toBe(1);
+      expect(api.getProjects).toHaveBeenCalled();
+      expect(api.getAgents).toHaveBeenCalled();
+      expect((api as any).getMachines).toHaveBeenCalled();
+    });
+
+    it("restore reloads the sidebar index", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "before" })]);
+      vi.mocked((api as any).restoreSession).mockResolvedValue(undefined);
+      await sessions.load();
+      mockSidebarIndex([makeSkinnyRow({ id: "after" })]);
+
+      await sessions.restoreSession("before");
+
+      expect((api as any).restoreSession).toHaveBeenCalledWith("before");
+      expect((api as any).getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["after"]);
+    });
+  });
+
+  describe("parseFiltersFromParams", () => {
+    it("should parse all known URL params", () => {
+      const f = parseFiltersFromParams({
+        project: "myproj",
+        machine: "host-a",
+        agent: "claude",
+        date: "2024-06-15",
+        date_from: "2024-06-01",
+        date_to: "2024-06-30",
+        active_since: "true",
+        exclude_project: "unknown",
+        min_messages: "5",
+        max_messages: "100",
+        min_user_messages: "3",
+        include_one_shot: "false",
+        include_automated: "true",
+      });
+      expect(f.project).toBe("myproj");
+      expect(f.machine).toBe("host-a");
+      expect(f.agent).toBe("claude");
+      expect(f.date).toBe("2024-06-15");
+      expect(f.dateFrom).toBe("2024-06-01");
+      expect(f.dateTo).toBe("2024-06-30");
+      expect(f.recentlyActive).toBe(true);
+      expect(f.hideUnknownProject).toBe(true);
+      expect(f.minMessages).toBe(5);
+      expect(f.maxMessages).toBe(100);
+      expect(f.minUserMessages).toBe(3);
+      expect(f.includeOneShot).toBe(false);
+      expect(f.includeAutomated).toBe(true);
+    });
+
+    it("should return defaults for empty params", () => {
+      const f = parseFiltersFromParams({});
+      expect(f.project).toBe("");
+      expect(f.agent).toBe("");
+      expect(f.minMessages).toBe(0);
+      expect(f.includeOneShot).toBe(true);
+      expect(f.includeAutomated).toBe(false);
+    });
+
+    it("should clear project=unknown when exclude_project=unknown", () => {
+      const f = parseFiltersFromParams({
+        project: "unknown",
+        exclude_project: "unknown",
+      });
+      expect(f.project).toBe("");
+      expect(f.hideUnknownProject).toBe(true);
+    });
+
+    it("should set hideUnknown from CSV exclude_project values", () => {
+      const f = parseFiltersFromParams({
+        exclude_project: "alpha,unknown",
+      });
+      expect(f.hideUnknownProject).toBe(true);
+    });
+
+    it("should handle non-numeric min_messages", () => {
+      const f = parseFiltersFromParams({ min_messages: "abc" });
+      expect(f.minMessages).toBe(0);
+    });
+  });
+
+  describe("filtersToParams", () => {
+    it("should return empty params for default filters", () => {
+      const params = filtersToParams(parseFiltersFromParams({}));
+      expect(params).toEqual({});
+    });
+
+    it("should serialize all set filters", () => {
+      const f: Filters = {
+        project: "myproj",
+        machine: "host-a",
+        agent: "claude",
+        termination: "unclean",
+        date: "2024-06-15",
+        dateFrom: "2024-06-01",
+        dateTo: "2024-06-30",
+        recentlyActive: true,
+        hideUnknownProject: true,
+        minMessages: 5,
+        maxMessages: 100,
+        minUserMessages: 3,
+        includeOneShot: false,
+        includeAutomated: true,
+      };
+      expect(filtersToParams(f)).toEqual({
+        project: "myproj",
+        machine: "host-a",
+        agent: "claude",
+        termination: "unclean",
+        date: "2024-06-15",
+        date_from: "2024-06-01",
+        date_to: "2024-06-30",
+        active_since: "true",
+        exclude_project: "unknown",
+        min_messages: "5",
+        max_messages: "100",
+        min_user_messages: "3",
+        include_one_shot: "false",
+        include_automated: "true",
+      });
+    });
+
+    it("should serialize termination filter into the URL", () => {
+      const defaults = parseFiltersFromParams({});
+      const params = filtersToParams({ ...defaults, termination: "unclean" });
+      expect(params.termination).toBe("unclean");
+    });
+
+    it("should parse termination from URL params", () => {
+      const f = parseFiltersFromParams({ termination: "unclean" });
+      expect(f.termination).toBe("unclean");
+    });
+
+    it("should round-trip through parseFiltersFromParams", () => {
+      const original: Filters = {
+        project: "myproj",
+        machine: "host-a",
+        agent: "claude",
+        termination: "unclean",
+        date: "2024-06-15",
+        dateFrom: "2024-06-01",
+        dateTo: "2024-06-30",
+        recentlyActive: true,
+        hideUnknownProject: true,
+        minMessages: 5,
+        maxMessages: 100,
+        minUserMessages: 3,
+        includeOneShot: false,
+        includeAutomated: true,
+      };
+      const params = filtersToParams(original);
+      const parsed = parseFiltersFromParams(params);
+      expect(parsed).toEqual(original);
+    });
+
+    it("should round-trip default filters as empty", () => {
+      const defaults = parseFiltersFromParams({});
+      const params = filtersToParams(defaults);
+      const reparsed = parseFiltersFromParams(params);
+      expect(reparsed).toEqual(defaults);
+      expect(params).toEqual({});
     });
   });
 
@@ -210,70 +867,82 @@ describe("SessionsStore", () => {
   });
 
   describe("loadMore serialization", () => {
-    it("should fetch all pages with consistent filters in load()", async () => {
-      vi.mocked(api.listSessions)
-        .mockResolvedValueOnce({
-          sessions: [
-            {
-              id: "s1",
-              project: "proj",
-              machine: "m",
-              agent: "a",
-              first_message: null,
-              started_at: null,
-              ended_at: null,
-              message_count: 1,
-              user_message_count: 1,
-              total_output_tokens: 0,
-              peak_context_tokens: 0,
-              has_total_output_tokens: false,
-              has_peak_context_tokens: false,
-              created_at: "2024-01-01T00:00:00Z",
-            },
-          ],
-          total: 2,
-          next_cursor: "cur1",
-        })
-        .mockResolvedValueOnce({
-          sessions: [
-            {
-              id: "s2",
-              project: "proj",
-              machine: "m",
-              agent: "a",
-              first_message: null,
-              started_at: null,
-              ended_at: null,
-              message_count: 1,
-              user_message_count: 1,
-              total_output_tokens: 0,
-              peak_context_tokens: 0,
-              has_total_output_tokens: false,
-              has_peak_context_tokens: false,
-              created_at: "2024-01-01T00:00:01Z",
-            },
-          ],
-          total: 2,
-        });
+    it("should load the sidebar index once with consistent filters", async () => {
+      mockSidebarIndex([
+        makeSkinnyRow({ id: "s1" }),
+        makeSkinnyRow({ id: "s2" }),
+      ]);
 
       sessions.filters.minMessages = 10;
       sessions.filters.maxMessages = 50;
       await sessions.load();
 
-      expect(api.listSessions).toHaveBeenCalledTimes(2);
-      const calls = vi.mocked(api.listSessions).mock.calls;
-      const first = calls[0]?.[0];
-      const second = calls[1]?.[0];
+      expect((api as any).getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+      expect(api.listSessions).not.toHaveBeenCalled();
+      const first = vi.mocked((api as any).getSidebarSessionIndex)
+        .mock.calls[0]?.[0];
 
       expect(first?.min_messages).toBe(10);
       expect(first?.max_messages).toBe(50);
       expect(first?.cursor).toBeUndefined();
 
-      expect(second?.min_messages).toBe(10);
-      expect(second?.max_messages).toBe(50);
-      expect(second?.cursor).toBe("cur1");
-
       expect(sessions.sessions).toHaveLength(2);
+      expect(sessions.total).toBe(2);
+      expect(sessions.nextCursor).toBeNull();
+    });
+
+    it("preserves old sidebar rows while the index reload is in flight", async () => {
+      // Pre-populate with a list representing a prior load,
+      // then trigger a delayed index reload. The old rows stay
+      // visible until the new index request succeeds.
+      sessions.sessions = [
+        makeSession({ id: "old-a" }),
+        makeSession({ id: "old-b" }),
+        makeSession({ id: "old-c" }),
+      ];
+      sessions.total = 3;
+
+      let resolveIndex: ((v: {
+        sessions: SkinnySessionRow[];
+        total: number;
+      }) => void) | null = null;
+      const indexPromise = new Promise<{
+        sessions: SkinnySessionRow[];
+        total: number;
+      }>((resolve) => {
+        resolveIndex = resolve;
+      });
+
+      vi.mocked((api as any).getSidebarSessionIndex)
+        .mockReturnValueOnce(indexPromise);
+
+      const loadPromise = sessions.load();
+
+      // Flush the load start without resolving the index request.
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(sessions.sessions.map((s) => s.id)).toEqual([
+        "old-a",
+        "old-b",
+        "old-c",
+      ]);
+      expect(sessions.total).toBe(3);
+      expect(sessions.loading).toBe(true);
+
+      resolveIndex!({
+        sessions: [
+          makeSkinnyRow({ id: "new-1" }),
+          makeSkinnyRow({ id: "new-2" }),
+        ],
+        total: 2,
+      });
+      await loadPromise;
+
+      expect(sessions.sessions.map((s) => s.id)).toEqual([
+        "new-1",
+        "new-2",
+      ]);
       expect(sessions.total).toBe(2);
       expect(sessions.nextCursor).toBeNull();
     });
@@ -284,7 +953,7 @@ describe("SessionsStore", () => {
       mockListSessions();
       await sessions.loadMore();
 
-      expectListSessionsCalledWith({
+      expectPaginatedListSessionsCalledWith({
         min_messages: undefined,
         max_messages: undefined,
       });
@@ -297,7 +966,7 @@ describe("SessionsStore", () => {
       mockListSessions();
       await sessions.loadMore();
 
-      expectListSessionsCalledWith({ agent: undefined });
+      expectPaginatedListSessionsCalledWith({ agent: undefined });
     });
 
     it("should omit date when empty in loadMore", async () => {
@@ -307,7 +976,7 @@ describe("SessionsStore", () => {
       mockListSessions();
       await sessions.loadMore();
 
-      expectListSessionsCalledWith({ date: undefined });
+      expectPaginatedListSessionsCalledWith({ date: undefined });
     });
 
     it("should omit date_from when empty in loadMore", async () => {
@@ -317,7 +986,7 @@ describe("SessionsStore", () => {
       mockListSessions();
       await sessions.loadMore();
 
-      expectListSessionsCalledWith({
+      expectPaginatedListSessionsCalledWith({
         date_from: undefined,
       });
     });
@@ -329,7 +998,7 @@ describe("SessionsStore", () => {
       mockListSessions();
       await sessions.loadMore();
 
-      expectListSessionsCalledWith({
+      expectPaginatedListSessionsCalledWith({
         date_to: undefined,
       });
     });
@@ -344,7 +1013,7 @@ describe("SessionsStore", () => {
       mockListSessions();
       await sessions.loadMore();
 
-      expectListSessionsCalledWith({
+      expectPaginatedListSessionsCalledWith({
         agent: "codex",
         date: "2024-07-01",
         date_from: "2024-07-01",
@@ -367,7 +1036,7 @@ describe("SessionsStore", () => {
       // Wait for load() triggered by setProjectFilter to complete,
       // not just start — verifies loading clears after the fetch.
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect((api as any).getSidebarSessionIndex).toHaveBeenCalled();
         expect(sessions.loading).toBe(false);
       });
 
@@ -415,7 +1084,7 @@ describe("SessionsStore", () => {
       sessions.filters.project = "unknown";
       sessions.setHideUnknownProjectFilter(true);
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect((api as any).getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.filters.project).toBe("");
@@ -430,7 +1099,7 @@ describe("SessionsStore", () => {
       sessions.filters.project = "my_app";
       sessions.setHideUnknownProjectFilter(true);
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect((api as any).getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.filters.project).toBe("my_app");
@@ -460,6 +1129,15 @@ describe("SessionsStore", () => {
       expect(sessions.filters.hideUnknownProject).toBe(true);
     });
 
+    it("should split hide-unknown from usage project exclusions", () => {
+      expect(
+        splitExcludeProjectParam("alpha,unknown,beta"),
+      ).toEqual({
+        hideUnknownProject: true,
+        usageExcludedProjects: "alpha,beta",
+      });
+    });
+
     it("should be included in hasActiveFilters", () => {
       sessions.filters.hideUnknownProject = true;
       expect(sessions.hasActiveFilters).toBe(true);
@@ -480,7 +1158,7 @@ describe("SessionsStore", () => {
       sessions.filters.hideUnknownProject = true;
       sessions.clearSessionFilters();
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect((api as any).getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.filters.hideUnknownProject).toBe(false);
@@ -520,7 +1198,7 @@ describe("SessionsStore", () => {
 
       sessions.clearSessionFilters();
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect((api as any).getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.hasActiveFilters).toBe(false);
@@ -531,7 +1209,7 @@ describe("SessionsStore", () => {
       sessions.filters.agent = "claude";
       sessions.clearSessionFilters();
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect((api as any).getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.filters.project).toBe("myproj");
@@ -543,7 +1221,7 @@ describe("SessionsStore", () => {
     it("should toggle one machine on and serialize it", async () => {
       sessions.toggleMachineFilter("host-a");
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect((api as any).getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.filters.machine).toBe("host-a");
@@ -555,12 +1233,12 @@ describe("SessionsStore", () => {
     it("should allow multiple selected machines", async () => {
       sessions.toggleMachineFilter("host-a");
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalledTimes(1);
+        expect((api as any).getSidebarSessionIndex).toHaveBeenCalledTimes(1);
       });
 
       sessions.toggleMachineFilter("host-b");
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalledTimes(2);
+        expect((api as any).getSidebarSessionIndex).toHaveBeenCalledTimes(2);
       });
 
       expect(sessions.filters.machine).toBe("host-a,host-b");
@@ -579,7 +1257,7 @@ describe("SessionsStore", () => {
 
       sessions.toggleMachineFilter("host-a");
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect((api as any).getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.filters.machine).toBe("host-b");
@@ -593,12 +1271,28 @@ describe("SessionsStore", () => {
 
       sessions.toggleMachineFilter("host-a");
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect((api as any).getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.filters.machine).toBe("");
       expect(sessions.selectedMachines).toEqual([]);
       expectListSessionsCalledWith({ machine: undefined });
+    });
+  });
+
+  describe("agent filter", () => {
+    it("should clear the filter when the last agent is removed", async () => {
+      sessions.filters.agent = "opencode";
+
+      sessions.toggleAgentFilter("opencode");
+      await vi.waitFor(() => {
+        expect((api as any).getSidebarSessionIndex).toHaveBeenCalled();
+      });
+
+      expect(sessions.filters.agent).toBe("");
+      expect(sessions.selectedAgents).toEqual([]);
+      expect(sessions.isAgentSelected("opencode")).toBe(false);
+      expectListSessionsCalledWith({ agent: undefined });
     });
   });
 
@@ -699,6 +1393,36 @@ describe("SessionsStore", () => {
       sessions.navigateSession(1, filter);
       expect(sessions.activeSessionId).toBe("s3");
     });
+
+    it("hydrates an index-only target after keyboard navigation", async () => {
+      sessions.sessions = [
+        makeSession({ id: "s1" }),
+        makeSession({
+          id: "skinny",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      sessions.activeSessionId = "s1";
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({
+          id: "skinny",
+          first_message: "hydrated from navigation",
+        }),
+      );
+
+      sessions.navigateSession(1);
+
+      expect(sessions.activeSessionId).toBe("skinny");
+      expect(sessions.activeSession).toBeUndefined();
+      await vi.waitFor(() => {
+        expect(sessions.activeSession?.first_message).toBe(
+          "hydrated from navigation",
+        );
+      });
+      expect(api.getSession).toHaveBeenCalledWith("skinny");
+      expect(sessions.sessions[1]!.is_index_only).toBe(false);
+    });
   });
 
   describe("loadProjects dedup", () => {
@@ -762,7 +1486,7 @@ describe("SessionsStore", () => {
       sessions.sessions = existing;
       sessions.total = 1;
 
-      vi.mocked(api.listSessions).mockRejectedValueOnce(
+      vi.mocked((api as any).getSidebarSessionIndex).mockRejectedValueOnce(
         new Error("network"),
       );
       await sessions.load();
@@ -778,7 +1502,7 @@ describe("SessionsStore", () => {
       sessions.sessions = existing;
       sessions.total = 1;
 
-      vi.mocked(api.listSessions).mockRejectedValueOnce(
+      vi.mocked((api as any).getSidebarSessionIndex).mockRejectedValueOnce(
         new Error("network"),
       );
       sessions.initFromParams({ project: "other" });
@@ -795,7 +1519,7 @@ describe("SessionsStore", () => {
       sessions.sessions = existing;
       sessions.total = 1;
 
-      vi.mocked(api.listSessions).mockRejectedValueOnce(
+      vi.mocked((api as any).getSidebarSessionIndex).mockRejectedValueOnce(
         new Error("network"),
       );
       sessions.setAgentFilter("claude");
@@ -929,6 +1653,63 @@ describe("SessionsStore", () => {
       expect(sessions.activeSessionId).toBe("existing");
       expect(api.getSession).not.toHaveBeenCalled();
     });
+
+    it("hydrates an already-loaded index-only session", async () => {
+      sessions.sessions = [
+        makeSession({
+          id: "existing",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({
+          id: "existing",
+          first_message: "hydrated navigation",
+        }),
+      );
+
+      await sessions.navigateToSession("existing");
+
+      expect(api.getSession).toHaveBeenCalledWith("existing");
+      expect(sessions.activeSessionId).toBe("existing");
+      expect(sessions.sessions[0]!.first_message).toBe(
+        "hydrated navigation",
+      );
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+    });
+
+    it("merges a navigation fetch if the index row arrives while fetching", async () => {
+      let resolveGet!: (s: Session) => void;
+      vi.mocked(api.getSession).mockReturnValue(
+        new Promise<Session>((resolve) => {
+          resolveGet = resolve;
+        }),
+      );
+
+      const promise = sessions.navigateToSession("racy");
+      sessions.sessions = [
+        makeSession({
+          id: "racy",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      resolveGet(makeSession({
+        id: "racy",
+        first_message: "fetched during navigation",
+      }));
+      await promise;
+
+      expect(sessions.sessions).toHaveLength(1);
+      expect(sessions.sessions[0]!.first_message).toBe(
+        "fetched during navigation",
+      );
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+      expect(sessions.activeSession?.first_message).toBe(
+        "fetched during navigation",
+      );
+    });
   });
 });
 
@@ -946,12 +1727,102 @@ function makeSession(
     user_message_count: 1,
     total_output_tokens: 0,
     peak_context_tokens: 0,
+    is_automated: false,
     created_at: "2024-01-01T00:00:00Z",
     ...overrides,
   };
 }
 
 describe("buildSessionGroups", () => {
+  it("sidebar index rows preserve status-tier order", () => {
+    const isoAgo = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const rows = [
+      makeSkinnyRow({
+        id: "unclean",
+        ended_at: isoAgo(2 * 60 * 60 * 1000),
+        termination_status: "tool_call_pending",
+      }),
+      makeSkinnyRow({
+        id: "quiet",
+        ended_at: isoAgo(30 * 60 * 1000),
+        termination_status: "clean",
+      }),
+      makeSkinnyRow({
+        id: "stale",
+        ended_at: isoAgo(30 * 60 * 1000),
+        termination_status: "truncated",
+      }),
+      makeSkinnyRow({
+        id: "idle",
+        ended_at: isoAgo(5 * 60 * 1000),
+      }),
+      makeSkinnyRow({
+        id: "waiting",
+        ended_at: isoAgo(5 * 60 * 1000),
+        termination_status: "awaiting_user",
+      }),
+      makeSkinnyRow({
+        id: "working",
+        ended_at: isoAgo(30 * 1000),
+      }),
+    ];
+
+    const groups = buildSessionGroups(rows as any);
+
+    expect(groups.map((g) => g.primarySessionId)).toEqual([
+      "working",
+      "waiting",
+      "idle",
+      "stale",
+      "quiet",
+      "unclean",
+    ]);
+  });
+
+  it("sidebar index freshness rollup uses every skinny group member", () => {
+    const rows = [
+      makeSkinnyRow({
+        id: "rolled-root",
+        ended_at: "2024-01-01T00:00:00Z",
+      }),
+      makeSkinnyRow({
+        id: "plain",
+        ended_at: "2024-01-02T00:00:00Z",
+      }),
+      makeSkinnyRow({
+        id: "rolled-child",
+        parent_session_id: "rolled-root",
+        relationship_type: "subagent",
+        ended_at: "2024-01-03T00:00:00Z",
+      }),
+    ];
+
+    const groups = buildSessionGroups(rows as any);
+
+    expect(groups.map((g) => g.key)).toEqual(["rolled-root", "plain"]);
+  });
+
+  it("sidebar index orphan teammate adoption uses is_teammate", () => {
+    const rows = [
+      makeSkinnyRow({
+        id: "main",
+        project: "proj",
+        started_at: "2024-01-01T00:00:00Z",
+      }),
+      makeSkinnyRow({
+        id: "teammate",
+        project: "proj",
+        is_teammate: true,
+        started_at: "2024-01-01T00:01:00Z",
+      }),
+    ];
+
+    const groups = buildSessionGroups(rows as any);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.sessions.map((s) => s.id)).toContain("teammate");
+  });
+
   it("groups two-session chain", () => {
     const sessions = [
       makeSession({
@@ -1253,5 +2124,191 @@ describe("buildSessionGroups", () => {
     expect(groups).toHaveLength(2);
     expect(groups[0]!.sessions).toHaveLength(2);
     expect(groups[1]!.sessions).toHaveLength(1);
+  });
+
+  it("aged awaiting_user falls through to quiet", () => {
+    // The waiting bubble is meant for freshly-blocked sessions.
+    // Once an awaiting_user session ages past the 10m active
+    // window it must fall through to quiet, not stay on the
+    // bubble forever.
+    const old = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const fresh = new Date(Date.now() - 30 * 1000).toISOString();
+    expect(
+      getSessionStatus({
+        ended_at: old,
+        termination_status: "awaiting_user",
+      } as Session),
+    ).toBe("quiet");
+    expect(
+      getSessionStatus({
+        ended_at: fresh,
+        termination_status: "awaiting_user",
+      } as Session),
+    ).toBe("waiting");
+  });
+
+  it("status-tier sort puts unclean below quiet", () => {
+    // All four sessions are >1h idle so the time-based tier is
+    // either quiet (clean/null) or unclean (flagged). Within a
+    // tier, freshness wins. Order should be:
+    //   quiet-newer → quiet-older → unclean-newer → unclean-older
+    // i.e. unclean sinks to the very bottom regardless of
+    // recency relative to quiet rows.
+    const sessions = [
+      makeSession({
+        id: "unclean-newer",
+        project: "u-new",
+        ended_at: "2024-01-04T00:00:00Z",
+        termination_status: "tool_call_pending",
+      }),
+      makeSession({
+        id: "quiet-older",
+        project: "q-old",
+        ended_at: "2024-01-01T00:00:00Z",
+      }),
+      makeSession({
+        id: "unclean-older",
+        project: "u-old",
+        ended_at: "2024-01-02T00:00:00Z",
+        termination_status: "truncated",
+      }),
+      makeSession({
+        id: "quiet-newer",
+        project: "q-new",
+        ended_at: "2024-01-03T00:00:00Z",
+      }),
+    ];
+
+    const groups = buildSessionGroups(sessions);
+    expect(groups.map((g) => g.sessions[0]!.id)).toEqual([
+      "quiet-newer",
+      "quiet-older",
+      "unclean-newer",
+      "unclean-older",
+    ]);
+  });
+});
+
+describe("SessionsStore live refresh", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    storageData.clear();
+    mockListSessions();
+    mockSidebarIndex();
+    mockGetProjects();
+  });
+
+  it("messages events invalidate hydrated detail without reloading the index", async () => {
+    const { events } = await import("./events.svelte.js");
+    let registered: ((e: { scope: string }) => void) | null = null;
+    const spy = vi
+      .spyOn(events, "subscribe")
+      .mockImplementation((fn) => {
+        registered = fn as (e: { scope: string }) => void;
+        return () => {};
+      });
+
+    mockSidebarIndex([makeSkinnyRow({ id: "row" })]);
+    const sessions = createSessionsStore();
+    await sessions.load();
+    vi.mocked(api.getSession)
+      .mockResolvedValueOnce(makeSession({
+        id: "row",
+        first_message: "first hydrate",
+      }))
+      .mockResolvedValueOnce(makeSession({
+        id: "row",
+        first_message: "second hydrate",
+      }));
+    await sessions.hydrateVisibleSessions(["row"]);
+
+    expect((api as any).getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+    expect(api.getSession).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalled();
+    expect(registered).not.toBeNull();
+
+    registered!({ scope: "messages" });
+    await sessions.hydrateVisibleSessions(["row"]);
+
+    expect((api as any).getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+    expect(api.getSession).toHaveBeenCalledTimes(2);
+    expect(sessions.sessions[0]!.first_message).toBe("second hydrate");
+
+    sessions.dispose();
+    spy.mockRestore();
+  });
+
+  it("sessions and sync events coalesce to one debounced index reload", async () => {
+    vi.useFakeTimers();
+    const { events } = await import("./events.svelte.js");
+    let registered: ((e: { scope: string }) => void) | null = null;
+    const spy = vi
+      .spyOn(events, "subscribe")
+      .mockImplementation((fn) => {
+        registered = fn as (e: { scope: string }) => void;
+        return () => {};
+      });
+
+    const sessions = createSessionsStore();
+    await sessions.load();
+    expect((api as any).getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+
+    registered!({ scope: "sessions" });
+    registered!({ scope: "sync" });
+    await vi.advanceTimersByTimeAsync(299);
+    expect((api as any).getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect((api as any).getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+
+    sessions.dispose();
+    spy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("refetches on the 5-minute safety-net interval", async () => {
+    vi.useFakeTimers();
+    const { events } = await import("./events.svelte.js");
+    const spy = vi
+      .spyOn(events, "subscribe")
+      .mockReturnValue(() => {});
+
+    const sessions = createSessionsStore();
+    await sessions.load();
+    expect((api as any).getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+
+    // Advance exactly one interval — avoids the runAllTimers infinite
+    // loop that recurring setInterval plus a promise-resolving
+    // listSessions mock would produce.
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    expect((api as any).getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+
+    sessions.dispose();
+    spy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("dispose() unsubscribes and clears the safety-net timer", async () => {
+    vi.useFakeTimers();
+    const { events } = await import("./events.svelte.js");
+    const unsub = vi.fn();
+    const spy = vi
+      .spyOn(events, "subscribe")
+      .mockReturnValue(unsub);
+
+    const sessions = createSessionsStore();
+    await sessions.load();
+    expect((api as any).getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+
+    sessions.dispose();
+    expect(unsub).toHaveBeenCalledTimes(1);
+
+    // After dispose the interval is cleared, so advancing well past
+    // 5 minutes triggers no further fetches.
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    expect((api as any).getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+
+    spy.mockRestore();
+    vi.useRealTimers();
   });
 });

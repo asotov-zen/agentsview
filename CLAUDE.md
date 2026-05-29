@@ -27,7 +27,7 @@ CLI (agentsview) → Config → DB (SQLite/FTS5)
 - **Sync**: File watcher + periodic sync (15min) for session directories
 - **PG Sync**: On-demand push sync from SQLite to PostgreSQL via `pg push`
 - **Frontend**: Svelte 5 SPA embedded in the Go binary at build time
-- **Config**: `AGENT_VIEWER_DATA_DIR` plus per-agent directory overrides (see
+- **Config**: `AGENTSVIEW_DATA_DIR` plus per-agent directory overrides (see
   `EnvVar` on each entry in `internal/parser/types.go`) and CLI flags
 
 ## Project Structure
@@ -96,7 +96,7 @@ committing:
 make test       # Go tests (CGO_ENABLED=1 -tags fts5)
 make test-short # Fast tests only (-short flag)
 make e2e        # Playwright E2E tests
-make lint       # golangci-lint
+make lint       # golangci-lint + NilAway
 make vet        # go vet
 ```
 
@@ -126,6 +126,13 @@ container (see `.github/workflows/ci.yml`, `integration` job).
 ### Test Guidelines
 
 - Table-driven tests for Go code
+- **Use `testify` (`require` + `assert`) for assertions in Go tests.** Reach for
+  `require.X` when a failed check should stop the test (setup errors, nil
+  receivers, length mismatches before indexing) and `assert.X` for independent
+  checks that should keep running. Don't hand-roll
+  `if got != want { t.Fatalf(...) }` in new tests. Custom domain helpers (e.g.
+  `assertSessionMeta`) are fine, but they should be built on top of testify, not
+  stdlib comparisons.
 - Use `testDB(t)` helper for database tests
 - Frontend: colocated `*.test.ts` files, Playwright specs in `frontend/e2e/`
 - All tests use `t.TempDir()` for temp directories
@@ -162,3 +169,5 @@ container (see `.github/workflows/ci.yml`, `integration` job).
 - Use conventional commit messages
 - Run tests before committing when applicable
 - Never push or pull unless explicitly asked
+- **PR descriptions**: summary only, no test plans or checklists. Describe what
+  the code does now, not how to test it.

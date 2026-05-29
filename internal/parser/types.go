@@ -10,28 +10,35 @@ import (
 type AgentType string
 
 const (
-	AgentClaude        AgentType = "claude"
-	AgentCodex         AgentType = "codex"
-	AgentCopilot       AgentType = "copilot"
-	AgentGemini        AgentType = "gemini"
-	AgentOpenCode      AgentType = "opencode"
-	AgentOpenHands     AgentType = "openhands"
-	AgentCursor        AgentType = "cursor"
-	AgentIflow         AgentType = "iflow"
-	AgentAmp           AgentType = "amp"
-	AgentZencoder      AgentType = "zencoder"
-	AgentVSCodeCopilot AgentType = "vscode-copilot"
-	AgentPi            AgentType = "pi"
-	AgentOpenClaw      AgentType = "openclaw"
-	AgentKimi          AgentType = "kimi"
-	AgentClaudeAI      AgentType = "claude-ai"
-	AgentChatGPT       AgentType = "chatgpt"
-	AgentKiro          AgentType = "kiro"
-	AgentKiroIDE       AgentType = "kiro-ide"
-	AgentCortex        AgentType = "cortex"
-	AgentHermes        AgentType = "hermes"
-	AgentWarp          AgentType = "warp"
-	AgentPositron      AgentType = "positron"
+	AgentClaude         AgentType = "claude"
+	AgentCodex          AgentType = "codex"
+	AgentCopilot        AgentType = "copilot"
+	AgentGemini         AgentType = "gemini"
+	AgentOpenCode       AgentType = "opencode"
+	AgentOpenHands      AgentType = "openhands"
+	AgentCursor         AgentType = "cursor"
+	AgentIflow          AgentType = "iflow"
+	AgentAmp            AgentType = "amp"
+	AgentZencoder       AgentType = "zencoder"
+	AgentVSCodeCopilot  AgentType = "vscode-copilot"
+	AgentPi             AgentType = "pi"
+	AgentQwen           AgentType = "qwen"
+	AgentOpenClaw       AgentType = "openclaw"
+	AgentQClaw          AgentType = "qclaw"
+	AgentKimi           AgentType = "kimi"
+	AgentClaudeAI       AgentType = "claude-ai"
+	AgentChatGPT        AgentType = "chatgpt"
+	AgentKiro           AgentType = "kiro"
+	AgentKiroIDE        AgentType = "kiro-ide"
+	AgentCortex         AgentType = "cortex"
+	AgentHermes         AgentType = "hermes"
+	AgentWorkBuddy      AgentType = "workbuddy"
+	AgentForge          AgentType = "forge"
+	AgentPiebald        AgentType = "piebald"
+	AgentWarp           AgentType = "warp"
+	AgentPositron       AgentType = "positron"
+	AgentAntigravity    AgentType = "antigravity"
+	AgentAntigravityCLI AgentType = "antigravity-cli"
 )
 
 // AgentDef describes a supported coding agent's filesystem
@@ -72,11 +79,14 @@ var Registry = []AgentDef{
 		FindSourceFunc: FindClaudeSourceFile,
 	},
 	{
-		Type:           AgentCodex,
-		DisplayName:    "Codex",
-		EnvVar:         "CODEX_SESSIONS_DIR",
-		ConfigKey:      "codex_sessions_dirs",
-		DefaultDirs:    []string{".codex/sessions"},
+		Type:        AgentCodex,
+		DisplayName: "Codex",
+		EnvVar:      "CODEX_SESSIONS_DIR",
+		ConfigKey:   "codex_sessions_dirs",
+		DefaultDirs: []string{
+			".codex/sessions",
+			".codex/archived_sessions",
+		},
 		IDPrefix:       "codex:",
 		FileBased:      true,
 		DiscoverFunc:   DiscoverCodexSessions,
@@ -113,7 +123,14 @@ var Registry = []AgentDef{
 		ConfigKey:   "opencode_dirs",
 		DefaultDirs: []string{".local/share/opencode"},
 		IDPrefix:    "opencode:",
-		FileBased:   false,
+		WatchSubdirs: []string{
+			"storage/session",
+			"storage/message",
+			"storage/part",
+		},
+		FileBased:      true,
+		DiscoverFunc:   DiscoverOpenCodeSessions,
+		FindSourceFunc: FindOpenCodeSourceFile,
 	},
 	{
 		Type:           AgentOpenHands,
@@ -211,6 +228,20 @@ var Registry = []AgentDef{
 		FindSourceFunc: FindPiSourceFile,
 	},
 	{
+		Type:        AgentQwen,
+		DisplayName: "Qwen Code",
+		EnvVar:      "QWEN_PROJECTS_DIR",
+		ConfigKey:   "qwen_project_dirs",
+		DefaultDirs: []string{".qwen/projects"},
+		IDPrefix:    "qwen:",
+		// Sessions live under <projectsDir>/<encoded-project>/chats/<id>.jsonl,
+		// so the projects root must be watched recursively — pinning the
+		// watch to a "chats" subdir of the root catches no events.
+		FileBased:      true,
+		DiscoverFunc:   DiscoverQwenSessions,
+		FindSourceFunc: FindQwenSourceFile,
+	},
+	{
 		Type:           AgentOpenClaw,
 		DisplayName:    "OpenClaw",
 		EnvVar:         "OPENCLAW_DIR",
@@ -220,6 +251,17 @@ var Registry = []AgentDef{
 		FileBased:      true,
 		DiscoverFunc:   DiscoverOpenClawSessions,
 		FindSourceFunc: FindOpenClawSourceFile,
+	},
+	{
+		Type:           AgentQClaw,
+		DisplayName:    "QClaw",
+		EnvVar:         "QCLAW_DIR",
+		ConfigKey:      "qclaw_dirs",
+		DefaultDirs:    []string{".qclaw/agents"},
+		IDPrefix:       "qclaw:",
+		FileBased:      true,
+		DiscoverFunc:   DiscoverQClawSessions,
+		FindSourceFunc: FindQClawSourceFile,
 	},
 	{
 		Type:           AgentKimi,
@@ -245,11 +287,14 @@ var Registry = []AgentDef{
 		FileBased:   false,
 	},
 	{
-		Type:           AgentKiro,
-		DisplayName:    "Kiro",
-		EnvVar:         "KIRO_SESSIONS_DIR",
-		ConfigKey:      "kiro_dirs",
-		DefaultDirs:    []string{".kiro/sessions/cli"},
+		Type:        AgentKiro,
+		DisplayName: "Kiro",
+		EnvVar:      "KIRO_SESSIONS_DIR",
+		ConfigKey:   "kiro_dirs",
+		DefaultDirs: []string{
+			".kiro/sessions/cli",
+			".local/share/kiro-cli",
+		},
 		IDPrefix:       "kiro:",
 		FileBased:      true,
 		DiscoverFunc:   DiscoverKiroSessions,
@@ -291,6 +336,42 @@ var Registry = []AgentDef{
 		FindSourceFunc: FindHermesSourceFile,
 	},
 	{
+		Type:           AgentWorkBuddy,
+		DisplayName:    "WorkBuddy",
+		EnvVar:         "WORKBUDDY_PROJECTS_DIR",
+		ConfigKey:      "workbuddy_project_dirs",
+		DefaultDirs:    []string{".workbuddy/projects"},
+		IDPrefix:       "workbuddy:",
+		FileBased:      true,
+		DiscoverFunc:   DiscoverWorkBuddySessions,
+		FindSourceFunc: FindWorkBuddySourceFile,
+	},
+	{
+		Type:        AgentForge,
+		DisplayName: "Forge",
+		EnvVar:      "FORGE_DIR",
+		ConfigKey:   "forge_dirs",
+		DefaultDirs: []string{".forge"},
+		IDPrefix:    "forge:",
+		FileBased:   false,
+	},
+	{
+		Type:        AgentPiebald,
+		DisplayName: "Piebald",
+		EnvVar:      "PIEBALD_DIR",
+		ConfigKey:   "piebald_dirs",
+		DefaultDirs: []string{
+			// Linux
+			".local/share/piebald",
+			// macOS
+			"Library/Application Support/piebald",
+			// Windows
+			"AppData/Roaming/piebald",
+		},
+		IDPrefix:  "piebald:",
+		FileBased: false,
+	},
+	{
 		Type:        AgentWarp,
 		DisplayName: "Warp",
 		EnvVar:      "WARP_DIR",
@@ -312,6 +393,38 @@ var Registry = []AgentDef{
 		FileBased:      true,
 		DiscoverFunc:   DiscoverPositronSessions,
 		FindSourceFunc: FindPositronSourceFile,
+	},
+	{
+		Type:        AgentAntigravity,
+		DisplayName: "Antigravity",
+		EnvVar:      "ANTIGRAVITY_DIR",
+		ConfigKey:   "antigravity_dirs",
+		DefaultDirs: []string{".gemini/antigravity"},
+		IDPrefix:    "antigravity:",
+		WatchSubdirs: []string{
+			"conversations",
+			"brain",
+			"annotations",
+		},
+		FileBased:      true,
+		DiscoverFunc:   DiscoverAntigravitySessions,
+		FindSourceFunc: FindAntigravitySourceFile,
+	},
+	{
+		Type:        AgentAntigravityCLI,
+		DisplayName: "Antigravity CLI",
+		EnvVar:      "ANTIGRAVITY_CLI_DIR",
+		ConfigKey:   "antigravity_cli_dirs",
+		DefaultDirs: []string{".gemini/antigravity-cli"},
+		IDPrefix:    "antigravity-cli:",
+		WatchSubdirs: []string{
+			"conversations",
+			"implicit",
+			"brain",
+		},
+		FileBased:      true,
+		DiscoverFunc:   DiscoverAntigravityCLISessions,
+		FindSourceFunc: FindAntigravityCLISourceFile,
 	},
 }
 
@@ -336,20 +449,35 @@ func AgentByType(t AgentType) (AgentDef, bool) {
 	return AgentDef{}, false
 }
 
+// StripHostPrefix splits a remote session ID into its host
+// and raw ID parts. Remote IDs use the form "host~rawID"
+// where the "~" separator avoids conflict with both agent
+// prefixes (":") and URL path segments ("/"). For local
+// session IDs (no "~" present), host is empty and rawID is
+// the original ID.
+func StripHostPrefix(id string) (host, rawID string) {
+	if before, after, ok := strings.Cut(id, "~"); ok {
+		return before, after
+	}
+	return "", id
+}
+
 // AgentByPrefix returns the AgentDef whose IDPrefix matches
 // the session ID. For Claude (empty prefix), the match
 // succeeds only when no other prefix matches and the ID
-// does not contain a colon.
+// does not contain a colon. Host prefixes ("host~...") are
+// stripped before matching.
 func AgentByPrefix(sessionID string) (AgentDef, bool) {
+	_, rawID := StripHostPrefix(sessionID)
 	for _, def := range Registry {
 		if def.IDPrefix != "" &&
-			strings.HasPrefix(sessionID, def.IDPrefix) {
+			strings.HasPrefix(rawID, def.IDPrefix) {
 			return def, true
 		}
 	}
 	// No prefixed agent matched. Fall back to Claude only
-	// if the ID has no colon (unprefixed).
-	if !strings.Contains(sessionID, ":") {
+	// if the raw ID has no colon (unprefixed).
+	if !strings.Contains(rawID, ":") {
 		if def, ok := AgentByType(AgentClaude); ok {
 			return def, true
 		}
@@ -377,10 +505,12 @@ const (
 
 // FileInfo holds file system metadata for a session source file.
 type FileInfo struct {
-	Path  string
-	Size  int64
-	Mtime int64
-	Hash  string
+	Path   string
+	Size   int64
+	Mtime  int64
+	Inode  int64
+	Device int64
+	Hash   string
 }
 
 // ParsedSession holds session metadata extracted from a JSONL file.
@@ -392,6 +522,11 @@ type ParsedSession struct {
 	ParentSessionID  string
 	RelationshipType RelationshipType
 	Cwd              string
+	GitBranch        string
+	SourceSessionID  string
+	SourceVersion    string
+	MalformedLines   int
+	IsTruncated      bool
 	FirstMessage     string
 	DisplayName      string
 	StartedAt        time.Time
@@ -399,6 +534,11 @@ type ParsedSession struct {
 	MessageCount     int
 	UserMessageCount int
 	File             FileInfo
+
+	// TerminationStatus describes how the session appears to have
+	// ended. Empty string = unknown (parser did not classify, or
+	// agent format does not yet support classification).
+	TerminationStatus TerminationStatus
 
 	TotalOutputTokens    int
 	PeakContextTokens    int
@@ -447,6 +587,7 @@ type ParsedMessage struct {
 	Ordinal       int
 	Role          RoleType
 	Content       string
+	ThinkingText  string // concatenated text of all thinking blocks; "" if none
 	Timestamp     time.Time
 	HasThinking   bool
 	HasToolUse    bool
@@ -472,9 +613,43 @@ type ParsedMessage struct {
 	ClaudeMessageID string
 	ClaudeRequestID string
 
+	SourceType        string
+	SourceSubtype     string
+	SourceUUID        string
+	SourceParentUUID  string
+	IsSidechain       bool
+	IsCompactBoundary bool
+
+	// StopReason is the reason the assistant stopped generating
+	// (Claude: "end_turn", "tool_use", "max_tokens", "stop_sequence";
+	// other agents may use their own vocabulary or leave it empty).
+	// Only populated for assistant messages where the parser sees
+	// the field. Empty when unknown.
+	StopReason string
+
 	// tokenPresenceKnown marks per-message token coverage as
 	// parser-owned and authoritative.
 	tokenPresenceKnown bool
+}
+
+// ParsedUsageEvent records session-level usage emitted by parsers
+// when an agent exposes aggregate accounting instead of per-message
+// token_usage rows.
+type ParsedUsageEvent struct {
+	SessionID                string
+	MessageOrdinal           *int
+	Source                   string
+	Model                    string
+	InputTokens              int
+	OutputTokens             int
+	CacheCreationInputTokens int
+	CacheReadInputTokens     int
+	ReasoningTokens          int
+	CostUSD                  *float64
+	CostStatus               string
+	CostSource               string
+	OccurredAt               string
+	DedupKey                 string
 }
 
 // accumulateMessageTokenUsage rolls up explicit per-message token
@@ -577,8 +752,9 @@ func (s ParsedSession) TokenCoverage(
 
 // ParseResult pairs a parsed session with its messages.
 type ParseResult struct {
-	Session  ParsedSession
-	Messages []ParsedMessage
+	Session     ParsedSession
+	Messages    []ParsedMessage
+	UsageEvents []ParsedUsageEvent
 }
 
 // InferRelationshipTypes sets RelationshipType on results that have

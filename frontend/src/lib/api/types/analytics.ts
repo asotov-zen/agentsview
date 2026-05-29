@@ -1,6 +1,7 @@
 /** Analytics types — match Go structs in internal/db/analytics.go */
 
 export type Granularity = "day" | "week" | "month";
+export type TrendsGranularity = "day" | "week" | "month";
 export type HeatmapMetric =
   | "messages"
   | "sessions"
@@ -136,6 +137,12 @@ export interface TopSession {
   message_count: number;
   output_tokens: number;
   duration_min: number;
+  /** ISO timestamps used by the StatusDot component to compute
+   * the active/stale/unclean tier — the column needs the same
+   * recency inputs as the sidebar list. */
+  started_at?: string | null;
+  ended_at?: string | null;
+  termination_status?: string | null;
 }
 
 export interface TopSessionsResponse {
@@ -165,4 +172,91 @@ export interface ToolsAnalyticsResponse {
   by_category: ToolCategoryCount[];
   by_agent: ToolAgentBreakdown[];
   trend: ToolTrendEntry[];
+}
+
+export interface SignalsToolHealth {
+  total_failure_signals: number;
+  total_retries: number;
+  total_edit_churn: number;
+  sessions_with_failures: number;
+  /** Already a percentage 0-100; do not multiply by 100. */
+  failure_rate: number;
+}
+
+export interface SignalsContextHealth {
+  avg_compaction_count: number;
+  sessions_with_compaction: number;
+  mid_task_compaction_count: number;
+  sessions_with_mid_task_compaction: number;
+  sessions_with_context_data: number;
+  avg_context_pressure: number | null;
+  high_pressure_sessions: number;
+}
+
+export interface SignalsTrendBucket {
+  date: string;
+  session_count: number;
+  avg_health_score: number | null;
+  completed: number;
+  errored: number;
+  abandoned: number;
+  avg_failure_signals: number;
+}
+
+export interface SignalsAgentRow {
+  agent: string;
+  session_count: number;
+  avg_health_score: number | null;
+  /** Already a percentage 0-100; do not multiply by 100. */
+  completed_rate: number;
+  avg_failure_signals: number;
+}
+
+export interface SignalsProjectRow {
+  project: string;
+  session_count: number;
+  avg_health_score: number | null;
+  /** Already a percentage 0-100; do not multiply by 100. */
+  completed_rate: number;
+  avg_failure_signals: number;
+}
+
+export interface SignalsAnalyticsResponse {
+  scored_sessions: number;
+  unscored_sessions: number;
+  grade_distribution: Record<string, number>;
+  avg_health_score: number | null;
+  outcome_distribution: Record<string, number>;
+  outcome_confidence_distribution: Record<string, number>;
+  tool_health: SignalsToolHealth;
+  context_health: SignalsContextHealth;
+  trend: SignalsTrendBucket[];
+  by_agent: SignalsAgentRow[];
+  by_project: SignalsProjectRow[];
+}
+
+export interface TrendsBucket {
+  date: string;
+  message_count: number;
+}
+
+export interface TrendsPoint {
+  date: string;
+  count: number;
+}
+
+export interface TrendsSeries {
+  term: string;
+  variants: string[];
+  total: number;
+  points: TrendsPoint[];
+}
+
+export interface TrendsTermsResponse {
+  granularity: TrendsGranularity;
+  from: string;
+  to: string;
+  message_count: number;
+  buckets: TrendsBucket[];
+  series: TrendsSeries[];
 }

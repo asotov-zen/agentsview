@@ -201,8 +201,8 @@ describe("ToolBlock output section", () => {
 
     const historyEntries = Array.from(document.querySelectorAll(".history-content"));
     expect(historyEntries).toHaveLength(2);
-    expect(historyEntries[0].textContent).toBe("First finished");
-    expect(historyEntries[1].textContent).toBe("Second finished");
+    expect(historyEntries[0]!.textContent).toBe("First finished");
+    expect(historyEntries[1]!.textContent).toBe("Second finished");
   });
 });
 
@@ -370,5 +370,324 @@ describe("ToolBlock fallback content", () => {
 
     const toolContent = document.querySelector(".tool-content");
     expect(toolContent).toBeNull();
+  });
+});
+
+describe("ToolBlock collapsed preview", () => {
+  let component: ReturnType<typeof mount>;
+
+  afterEach(() => {
+    if (component) unmount(component);
+    document.body.innerHTML = "";
+  });
+
+  it("shows codex bash command (cmd key) when content is empty", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "exec_command",
+      category: "Bash",
+      input_json: JSON.stringify({
+        cmd: "nl -ba file.md",
+        workdir: "/x",
+      }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "Bash", toolCall },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview).not.toBeNull();
+    expect(preview!.textContent).toBe("$ nl -ba file.md");
+  });
+
+  it("shows claude bash command (command key) when content is empty", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "Bash",
+      category: "Bash",
+      input_json: JSON.stringify({ command: "ls -la" }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "Bash", toolCall },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview).not.toBeNull();
+    expect(preview!.textContent).toBe("$ ls -la");
+  });
+
+  it("shows only the first line of multi-line bash commands", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "exec_command",
+      category: "Bash",
+      input_json: JSON.stringify({
+        cmd: "cat <<EOF\nhello\nworld\nEOF",
+      }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "Bash", toolCall },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview).not.toBeNull();
+    expect(preview!.textContent).toBe("$ cat <<EOF");
+  });
+
+  it("prefers explicit content over command fallback", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "exec_command",
+      category: "Bash",
+      input_json: JSON.stringify({ cmd: "from json" }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "$ from content", label: "Bash", toolCall },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview!.textContent).toBe("$ from content");
+  });
+
+  it("shows in-progress todo content for TodoWrite", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "TodoWrite",
+      input_json: JSON.stringify({
+        todos: [
+          { content: "first done task", status: "completed" },
+          { content: "current work", status: "in_progress" },
+          { content: "future task", status: "pending" },
+        ],
+      }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "TodoWrite", toolCall },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview).not.toBeNull();
+    expect(preview!.textContent).toBe("→ current work");
+  });
+
+  it("falls back to last todo when none are in-progress", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "TodoWrite",
+      input_json: JSON.stringify({
+        todos: [
+          { content: "task one", status: "completed" },
+          { content: "task two", status: "completed" },
+        ],
+      }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "TodoWrite", toolCall },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview!.textContent).toBe("→ task two");
+  });
+
+  it("prefers TodoWrite synthesis over content first line", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "TodoWrite",
+      input_json: JSON.stringify({
+        todos: [{ content: "do thing", status: "in_progress" }],
+      }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: {
+        content: "[Todo List]\n  → do thing",
+        label: "TodoWrite",
+        toolCall,
+      },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview!.textContent).toBe("→ do thing");
+  });
+
+  it("shows subject for TaskCreate", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "TaskCreate",
+      input_json: JSON.stringify({
+        subject: "Rebuild Companies list table columns",
+        description: "long description here",
+      }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "TaskCreate", toolCall },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview!.textContent).toBe("Rebuild Companies list table columns");
+  });
+
+  it("shows task id, status, and subject for TaskUpdate", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "TaskUpdate",
+      input_json: JSON.stringify({
+        taskId: 29,
+        status: "in_progress",
+        subject: "Rebuild Companies list table columns",
+      }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "TaskUpdate", toolCall },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview!.textContent).toBe(
+      "#29 · in_progress · Rebuild Companies list table columns",
+    );
+  });
+
+  it("shows just task id and status for TaskUpdate without subject", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "TaskUpdate",
+      input_json: JSON.stringify({
+        taskId: 29,
+        status: "completed",
+      }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "TaskUpdate", toolCall },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview!.textContent).toBe("#29 · completed");
+  });
+
+  it("shows skill name for Skill tool", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "Skill",
+      input_json: JSON.stringify({ skill: "roborev-review-branch" }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "Skill", toolCall },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview!.textContent).toBe("roborev-review-branch");
+  });
+
+  it("shows skill name from name field for lowercase skill tool", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "skill",
+      input_json: JSON.stringify({ name: "my-skill" }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "skill", toolCall },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview!.textContent).toBe("my-skill");
+  });
+
+  it("shows query for ToolSearch", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "ToolSearch",
+      input_json: JSON.stringify({
+        query: "select:TaskOutput,TaskGet",
+        max_results: 2,
+      }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "ToolSearch", toolCall },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview!.textContent).toBe("select:TaskOutput,TaskGet");
+  });
+
+  it("shows description for Task tool", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "Task",
+      input_json: JSON.stringify({
+        subagent_type: "Explore",
+        description: "Explore agentsview project",
+      }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "Task", toolCall },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview!.textContent).toBe("Explore agentsview project");
+  });
+
+  it("falls back to prompt when description is missing for Task", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "Task",
+      input_json: JSON.stringify({
+        subagent_type: "Explore",
+        prompt: "Find the foo function\nand return its location",
+      }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "Task", toolCall },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview!.textContent).toBe("Find the foo function");
+  });
+
+  it("uses Task preview for Agent tool", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "Agent",
+      input_json: JSON.stringify({
+        description: "Audit ship readiness",
+      }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "Agent", toolCall },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview!.textContent).toBe("Audit ship readiness");
+  });
+
+  it("uses Task preview for subagent-style tool names", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "Zencoder_subagent__ZencoderSubagent",
+      input_json: JSON.stringify({
+        description: "Run subagent task",
+      }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "subagent", toolCall },
+    });
+    await tick();
+
+    const preview = document.querySelector(".tool-header .tool-preview");
+    expect(preview!.textContent).toBe("Run subagent task");
   });
 });

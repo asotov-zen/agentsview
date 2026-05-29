@@ -1,14 +1,29 @@
 <script lang="ts">
-  import type { Session } from "../../api/types.js";
-  import { sessions, isRecentlyActive } from "../../stores/sessions.svelte.js";
+  import {
+    sessions,
+    type SessionGroupInput,
+  } from "../../stores/sessions.svelte.js";
   import { starred } from "../../stores/starred.svelte.js";
   import { formatRelativeTime, truncate } from "../../utils/format.js";
   import { agentColor as getAgentColor, agentLabel } from "../../utils/agents.js";
+  import {
+    normalizeMessagePreview,
+    previewMessage,
+  } from "../../utils/messages.js";
+  import StatusDot from "../common/StatusDot.svelte";
 
   interface Props {
-    session: Session;
+    session: SessionGroupInput;
     continuationCount?: number;
     groupSessionIds?: string[];
+    /** Optional full session objects in this row's group. When
+     * provided, the status dot uses the group's freshest activity
+     * for the time-based tier — so a parent in tool_call_pending
+     * with a subagent currently writing stays green/working
+     * instead of decaying to stale. The parent's parser status
+     * still wins over freshness for awaiting_user (a fork running
+     * in parallel doesn't change that the parent is waiting). */
+    groupSessions?: SessionGroupInput[];
     hideAgent?: boolean;
     hideProject?: boolean;
     /** Render in compact mode (smaller, used for child sessions). */
@@ -31,6 +46,7 @@
     session,
     continuationCount = 1,
     groupSessionIds,
+    groupSessions,
     hideAgent = false,
     hideProject = false,
     compact = false,
@@ -55,8 +71,6 @@
     return false;
   });
 
-  let recentlyActive = $derived(isRecentlyActive(session));
-
   let agentColor = $derived(
     getAgentColor(session.agent),
   );
@@ -69,7 +83,9 @@
 
   /** Whether this session is a team member (received a <teammate-message>). */
   let isTeamSession = $derived(
-    session.first_message?.includes("<teammate-message") ?? false,
+    session.is_teammate
+      ?? session.first_message?.includes("<teammate-message")
+      ?? false,
   );
 
   /**
@@ -77,8 +93,13 @@
    * description (e.g. "Task #2: Align ROADMAP.md...") instead of the
    * repetitive "You are a teammate on..." boilerplate.
    */
-  let displayName = $derived.by(() => {
-    if (session.display_name) return truncate(session.display_name, 50);
+  let displayLabel = $derived.by((): { text: string; isShell: boolean } => {
+    if (session.display_name) {
+      return {
+        text: truncate(session.display_name, 50),
+        isShell: false,
+      };
+    }
     let msg = session.first_message ?? "";
     if (msg.includes("<teammate-message")) {
       msg = msg
@@ -88,16 +109,18 @@
       // Extract "Task #N: description" from the boilerplate.
       const taskMatch = msg.match(/Task\s*#?\d+[:\s]+(.+?)(?:\s+\d+\.|$)/s);
       if (taskMatch) {
-        return truncate(taskMatch[1]!.trim(), 50);
+        return { text: truncate(taskMatch[1]!.trim(), 50), isShell: false };
       }
       // Fallback: skip the "You are a teammate on ..." boilerplate.
       const afterTeam = msg.match(/team[."]\s*[^.]*?[.]\s+(.+)/s)
         ?? msg.match(/You are a teammate[^.]*\.\s+(.+)/s);
       if (afterTeam) {
-        return truncate(afterTeam[1]!.trim(), 50);
+        return { text: truncate(afterTeam[1]!.trim(), 50), isShell: false };
       }
     }
-    return msg ? truncate(msg, 50) : truncate(session.project, 30);
+    const p = previewMessage(msg);
+    if (p.text) return { text: truncate(p.text, 50), isShell: p.isShell };
+    return { text: truncate(session.project, 30), isShell: false };
   });
 
   let timeStr = $derived(
@@ -154,7 +177,9 @@
   }
 
   function startRename() {
-    renameValue = session.display_name ?? session.first_message ?? "";
+    renameValue =
+      session.display_name
+      ?? normalizeMessagePreview(session.first_message);
     renaming = true;
     closeContextMenu();
     requestAnimationFrame(() => renameInput?.select());
@@ -256,13 +281,8 @@
     <span class="tree-spacer"></span>
   {/if}
 
-  {#if !hideAgent || recentlyActive}
-    <span
-      class="agent-dot"
-      class:recently-active={recentlyActive}
-      style:background={agentColor}
-    ></span>
-  {/if}
+  <StatusDot {session} {groupSessions} size={6} />
+
 
   <div class="session-info">
     {#if renaming}
@@ -287,7 +307,17 @@
       />
     {:else}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div class="session-name" ondblclick={handleDblClick}>{displayName}</div>
+      <div
+        class="session-name"
+        class:shell={displayLabel.isShell}
+        ondblclick={handleDblClick}
+      >
+        {#if displayLabel.isShell}
+          <code>{displayLabel.text}</code>
+        {:else}
+          {displayLabel.text}
+        {/if}
+      </div>
     {/if}
     <div class="session-meta">
       {#if !hideProject}
@@ -438,32 +468,6 @@
     flex-shrink: 0;
   }
 
-  .agent-dot {
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    flex-shrink: 0;
-  }
-
-  .agent-dot.recently-active {
-    animation: pulse-glow 3s ease-in-out infinite;
-    will-change: box-shadow;
-  }
-
-  @keyframes pulse-glow {
-    0%,
-    100% {
-      box-shadow: 0 0 0 0 transparent;
-    }
-    50% {
-      box-shadow: 0 0 6px 3px color-mix(
-        in srgb,
-        var(--accent-green) 40%,
-        transparent
-      );
-    }
-  }
-
   .side-meta {
     display: flex;
     flex-direction: column;
@@ -513,6 +517,16 @@
     text-overflow: ellipsis;
     line-height: 1.3;
     letter-spacing: -0.005em;
+  }
+
+  .session-name.shell > code {
+    font-family: var(--font-mono);
+    font-size: 0.95em;
+    background: transparent;
+    border: none;
+    padding: 0;
+    color: var(--text-secondary);
+    letter-spacing: 0;
   }
 
   .compact .session-name {

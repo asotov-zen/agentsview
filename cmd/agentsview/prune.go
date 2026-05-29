@@ -11,8 +11,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/wesm/agentsview/internal/config"
-	"github.com/wesm/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 )
 
 // PruneConfig holds parsed CLI options for the prune command.
@@ -246,6 +246,7 @@ func runPrune(cfg PruneConfig) {
 		log.Fatalf("loading config: %v", err)
 	}
 
+	applyClassifierConfig(appCfg)
 	database, err := db.Open(appCfg.DBPath)
 	if err != nil {
 		log.Fatalf("opening database: %v", err)

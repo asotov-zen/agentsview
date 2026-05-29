@@ -3,6 +3,7 @@ export interface VersionInfo {
   version: string;
   commit: string;
   build_date: string;
+  read_only?: boolean;
 }
 
 /** Matches Go Session struct in internal/db/sessions.go */
@@ -21,6 +22,7 @@ export interface Session {
   relationship_type?: string;
   cwd?: string;
   deleted_at?: string | null;
+  termination_status?: string | null;
   file_path?: string;
   file_size?: number;
   file_mtime?: number;
@@ -29,6 +31,26 @@ export interface Session {
   has_total_output_tokens?: boolean;
   has_peak_context_tokens?: boolean;
   is_automated: boolean;
+  is_teammate?: boolean;
+  /** True when populated from the skinny sidebar index and not yet hydrated. */
+  is_index_only?: boolean;
+  // Session signals (from backend computation)
+  health_score?: number | null;
+  health_grade?: string | null;
+  outcome?: string;
+  outcome_confidence?: string;
+  ended_with_role?: string;
+  tool_failure_signal_count?: number;
+  tool_retry_count?: number;
+  edit_churn_count?: number;
+  consecutive_failure_max?: number;
+  final_failure_streak?: number;
+  compaction_count?: number;
+  mid_task_compaction_count?: number;
+  context_pressure_max?: number | null;
+  // Detail-only fields (from enriched detail response)
+  health_score_basis?: string[] | null;
+  health_penalties?: Record<string, number> | null;
   created_at: string;
 }
 
@@ -36,6 +58,31 @@ export interface Session {
 export interface SessionPage {
   sessions: Session[];
   next_cursor?: string;
+  total: number;
+}
+
+/** Skinny sidebar index row from GET /api/v1/sessions/sidebar-index. */
+export interface SidebarSessionIndexRow {
+  id: string;
+  parent_session_id?: string | null;
+  relationship_type?: string | null;
+  project: string;
+  machine: string;
+  agent: string;
+  display_name?: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  created_at: string;
+  termination_status?: string | null;
+  message_count: number;
+  user_message_count: number;
+  is_automated: boolean;
+  is_teammate?: boolean;
+}
+
+/** Matches Go SidebarSessionIndex struct. */
+export interface SidebarSessionIndexResponse {
+  sessions: SidebarSessionIndexRow[];
   total: number;
 }
 
@@ -80,6 +127,7 @@ export interface Message {
   content: string;
   timestamp: string;
   has_thinking: boolean;
+  thinking_text: string;
   has_tool_use: boolean;
   is_system: boolean;
   content_length: number;
@@ -92,6 +140,8 @@ export interface Message {
   has_context_tokens?: boolean;
   has_output_tokens?: boolean;
   tool_calls?: ToolCall[];
+  is_compact_boundary?: boolean;
+  source_subtype?: string;
 }
 
 /** Matches Go MinimapEntry struct */

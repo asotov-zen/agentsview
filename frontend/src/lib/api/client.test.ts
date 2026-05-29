@@ -7,6 +7,11 @@ import {
   getAnalyticsActivity,
   getAnalyticsHeatmap,
   getAnalyticsTopSessions,
+  getTrendsTerms,
+  watchEvents,
+  WATCH_EVENTS_MAX_CONSECUTIVE_ERRORS,
+  watchSession,
+  WATCH_SESSION_MAX_CONSECUTIVE_ERRORS,
   ApiError,
 } from "./client.js";
 import type { SyncHandle } from "./client.js";
@@ -486,6 +491,7 @@ describe("generateInsight SSE parsing", () => {
         ok: false,
         status: 500,
         body: null,
+        text: () => Promise.resolve(""),
       }),
     );
 
@@ -498,6 +504,42 @@ describe("generateInsight SSE parsing", () => {
     activeHandles.push(handle);
 
     await expect(handle.done).rejects.toThrow("500");
+  });
+
+  it("surfaces backend error text on non-ok response", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 501,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              error:
+                "insight generation is not available in read-only mode",
+            }),
+          ),
+      }),
+    );
+
+    const { generateInsight } = await import("./client.js");
+    const handle = generateInsight({
+      type: "daily_activity",
+      date_from: "2025-01-15",
+      date_to: "2025-01-15",
+    });
+    activeHandles.push(handle);
+
+    try {
+      await handle.done;
+      expect.unreachable("should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ApiError);
+      expect((e as InstanceType<typeof ApiError>).status).toBe(501);
+      expect((e as InstanceType<typeof ApiError>).message).toBe(
+        "insight generation is not available in read-only mode",
+      );
+    }
   });
 });
 
@@ -660,5 +702,298 @@ describe("query serialization", () => {
         "/api/v1/analytics/top-sessions?from=2024-01-01",
       );
     });
+  });
+
+  describe("trends query serialization", () => {
+    it("serializes trends repeated term params", async () => {
+      fetchSpy.mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({
+          granularity: "week",
+          from: "2024-06-01",
+          to: "2024-06-30",
+          message_count: 0,
+          buckets: [],
+          series: [],
+        }),
+      });
+
+      await getTrendsTerms({
+        from: "2024-06-01",
+        to: "2024-06-30",
+        timezone: "UTC",
+        granularity: "week",
+        terms: ["load bearing | load-bearing", "seam"],
+      });
+
+      const [path, query = ""] = lastUrl().split("?");
+      expect(path).toBe("/api/v1/trends/terms");
+      const params = new URLSearchParams(query);
+      expect(params.get("from")).toBe("2024-06-01");
+      expect(params.get("to")).toBe("2024-06-30");
+      expect(params.get("timezone")).toBe("UTC");
+      expect(params.get("granularity")).toBe("week");
+      expect(params.getAll("term")).toEqual([
+        "load bearing | load-bearing",
+        "seam",
+      ]);
+    });
+  });
+});
+
+describe("watchEvents", () => {
+  class FakeEventSource {
+    static instances: FakeEventSource[] = [];
+    public url: string;
+    public readyState = 1;
+    private listeners: Record<string, ((ev: MessageEvent) => void)[]> = {};
+    public onerror: ((ev: Event) => void) | null = null;
+    public closed = false;
+
+    constructor(url: string) {
+      this.url = url;
+      FakeEventSource.instances.push(this);
+    }
+
+    addEventListener(name: string, cb: (ev: MessageEvent) => void) {
+      (this.listeners[name] ||= []).push(cb);
+    }
+
+    close() {
+      this.closed = true;
+    }
+
+    // Fire an onerror event (the native API triggers via the property, not addEventListener).
+    fireError() {
+      if (this.onerror) this.onerror(new Event("error"));
+    }
+
+    // Fire an open event (successful (re)connect).
+    fireOpen() {
+      (this.listeners["open"] || []).forEach((cb) => cb(new Event("open") as MessageEvent));
+    }
+
+    // Fire a frame with a string body (caller controls JSON validity).
+    fireRaw(name: string, data: string) {
+      const payload = { data } as MessageEvent;
+      (this.listeners[name] || []).forEach((cb) => cb(payload));
+    }
+
+    static reset() {
+      FakeEventSource.instances = [];
+    }
+  }
+
+  beforeEach(() => {
+    FakeEventSource.reset();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    localStorage.clear();
+  });
+
+  it("opens /api/v1/events locally without a token", () => {
+    watchEvents(() => {});
+    expect(FakeEventSource.instances).toHaveLength(1);
+    expect(FakeEventSource.instances[0]!.url).toBe("/api/v1/events");
+  });
+
+  it("appends ?token= when an auth token is set", () => {
+    localStorage.setItem("agentsview-auth-token", "secret");
+    watchEvents(() => {});
+    expect(FakeEventSource.instances[0]!.url).toBe(
+      "/api/v1/events?token=secret",
+    );
+  });
+
+  it("invokes onEvent with parsed scope for valid data_changed frames", () => {
+    const received: string[] = [];
+    watchEvents((e) => received.push(e.scope));
+    FakeEventSource.instances[0]!.fireRaw(
+      "data_changed",
+      JSON.stringify({ scope: "messages" }),
+    );
+    expect(received).toEqual(["messages"]);
+  });
+
+  it("falls back to { scope: 'sync' } for malformed payloads", () => {
+    const received: string[] = [];
+    watchEvents((e) => received.push(e.scope));
+    FakeEventSource.instances[0]!.fireRaw(
+      "data_changed",
+      "not valid json",
+    );
+    expect(received).toEqual(["sync"]);
+  });
+
+  it("falls back to { scope: 'sync' } for parsed-but-invalid payloads", () => {
+    const received: string[] = [];
+    watchEvents((e) => received.push(e.scope));
+    const es = FakeEventSource.instances[0]!;
+    // Empty object — no scope field.
+    es.fireRaw("data_changed", JSON.stringify({}));
+    // Unknown scope value.
+    es.fireRaw("data_changed", JSON.stringify({ scope: "bogus" }));
+    // Non-object payloads (string, number, null).
+    es.fireRaw("data_changed", JSON.stringify("messages"));
+    es.fireRaw("data_changed", JSON.stringify(42));
+    es.fireRaw("data_changed", JSON.stringify(null));
+    expect(received).toEqual(["sync", "sync", "sync", "sync", "sync"]);
+  });
+
+  it("opens <server>/api/v1/events with server-scoped token in remote mode", () => {
+    const server = "https://remote.example.com";
+    localStorage.setItem("agentsview-server-url", server);
+    localStorage.setItem(`agentsview-auth-token::${server}`, "remote-token");
+    watchEvents(() => {});
+    expect(FakeEventSource.instances[0]!.url).toBe(
+      `${server}/api/v1/events?token=remote-token`,
+    );
+  });
+
+  it("URL-encodes reserved characters in the token query parameter", () => {
+    const rawToken = "a b&c?d=e/f+g";
+    localStorage.setItem("agentsview-auth-token", rawToken);
+    watchEvents(() => {});
+    expect(FakeEventSource.instances[0]!.url).toBe(
+      `/api/v1/events?token=${encodeURIComponent(rawToken)}`,
+    );
+  });
+
+  it("closes the EventSource after N consecutive errors without a successful event", () => {
+    watchEvents(() => {});
+    const es = FakeEventSource.instances[0]!;
+    for (let i = 0; i < WATCH_EVENTS_MAX_CONSECUTIVE_ERRORS - 1; i++) {
+      es.fireError();
+      expect(es.closed).toBe(false);
+    }
+    es.fireError();
+    expect(es.closed).toBe(true);
+  });
+
+  it("resets the error counter on a successful (re)connect", () => {
+    watchEvents(() => {});
+    const es = FakeEventSource.instances[0]!;
+    // Accumulate N-1 errors.
+    for (let i = 0; i < WATCH_EVENTS_MAX_CONSECUTIVE_ERRORS - 1; i++) {
+      es.fireError();
+    }
+    // A successful reconnect (open event) resets the counter.
+    es.fireOpen();
+    // Another N-1 errors should still not close.
+    for (let i = 0; i < WATCH_EVENTS_MAX_CONSECUTIVE_ERRORS - 1; i++) {
+      es.fireError();
+    }
+    expect(es.closed).toBe(false);
+  });
+
+  it("resets the error counter after a successful event delivery", () => {
+    const received: string[] = [];
+    watchEvents((e) => received.push(e.scope));
+    const es = FakeEventSource.instances[0]!;
+    // Accumulate N-1 errors, then a successful event resets the counter.
+    for (let i = 0; i < WATCH_EVENTS_MAX_CONSECUTIVE_ERRORS - 1; i++) {
+      es.fireError();
+    }
+    es.fireRaw("data_changed", JSON.stringify({ scope: "messages" }));
+    expect(received).toEqual(["messages"]);
+    // Another N-1 errors should still not close — counter is back at 0.
+    for (let i = 0; i < WATCH_EVENTS_MAX_CONSECUTIVE_ERRORS - 1; i++) {
+      es.fireError();
+    }
+    expect(es.closed).toBe(false);
+  });
+});
+
+describe("watchSession", () => {
+  class FakeEventSource {
+    static instances: FakeEventSource[] = [];
+    public url: string;
+    public readyState = 1;
+    private listeners: Record<string, ((ev: MessageEvent) => void)[]> = {};
+    public onerror: ((ev: Event) => void) | null = null;
+    public closed = false;
+
+    constructor(url: string) {
+      this.url = url;
+      FakeEventSource.instances.push(this);
+    }
+
+    addEventListener(name: string, cb: (ev: MessageEvent) => void) {
+      (this.listeners[name] ||= []).push(cb);
+    }
+
+    close() {
+      this.closed = true;
+    }
+
+    fireError() {
+      if (this.onerror) this.onerror(new Event("error"));
+    }
+
+    fireOpen() {
+      (this.listeners["open"] || []).forEach((cb) =>
+        cb(new Event("open") as MessageEvent),
+      );
+    }
+
+    fireUpdate() {
+      (this.listeners["session_updated"] || []).forEach((cb) =>
+        cb(new MessageEvent("session_updated")),
+      );
+    }
+
+    static reset() {
+      FakeEventSource.instances = [];
+    }
+  }
+
+  beforeEach(() => {
+    FakeEventSource.reset();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    localStorage.clear();
+  });
+
+  it("closes the EventSource after N consecutive errors", () => {
+    // Unknown session ids now return HTTP 404 per the Session API
+    // contract. Without a retry cap the browser would hammer /watch
+    // forever; this test locks in the circuit breaker instead.
+    watchSession("abc", () => {});
+    const es = FakeEventSource.instances[0]!;
+    for (let i = 0; i < WATCH_SESSION_MAX_CONSECUTIVE_ERRORS - 1; i++) {
+      es.fireError();
+      expect(es.closed).toBe(false);
+    }
+    es.fireError();
+    expect(es.closed).toBe(true);
+  });
+
+  it("resets the error counter on session_updated or open", () => {
+    const seen: number[] = [];
+    watchSession("abc", () => seen.push(1));
+    const es = FakeEventSource.instances[0]!;
+
+    for (let i = 0; i < WATCH_SESSION_MAX_CONSECUTIVE_ERRORS - 1; i++) {
+      es.fireError();
+    }
+    es.fireUpdate(); // successful delivery resets counter
+    expect(seen).toEqual([1]);
+
+    for (let i = 0; i < WATCH_SESSION_MAX_CONSECUTIVE_ERRORS - 1; i++) {
+      es.fireError();
+    }
+    es.fireOpen(); // successful (re)connect also resets
+    for (let i = 0; i < WATCH_SESSION_MAX_CONSECUTIVE_ERRORS - 1; i++) {
+      es.fireError();
+    }
+    expect(es.closed).toBe(false);
   });
 });

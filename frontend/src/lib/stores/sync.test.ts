@@ -17,6 +17,7 @@ vi.mock("../api/client.js", () => ({
   getVersion: vi.fn(),
   watchSession: vi.fn(),
   checkForUpdate: vi.fn(),
+  isRemoteConnection: vi.fn(),
 }));
 
 const MOCK_STATS: SyncStats = {
@@ -37,6 +38,14 @@ function mockResyncSuccess(): void {
     project_count: 3,
     machine_count: 1,
     earliest_session: null,
+  });
+  // triggerResync schedules loadStatus() as a side effect.
+  // loadStatus() reads getSyncStatus and unconditionally sets
+  // lastSyncStats from the response, so mirror MOCK_STATS here so
+  // the post-resync state matches what the resync just produced.
+  vi.mocked(api.getSyncStatus).mockResolvedValue({
+    last_sync: "2024-01-01T00:00:00Z",
+    stats: MOCK_STATS,
   });
 }
 
@@ -279,5 +288,50 @@ describe("SyncStore.checkForUpdate", () => {
       writable: true,
       configurable: true,
     });
+  });
+});
+
+describe("SyncStore.remoteUnreachable", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    const s = sync as unknown as Record<string, unknown>;
+    s.remoteUnreachable = false;
+    s.statusHydrated = false;
+  });
+
+  it("flags unreachable when a remote load fails", async () => {
+    vi.mocked(api.isRemoteConnection).mockReturnValue(true);
+    vi.mocked(api.getSyncStatus).mockRejectedValue(
+      new TypeError("Failed to fetch"),
+    );
+
+    await sync.loadStatus();
+
+    expect(sync.remoteUnreachable).toBe(true);
+  });
+
+  it("clears the flag when a remote load succeeds", async () => {
+    vi.mocked(api.isRemoteConnection).mockReturnValue(true);
+    const s = sync as unknown as Record<string, unknown>;
+    s.remoteUnreachable = true;
+    vi.mocked(api.getSyncStatus).mockResolvedValue({
+      last_sync: "",
+      stats: MOCK_STATS,
+    });
+
+    await sync.loadStatus();
+
+    expect(sync.remoteUnreachable).toBe(false);
+  });
+
+  it("does not flag unreachable for local connections", async () => {
+    vi.mocked(api.isRemoteConnection).mockReturnValue(false);
+    vi.mocked(api.getSyncStatus).mockRejectedValue(
+      new TypeError("Failed to fetch"),
+    );
+
+    await sync.loadStatus();
+
+    expect(sync.remoteUnreachable).toBe(false);
   });
 });

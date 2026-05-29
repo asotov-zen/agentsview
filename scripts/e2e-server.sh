@@ -32,6 +32,9 @@ else
     cd "$ROOT/frontend" && npm run build
     rm -rf "$ROOT/internal/web/dist"
     cp -r "$ROOT/frontend/dist" "$ROOT/internal/web/dist"
+    printf '%s\n' \
+      'keep embed dir for generated frontend assets' \
+      > "$ROOT/internal/web/dist/.keep"
     CGO_ENABLED=1 go build -tags fts5 \
       -o "$SERVER" "$ROOT/cmd/agentsview"
 fi
@@ -40,7 +43,7 @@ fi
 # Every agent dir must point to EMPTY_DIR to prevent
 # the server from discovering real sessions on the host.
 echo "Starting e2e server on :8090..."
-AGENT_VIEWER_DATA_DIR="$TMPDIR" \
+AGENTSVIEW_DATA_DIR="$TMPDIR" \
 CLAUDE_PROJECTS_DIR="$EMPTY_DIR" \
 CODEX_SESSIONS_DIR="$EMPTY_DIR" \
 COPILOT_DIR="$EMPTY_DIR" \
@@ -52,6 +55,8 @@ IFLOW_DIR="$EMPTY_DIR" \
 VSCODE_COPILOT_DIR="$EMPTY_DIR" \
 PI_DIR="$EMPTY_DIR" \
 OPENCLAW_DIR="$EMPTY_DIR" \
-exec "$SERVER" \
+QCLAW_DIR="$EMPTY_DIR" \
+WORKBUDDY_PROJECTS_DIR="$EMPTY_DIR" \
+exec "$SERVER" serve \
   --port 8090 \
   --no-browser

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -70,6 +71,16 @@ type GenerateStreamFunc func(
 	ctx context.Context, agent, prompt string, onLog LogFunc,
 ) (Result, error)
 
+// AgentConfig holds insight generation overrides for one agent.
+type AgentConfig struct {
+	Binary string
+}
+
+// GenerateOptions holds optional insight generation overrides.
+type GenerateOptions struct {
+	Agents map[string]AgentConfig
+}
+
 // Generate invokes an AI agent CLI to generate an insight.
 // The agent parameter selects which CLI to use (claude,
 // codex, gemini). The prompt is passed via stdin.
@@ -84,13 +95,24 @@ func Generate(
 func GenerateStream(
 	ctx context.Context, agent, prompt string, onLog LogFunc,
 ) (Result, error) {
+	return GenerateStreamWithOptions(
+		ctx, agent, prompt, onLog, GenerateOptions{},
+	)
+}
+
+// GenerateStreamWithOptions invokes an AI agent CLI to generate an
+// insight, using configured binary paths before falling back to PATH.
+func GenerateStreamWithOptions(
+	ctx context.Context, agent, prompt string, onLog LogFunc,
+	opts GenerateOptions,
+) (Result, error) {
 	if !ValidAgents[agent] {
 		return Result{}, fmt.Errorf(
 			"unsupported agent: %s", agent,
 		)
 	}
 
-	path, err := exec.LookPath(agentBinary(agent))
+	path, err := resolveAgentBinary(agent, opts)
 	if err != nil {
 		return Result{}, fmt.Errorf(
 			"%s CLI not found: %w", agent, err,
@@ -109,6 +131,13 @@ func GenerateStream(
 	default:
 		return generateClaude(ctx, path, prompt, onLog)
 	}
+}
+
+func resolveAgentBinary(agent string, opts GenerateOptions) (string, error) {
+	if cfg, ok := opts.Agents[agent]; ok && strings.TrimSpace(cfg.Binary) != "" {
+		return strings.TrimSpace(cfg.Binary), nil
+	}
+	return exec.LookPath(agentBinary(agent))
 }
 
 // agentEnv returns the current environment with
@@ -245,16 +274,17 @@ func generateClaude(
 		)
 	}
 
-	var resp struct {
-		Result string `json:"result"`
-		Model  string `json:"model"`
-	}
-	if json.Unmarshal(stdoutBytes, &resp) == nil &&
-		strings.TrimSpace(resp.Result) != "" {
+	// Claude Code CLI outputs a JSON array of events when
+	// invoked with -p --output-format json. Find the element
+	// with type="result" and extract its result field.
+	// Also accept the legacy single-object format as a
+	// fallback for older Claude CLI versions.
+	content, model := parseCLIResult(stdoutBytes)
+	if strings.TrimSpace(content) != "" {
 		return Result{
-			Content: resp.Result,
+			Content: content,
 			Agent:   "claude",
-			Model:   resp.Model,
+			Model:   model,
 		}, nil
 	}
 
@@ -269,6 +299,49 @@ func generateClaude(
 		"claude returned empty result\nraw: %s",
 		string(stdoutBytes),
 	)
+}
+
+// parseCLIResult extracts the result text and model from
+// claude CLI output. Claude Code (v2+) outputs a JSON array
+// of events; we find type="result" and read its result field.
+// Falls back to the legacy single-object format for older
+// versions: {"result":"...","model":"..."}.
+func parseCLIResult(data []byte) (result, model string) {
+	// Try JSON array format (Claude Code v2+).
+	var events []json.RawMessage
+	if json.Unmarshal(data, &events) == nil {
+		for _, raw := range events {
+			var ev struct {
+				Type       string                     `json:"type"`
+				Result     string                     `json:"result"`
+				ModelUsage map[string]json.RawMessage `json:"modelUsage"`
+			}
+			if json.Unmarshal(raw, &ev) != nil {
+				continue
+			}
+			if ev.Type == "result" &&
+				strings.TrimSpace(ev.Result) != "" {
+				if len(ev.ModelUsage) > 0 {
+					keys := make([]string, 0, len(ev.ModelUsage))
+					for k := range ev.ModelUsage {
+						keys = append(keys, k)
+					}
+					sort.Strings(keys)
+					model = keys[0]
+				}
+				return ev.Result, model
+			}
+		}
+	}
+	// Fall back to legacy single-object format.
+	var resp struct {
+		Result string `json:"result"`
+		Model  string `json:"model"`
+	}
+	if json.Unmarshal(data, &resp) == nil {
+		return resp.Result, resp.Model
+	}
+	return "", ""
 }
 
 // generateCodex invokes `codex exec` in read-only sandbox
@@ -361,7 +434,7 @@ func parseCodexStream(
 	r io.Reader, onLog LogFunc,
 ) (string, error) {
 	br := bufio.NewReader(r)
-	var messages []string
+	messages := make([]string, 0)
 	indexByID := make(map[string]int)
 
 	for {

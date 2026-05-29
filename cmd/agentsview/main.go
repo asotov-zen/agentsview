@@ -14,11 +14,13 @@ import (
 	_ "time/tzdata"
 
 	"github.com/spf13/cobra"
-	"github.com/wesm/agentsview/internal/config"
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/parser"
-	"github.com/wesm/agentsview/internal/server"
-	"github.com/wesm/agentsview/internal/sync"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/secrets"
+	"go.kenn.io/agentsview/internal/server"
+	"go.kenn.io/agentsview/internal/signals"
+	"go.kenn.io/agentsview/internal/sync"
 )
 
 var (
@@ -31,9 +33,17 @@ const (
 	periodicSyncInterval  = 15 * time.Minute
 	unwatchedPollInterval = 2 * time.Minute
 	watcherDebounce       = 500 * time.Millisecond
+	recursiveWatchBudget  = 8192
 )
 
 func main() {
+	// Turn on the agentsview-test-fixture deny-list before any scan
+	// runs. The secrets package keeps the filter off by default so unit
+	// tests in this repo (which use the same random-looking fixtures
+	// production scans would suppress) can assert positive rule paths;
+	// the binary always wants the filter on.
+	secrets.EnableFixtureDeny()
+
 	if err := executeCLI(); err != nil {
 		fatal("%v", err)
 	}
@@ -76,8 +86,13 @@ func runServe(cfg config.Config) {
 	server.WriteStartupLock(cfg.DataDir)
 	defer server.RemoveStartupLock(cfg.DataDir)
 
+	applyClassifierConfig(cfg)
 	database := mustOpenDB(cfg)
 	defer database.Close()
+
+	if n := len(db.UserAutomationPrefixes()); n > 0 {
+		log.Printf("loaded %d user automation prefix(es) from config", n)
+	}
 
 	for _, def := range parser.Registry {
 		if !cfg.IsUserConfigured(def.Type) {
@@ -97,16 +112,38 @@ func runServe(cfg config.Config) {
 	)
 	defer stop()
 
+	broadcaster := server.NewBroadcaster(cfg.EventsCoalesceInterval)
+
 	var engine *sync.Engine
 	if !cfg.NoSync {
 		engine = sync.NewEngine(database, sync.EngineConfig{
 			AgentDirs:               cfg.AgentDirs,
 			Machine:                 "local",
 			BlockedResultCategories: cfg.ResultContentBlockedCategories,
+			Emitter:                 broadcaster,
 		})
 
 		if database.NeedsResync() {
-			runInitialResync(ctx, engine)
+			signalsCovered := runInitialResync(ctx, engine)
+			if ctx.Err() == nil {
+				if err := database.Vacuum(); err != nil {
+					log.Printf("vacuum after resync: %v", err)
+				}
+				// Only short-circuit BackfillSignals when resync
+				// rewrote every session through the inline signal
+				// path. Aborted resyncs fall back to incremental
+				// sync (existing rows untouched) and orphans are
+				// copied as-is from the previous DB without
+				// recompute -- both leave sessions that still
+				// need backfill.
+				if signalsCovered {
+					if err := database.MarkSignalsBackfillDone(); err != nil {
+						log.Printf(
+							"mark signals backfill done: %v", err,
+						)
+					}
+				}
+			}
 		} else {
 			runInitialSync(ctx, engine)
 		}
@@ -114,13 +151,25 @@ func runServe(cfg config.Config) {
 			return
 		}
 
-		stopWatcher, unwatchedDirs := startFileWatcher(cfg, engine)
-		defer stopWatcher()
+		// Backfill runs in the background. On a large DB (e.g.
+		// after copying tens of thousands of orphaned sessions
+		// during a resync), walking every row to recompute
+		// signals would otherwise block the HTTP server from
+		// listening for minutes. Backfill is idempotent and
+		// guarded by a one-shot marker, so concurrent writes
+		// from the file watcher and periodic sync are safe.
+		go func() {
+			if err := database.BackfillSignals(
+				ctx,
+				func(bCtx context.Context, id string) error {
+					return engine.RecomputeSignals(bCtx, id)
+				},
+			); err != nil && ctx.Err() == nil {
+				log.Printf("signals backfill: %v", err)
+			}
+		}()
 
-		go startPeriodicSync(engine)
-		if len(unwatchedDirs) > 0 {
-			go startUnwatchedPoll(engine)
-		}
+		go startPeriodicSync(engine, database)
 	}
 
 	// Seed model_pricing after any resync swap so the new DB
@@ -131,21 +180,13 @@ func runServe(cfg config.Config) {
 	// background LiteLLM refresh follows immediately.
 	seedPricing(database)
 
-	// Auto-bind to 0.0.0.0 when remote access is enabled so the
-	// server is reachable from the network. Only override if the
-	// user hasn't explicitly set --host via the CLI flag.
-	if cfg.RemoteAccess && !cfg.HostExplicit && cfg.Host == "127.0.0.1" {
-		cfg.Host = "0.0.0.0"
-	}
-
-	// When remote access is enabled, ensure an auth token exists so
-	// the API is never exposed on the network without authentication.
-	if cfg.RemoteAccess {
+	// When auth is required, ensure a token exists.
+	if cfg.RequireAuth {
 		if err := cfg.EnsureAuthToken(); err != nil {
 			log.Fatalf("Failed to generate auth token: %v", err)
 		}
 		if cfg.AuthToken != "" {
-			fmt.Printf("Remote access enabled. Auth token: %s\n", cfg.AuthToken)
+			fmt.Printf("Auth enabled. Token: %s\n", cfg.AuthToken)
 		}
 	}
 
@@ -167,6 +208,7 @@ func runServe(cfg config.Config) {
 		}),
 		server.WithDataDir(cfg.DataDir),
 		server.WithBaseContext(ctx),
+		server.WithBroadcaster(broadcaster),
 	)
 
 	rt, err := startServerWithOptionalCaddy(ctx, cfg, srv, rtOpts)
@@ -183,7 +225,7 @@ func runServe(cfg config.Config) {
 	// is active" marker so token-use doesn't start a competing
 	// on-demand sync against our live DB.
 	if _, sfErr := server.WriteStateFile(
-		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version,
+		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version, false,
 	); sfErr != nil {
 		log.Printf(
 			"warning: could not write state file: %v"+
@@ -209,6 +251,14 @@ func runServe(cfg config.Config) {
 		)
 	}
 	fmt.Printf("Database: %s\n", cfg.DBPath)
+
+	if engine != nil {
+		stopWatcher, unwatchedDirs := startFileWatcher(cfg, engine)
+		defer stopWatcher()
+		if len(unwatchedDirs) > 0 {
+			go startUnwatchedPoll(engine)
+		}
+	}
 
 	if err := waitForServerRuntime(ctx, srv, rt); err != nil {
 		fatal("%v", err)
@@ -258,8 +308,18 @@ func truncateLogFile(path string, limit int64) {
 	_ = os.Truncate(path, 0)
 }
 
-func mustOpenDB(cfg config.Config) *db.DB {
+func openDB(cfg config.Config) (*db.DB, error) {
+	applyClassifierConfig(cfg)
 	database, err := db.Open(cfg.DBPath)
+	if err != nil {
+		return nil, err
+	}
+	applyCustomPricing(database, cfg)
+	return database, nil
+}
+
+func mustOpenDB(cfg config.Config) *db.DB {
+	database, err := openDB(cfg)
 	if err != nil {
 		fatal("opening database: %v", err)
 	}
@@ -301,23 +361,52 @@ func runInitialSync(
 	printSyncSummary(stats, t)
 }
 
+// runInitialResync runs ResyncAll, falling back to incremental
+// sync when the resync aborts. Returns true only when every
+// session in the resulting DB went through the inline signal
+// path -- see resyncCoversSignals.
 func runInitialResync(
 	ctx context.Context, engine *sync.Engine,
-) {
+) bool {
 	fmt.Println("Data version changed, running full resync...")
 	t := time.Now()
 	stats := engine.ResyncAll(ctx, printSyncProgress)
 	printSyncSummary(stats, t)
 
-	// If resync was aborted due to data issues (not
-	// cancellation), fall back to an incremental sync so
-	// the server starts with current data.
+	fellBack := false
 	if stats.Aborted && ctx.Err() == nil {
 		fmt.Println("Resync incomplete, running incremental sync...")
 		t = time.Now()
 		fallback := engine.SyncAll(ctx, printSyncProgress)
 		printSyncSummary(fallback, t)
+		fellBack = true
 	}
+
+	if ctx.Err() != nil {
+		return false
+	}
+	return resyncCoversSignals(stats, fellBack)
+}
+
+// resyncCoversSignals returns true only when every session in
+// the resulting DB went through the inline signal path:
+//   - resync completed cleanly (no abort fallback to incremental
+//     sync, which leaves existing rows untouched), AND
+//   - no orphaned sessions were copied from the previous DB
+//     (CopyOrphanedDataFrom carries existing signal columns
+//     verbatim, which may be stale or missing).
+//
+// When false, the caller must run BackfillSignals.
+func resyncCoversSignals(
+	stats sync.SyncStats, fellBack bool,
+) bool {
+	if fellBack {
+		return false
+	}
+	if stats.OrphanedCopied > 0 {
+		return false
+	}
+	return true
 }
 
 func printSyncSummary(stats sync.SyncStats, t time.Time) {
@@ -382,6 +471,23 @@ func startFileWatcher(
 			continue
 		}
 		for _, d := range cfg.ResolveDirs(def.Type) {
+			if def.Type == parser.AgentOpenCode {
+				watchDirs := parser.ResolveOpenCodeWatchRoots(d)
+				if len(watchDirs) == 0 {
+					unwatchedDirs = append(unwatchedDirs, d)
+					continue
+				}
+				for _, watchDir := range watchDirs {
+					if _, err := os.Stat(watchDir); err == nil {
+						roots = append(
+							roots, watchRoot{d, watchDir, def.ShallowWatch},
+						)
+						continue
+					}
+					unwatchedDirs = append(unwatchedDirs, d)
+				}
+				continue
+			}
 			if len(def.WatchSubdirs) == 0 {
 				if _, err := os.Stat(d); err == nil {
 					roots = append(
@@ -403,6 +509,7 @@ func startFileWatcher(
 
 	var totalWatched int
 	var shallowWatched int
+	remaining := recursiveWatchBudget
 	for _, r := range roots {
 		if r.shallow {
 			if watcher.WatchShallow(r.root) {
@@ -413,14 +520,19 @@ func startFileWatcher(
 			}
 			continue
 		}
-		watched, uw, _ := watcher.WatchRecursive(r.root)
-		totalWatched += watched
-		if uw > 0 {
+		result := watcher.WatchRecursiveBudgeted(r.root, remaining)
+		totalWatched += result.Watched
+		remaining -= result.Watched
+		if result.Unwatched > 0 || result.BudgetExhausted ||
+			result.ResourceExhausted || result.Err != nil {
 			unwatchedDirs = append(unwatchedDirs, r.dir)
 			log.Printf(
 				"Couldn't watch %d directories under %s, will poll every %s",
-				uw, r.dir, unwatchedPollInterval,
+				result.Unwatched, r.dir, unwatchedPollInterval,
 			)
+			if result.Err != nil {
+				log.Printf("watching %s: %v", r.dir, result.Err)
+			}
 		}
 	}
 
@@ -435,16 +547,52 @@ func startFileWatcher(
 			totalWatched, time.Since(t).Round(time.Millisecond),
 		)
 	}
+	if len(unwatchedDirs) > 0 {
+		fmt.Printf(
+			"Polling %d roots every %s for changes\n",
+			len(unwatchedDirs), unwatchedPollInterval,
+		)
+	}
 	watcher.Start()
 	return watcher.Stop, unwatchedDirs
 }
 
-func startPeriodicSync(engine *sync.Engine) {
+func startPeriodicSync(
+	engine *sync.Engine, database *db.DB,
+) {
 	ticker := time.NewTicker(periodicSyncInterval)
 	defer ticker.Stop()
 	for range ticker.C {
 		log.Println("Running scheduled sync...")
 		engine.SyncAll(context.Background(), nil)
+		recomputePendingSessions(engine, database)
+	}
+}
+
+func recomputePendingSessions(
+	engine *sync.Engine, database *db.DB,
+) {
+	cutoff := time.Now().Add(-signals.RecencyWindow).
+		UTC().Format(time.RFC3339)
+	ids, err := database.PendingSignalSessions(
+		context.Background(), cutoff,
+	)
+	if err != nil {
+		log.Printf("deferred recompute query: %v", err)
+		return
+	}
+	if len(ids) == 0 {
+		return
+	}
+	log.Printf(
+		"recomputing signals for %d deferred sessions",
+		len(ids),
+	)
+	for _, id := range ids {
+		// Errors are already logged by RecomputeSignals; the
+		// deferred-recompute loop is best-effort, the next
+		// pass will retry any that failed.
+		_ = engine.RecomputeSignals(context.Background(), id)
 	}
 }
 

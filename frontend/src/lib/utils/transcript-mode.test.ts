@@ -18,6 +18,7 @@ function msg(
     role: "assistant",
     timestamp: "2025-02-17T21:04:00Z",
     has_thinking: false,
+    thinking_text: "",
     has_tool_use: false,
     content_length: overrides.content.length,
     model: "",
@@ -120,6 +121,23 @@ describe("filterDisplayItemsByTranscriptMode", () => {
         userMsg(3),
       ]),
     ).toEqual([0, 2, 3]);
+  });
+
+  it("keeps the assistant response that precedes a compact-boundary divider", () => {
+    const boundary = msg({
+      ordinal: 2,
+      role: "user",
+      content: "[compact summary]",
+      is_compact_boundary: true,
+    });
+    expect(
+      ordinalsOf([
+        userMsg(0),
+        assistantMsg(1, "answer"),
+        boundary,
+        userMsg(3),
+      ]),
+    ).toEqual([0, 1, 2, 3]);
   });
 
   it("can pick the last assistant that still has visible segments", () => {

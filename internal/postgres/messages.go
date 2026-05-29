@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wesm/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/db"
 )
 
 const attachToolCallBatchSize = 500
@@ -28,12 +28,15 @@ func (s *Store) GetMessages(
 	}
 
 	query := fmt.Sprintf(`
-		SELECT session_id, ordinal, role, content,
+		SELECT session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use,
 			content_length, is_system, model, token_usage,
 			context_tokens, output_tokens,
 			has_context_tokens, has_output_tokens,
-			claude_message_id, claude_request_id
+			claude_message_id, claude_request_id,
+			source_type, source_subtype, source_uuid,
+			source_parent_uuid, is_sidechain,
+			is_compact_boundary
 		FROM messages
 		WHERE session_id = $1 AND ordinal %s $2
 		ORDER BY ordinal %s
@@ -65,12 +68,15 @@ func (s *Store) GetAllMessages(
 	ctx context.Context, sessionID string,
 ) ([]db.Message, error) {
 	rows, err := s.pg.QueryContext(ctx, `
-		SELECT session_id, ordinal, role, content,
+		SELECT session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use,
 			content_length, is_system, model, token_usage,
 			context_tokens, output_tokens,
 			has_context_tokens, has_output_tokens,
-			claude_message_id, claude_request_id
+			claude_message_id, claude_request_id,
+			source_type, source_subtype, source_uuid,
+			source_parent_uuid, is_sidechain,
+			is_compact_boundary
 		FROM messages
 		WHERE session_id = $1
 		ORDER BY ordinal ASC`, sessionID)
@@ -511,6 +517,15 @@ func (s *Store) attachToolResultEventsBatch(
 
 // scanPGMessages scans message rows from PostgreSQL,
 // converting TIMESTAMPTZ to string.
+//
+// The PG messages table has no id column (composite PK on
+// session_id, ordinal), so we synthesize Message.ID = int64(ordinal)
+// to match the convention used by TurnRow.MessageID and
+// CallRow.MessageID in session_timing.go. The frontend keys
+// {#each messages (message.id)} and looks up turns via
+// turnByMessage.get(message.id); both depend on Message.ID being
+// non-zero, unique within a session, and equal to int64(ordinal)
+// so it joins with TurnRow.MessageID.
 func scanPGMessages(rows interface {
 	Next() bool
 	Scan(dest ...any) error
@@ -524,17 +539,21 @@ func scanPGMessages(rows interface {
 		var tokenUsage string
 		if err := rows.Scan(
 			&m.SessionID, &m.Ordinal, &m.Role,
-			&m.Content, &ts, &m.HasThinking,
+			&m.Content, &m.ThinkingText, &ts, &m.HasThinking,
 			&m.HasToolUse, &m.ContentLength, &m.IsSystem,
 			&m.Model, &tokenUsage,
 			&m.ContextTokens, &m.OutputTokens,
 			&m.HasContextTokens, &m.HasOutputTokens,
 			&m.ClaudeMessageID, &m.ClaudeRequestID,
+			&m.SourceType, &m.SourceSubtype, &m.SourceUUID,
+			&m.SourceParentUUID, &m.IsSidechain,
+			&m.IsCompactBoundary,
 		); err != nil {
 			return nil, fmt.Errorf(
 				"scanning message: %w", err,
 			)
 		}
+		m.ID = int64(m.Ordinal)
 		if ts != nil {
 			m.Timestamp = FormatISO8601(*ts)
 		}

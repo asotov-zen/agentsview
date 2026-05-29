@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wesm/agentsview/internal/testjsonl"
+	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/testjsonl"
 )
 
 // TestServerTimeouts starts a real HTTP server and verifies that
@@ -45,19 +47,13 @@ func TestServerTimeouts(t *testing.T) {
 	req, err := http.NewRequestWithContext(
 		ctx, http.MethodGet, url, nil,
 	)
-	if err != nil {
-		t.Fatalf("creating request: %v", err)
-	}
+	require.NoError(t, err)
 
 	resp, err := (&http.Client{}).Do(req)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
+	require.NoError(t, err)
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
-	}
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	// Trigger an update after 500ms (> WriteTimeout).
 	errCh := make(chan error, 1)

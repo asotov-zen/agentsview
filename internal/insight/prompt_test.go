@@ -6,8 +6,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/dbtest"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 )
 
 func TestBuildPrompt(t *testing.T) {
@@ -29,15 +31,15 @@ func TestBuildPrompt(t *testing.T) {
 			seed: func(t *testing.T, d *db.DB) {
 				dbtest.SeedSession(t, d, "s1", "my-app", func(s *db.Session) {
 					s.MessageCount = 5
-					s.StartedAt = dbtest.Ptr("2025-01-15T10:00:00Z")
-					s.EndedAt = dbtest.Ptr("2025-01-15T11:00:00Z")
-					s.FirstMessage = dbtest.Ptr("Fix the login bug")
+					s.StartedAt = new("2025-01-15T10:00:00Z")
+					s.EndedAt = new("2025-01-15T11:00:00Z")
+					s.FirstMessage = new("Fix the login bug")
 				})
 				dbtest.SeedSession(t, d, "s2", "other-app", func(s *db.Session) {
 					s.MessageCount = 3
-					s.StartedAt = dbtest.Ptr("2025-01-15T14:00:00Z")
-					s.EndedAt = dbtest.Ptr("2025-01-15T15:00:00Z")
-					s.FirstMessage = dbtest.Ptr("Add tests")
+					s.StartedAt = new("2025-01-15T14:00:00Z")
+					s.EndedAt = new("2025-01-15T15:00:00Z")
+					s.FirstMessage = new("Add tests")
 				})
 			},
 			wantContains: []string{
@@ -62,13 +64,13 @@ func TestBuildPrompt(t *testing.T) {
 			seed: func(t *testing.T, d *db.DB) {
 				dbtest.SeedSession(t, d, "s1", "my-app", func(s *db.Session) {
 					s.MessageCount = 5
-					s.StartedAt = dbtest.Ptr("2025-01-15T10:00:00Z")
-					s.EndedAt = dbtest.Ptr("2025-01-15T11:00:00Z")
+					s.StartedAt = new("2025-01-15T10:00:00Z")
+					s.EndedAt = new("2025-01-15T11:00:00Z")
 				})
 				dbtest.SeedSession(t, d, "s2", "other-app", func(s *db.Session) {
 					s.MessageCount = 3
-					s.StartedAt = dbtest.Ptr("2025-01-15T14:00:00Z")
-					s.EndedAt = dbtest.Ptr("2025-01-15T15:00:00Z")
+					s.StartedAt = new("2025-01-15T14:00:00Z")
+					s.EndedAt = new("2025-01-15T15:00:00Z")
 				})
 			},
 			wantContains: []string{"Project: my-app"},
@@ -111,8 +113,8 @@ func TestBuildPrompt(t *testing.T) {
 						fmt.Sprintf("s%d", i), "my-app",
 						func(s *db.Session) {
 							s.MessageCount = 1
-							s.StartedAt = dbtest.Ptr("2025-01-15T10:00:00Z")
-							s.EndedAt = dbtest.Ptr(fmt.Sprintf("2025-01-15T11:%02d:00Z", i))
+							s.StartedAt = new("2025-01-15T10:00:00Z")
+							s.EndedAt = new(fmt.Sprintf("2025-01-15T11:%02d:00Z", i))
 						},
 					)
 				}
@@ -120,9 +122,7 @@ func TestBuildPrompt(t *testing.T) {
 			wantContains: []string{"omitted"},
 			checkPrompt: func(t *testing.T, prompt string) {
 				count := strings.Count(prompt, "### Session")
-				if count != 50 {
-					t.Errorf("got %d sessions in prompt, want 50", count)
-				}
+				assert.Equal(t, 50, count, "got %d sessions in prompt, want 50", count)
 			},
 		},
 		{
@@ -135,11 +135,11 @@ func TestBuildPrompt(t *testing.T) {
 			seed: func(t *testing.T, d *db.DB) {
 				dbtest.SeedSession(t, d, "s1", "my-app", func(s *db.Session) {
 					s.MessageCount = 3
-					s.StartedAt = dbtest.Ptr("2025-01-13T10:00:00Z")
+					s.StartedAt = new("2025-01-13T10:00:00Z")
 				})
 				dbtest.SeedSession(t, d, "s2", "my-app", func(s *db.Session) {
 					s.MessageCount = 2
-					s.StartedAt = dbtest.Ptr("2025-01-17T14:00:00Z")
+					s.StartedAt = new("2025-01-17T14:00:00Z")
 				})
 			},
 			wantContains: []string{"Date Range: 2025-01-13 to 2025-01-17"},
@@ -163,6 +163,38 @@ func TestBuildPrompt(t *testing.T) {
 			},
 			wantContains: []string{"No sessions found"},
 		},
+		{
+			name: "excludes automated sessions",
+			req: GenerateRequest{
+				Type:     "daily_activity",
+				DateFrom: "2025-01-15",
+				DateTo:   "2025-01-15",
+			},
+			seed: func(t *testing.T, d *db.DB) {
+				// A normal user session.
+				dbtest.SeedSession(t, d, "user-session", "my-app", func(s *db.Session) {
+					s.MessageCount = 5
+					s.UserMessageCount = 2
+					s.StartedAt = new("2025-01-15T10:00:00Z")
+					s.EndedAt = new("2025-01-15T11:00:00Z")
+					s.FirstMessage = new("Fix the login bug")
+				})
+				// An automated session: roborev review, single-turn,
+				// is_automated must be true.
+				dbtest.SeedSession(t, d, "auto-session", "my-app", func(s *db.Session) {
+					s.MessageCount = 2
+					s.UserMessageCount = 1
+					s.StartedAt = new("2025-01-15T12:00:00Z")
+					s.EndedAt = new("2025-01-15T12:05:00Z")
+					s.FirstMessage = new(
+						"You are a code reviewer. Review the diff.",
+					)
+					s.IsAutomated = true
+				})
+			},
+			wantContains: []string{"user-session", "Fix the login bug"},
+			wantNot:      []string{"auto-session", "code reviewer"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -175,19 +207,13 @@ func TestBuildPrompt(t *testing.T) {
 			}
 
 			prompt, err := BuildPrompt(ctx, d, tt.req)
-			if err != nil {
-				t.Fatalf("BuildPrompt: %v", err)
-			}
+			require.NoError(t, err)
 
 			for _, want := range tt.wantContains {
-				if !strings.Contains(prompt, want) {
-					t.Errorf("prompt missing %q", want)
-				}
+				assert.Contains(t, prompt, want)
 			}
 			for _, notWant := range tt.wantNot {
-				if strings.Contains(prompt, notWant) {
-					t.Errorf("prompt unexpectedly contains %q", notWant)
-				}
+				assert.NotContains(t, prompt, notWant)
 			}
 			if tt.checkPrompt != nil {
 				tt.checkPrompt(t, prompt)

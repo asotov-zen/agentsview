@@ -8,8 +8,8 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/wesm/agentsview/internal/config"
-	"github.com/wesm/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 	"golang.org/x/term"
 )
 
@@ -34,7 +34,7 @@ func newRootCommand() *cobra.Command {
 				printVersion(cmd.OutOrStdout())
 				return
 			}
-			runServe(mustLoadConfig(cmd))
+			_ = cmd.Help()
 		},
 	}
 	root.AddGroup(
@@ -46,7 +46,6 @@ func newRootCommand() *cobra.Command {
 	root.SetCompletionCommandGroupID(groupMeta)
 	root.SetHelpCommandGroupID(groupMeta)
 
-	config.RegisterServePFlags(root.Flags())
 	root.Flags().BoolVarP(
 		&showVersion,
 		"version",
@@ -62,8 +61,13 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newTokenUseCommand())
 	root.AddCommand(newImportCommand())
 	root.AddCommand(newProjectsCommand())
+	root.AddCommand(newHealthCommand())
 	root.AddCommand(newUsageCommand())
 	root.AddCommand(newPGCommand())
+	root.AddCommand(newSessionCommand())
+	root.AddCommand(newStatsCommand())
+	root.AddCommand(newClassifierCommand())
+	root.AddCommand(newSecretsCommand())
 	root.AddCommand(newVersionCommand())
 
 	defaultHelp := root.HelpFunc()
@@ -94,23 +98,61 @@ func newServeCommand() *cobra.Command {
 }
 
 func newSyncCommand() *cobra.Command {
-	var full bool
+	var cfg SyncConfig
 	cmd := &cobra.Command{
 		Use:          "sync",
 		Short:        "Sync session data without serving",
 		GroupID:      groupCore,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
+		PreRunE: func(cmd *cobra.Command, _ []string) error {
+			if cfg.Host == "" {
+				if cmd.Flags().Changed("user") ||
+					cmd.Flags().Changed("port") {
+					return fmt.Errorf(
+						"--user and --port require --host",
+					)
+				}
+			}
+			return nil
+		},
 		Run: func(cmd *cobra.Command, args []string) {
-			runSync(SyncConfig{Full: full})
+			runSync(cfg)
 		},
 	}
 	cmd.Flags().BoolVar(
-		&full,
-		"full",
-		false,
+		&cfg.Full, "full", false,
 		"Force a full resync regardless of data version",
 	)
+	cmd.Flags().StringVar(
+		&cfg.Host, "host", "",
+		"SSH hostname for remote sync",
+	)
+	cmd.Flags().StringVar(
+		&cfg.User, "user", "",
+		"SSH user for remote sync",
+	)
+	cmd.Flags().IntVar(
+		&cfg.Port, "port", 0,
+		"SSH port for remote sync (default: 22)",
+	)
+	cmd.Flags().StringVar(
+		&cfg.CPUProfile, "cpuprofile", "",
+		"Write CPU profile to file (developer use)",
+	)
+	cmd.Flags().StringVar(
+		&cfg.MemProfile, "memprofile", "",
+		"Write memory profile to file (developer use)",
+	)
+	cmd.Flags().StringVar(
+		&cfg.Trace, "trace", "",
+		"Write runtime trace to file (developer use)",
+	)
+	for _, name := range []string{"cpuprofile", "memprofile", "trace"} {
+		if err := cmd.Flags().MarkHidden(name); err != nil {
+			panic(err)
+		}
+	}
 	return cmd
 }
 
@@ -211,6 +253,30 @@ func newProjectsCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output as JSON array")
+	return cmd
+}
+
+func newHealthCommand() *cobra.Command {
+	var cfg HealthConfig
+	cmd := &cobra.Command{
+		Use:   "health [session-id]",
+		Short: "Show session health and signals",
+		Long: "Without arguments, lists the most recent " +
+			"sessions with grade and outcome columns. " +
+			"With a session ID, prints detailed signal " +
+			"counts for that session.",
+		GroupID:      groupCore,
+		SilenceUsage: true,
+		Args:         cobra.MaximumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			runHealth(args, cfg)
+		},
+	}
+	cmd.Flags().BoolVar(&cfg.JSON, "json", false,
+		"Output as JSON")
+	cmd.Flags().IntVar(&cfg.Limit, "limit",
+		defaultHealthLimit,
+		"Number of sessions to list (max 500)")
 	return cmd
 }
 
@@ -365,9 +431,8 @@ func printVersion(w io.Writer) {
 
 func writeRootHelp(w io.Writer, root *cobra.Command) {
 	fmt.Fprintf(w, "agentsview %s - local web viewer for AI agent sessions\n\n", version)
-	fmt.Fprintln(w, "Syncs Claude Code, Codex, Copilot CLI, Gemini CLI, OpenCode,")
-	fmt.Fprintln(w, "Cursor, and Amp session data into SQLite, serves analytics,")
-	fmt.Fprintln(w, "and exposes session browser via local web UI.")
+	fmt.Fprintln(w, "Syncs session data from supported AI coding agents into SQLite,")
+	fmt.Fprintln(w, "serves analytics, and exposes a session browser via local web UI.")
 	fmt.Fprintln(w)
 	renderRootUsage(w, root)
 	fmt.Fprintln(w)
@@ -384,7 +449,11 @@ func writeRootHelp(w io.Writer, root *cobra.Command) {
 	fmt.Fprintln(w, "  CURSOR_PROJECTS_DIR     Cursor projects directory")
 	fmt.Fprintln(w, "  IFLOW_DIR               iFlow projects directory")
 	fmt.Fprintln(w, "  AMP_DIR                 Amp threads directory")
-	fmt.Fprintln(w, "  AGENT_VIEWER_DATA_DIR   Data directory (database, config)")
+	fmt.Fprintln(w, "  QWEN_PROJECTS_DIR       Qwen Code projects directory")
+	fmt.Fprintln(w, "  QCLAW_DIR               QClaw agents directory")
+	fmt.Fprintln(w, "  WORKBUDDY_PROJECTS_DIR  WorkBuddy projects directory")
+	fmt.Fprintln(w, "  PIEBALD_DIR             Piebald data directory")
+	fmt.Fprintln(w, "  AGENTSVIEW_DATA_DIR     Data directory (database, config)")
 	fmt.Fprintln(w, "  AGENTSVIEW_PG_URL       PostgreSQL connection URL for sync")
 	fmt.Fprintln(w, "  AGENTSVIEW_PG_MACHINE   Machine name for PG sync")
 	fmt.Fprintln(w, "  AGENTSVIEW_PG_SCHEMA    PG schema name (default \"agentsview\")")

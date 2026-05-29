@@ -1,8 +1,13 @@
 <script lang="ts">
   import { analytics } from "../../stores/analytics.svelte.js";
-  import { sessions } from "../../stores/sessions.svelte.js";
+  import {
+    sessions,
+    getSessionStatus,
+  } from "../../stores/sessions.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import { formatTokenCount } from "../../utils/format.js";
+  import { normalizeMessagePreview } from "../../utils/messages.js";
+  import StatusDot from "../common/StatusDot.svelte";
 
   function truncate(text: string, max: number): string {
     if (text.length <= max) return text;
@@ -37,41 +42,56 @@
     analytics.summary?.total_output_tokens !== undefined &&
       analytics.summary?.token_reporting_sessions !== undefined,
   );
+
+  const uncleanCount = $derived(
+    (analytics.topSessions?.sessions ?? []).filter(
+      (s) => getSessionStatus(s) === "unclean",
+    ).length,
+  );
 </script>
 
 <div class="top-sessions-container">
   <div class="top-header">
     <h3 class="chart-title">Top Sessions</h3>
-    <div class="metric-toggle">
-      <button
-        class="toggle-btn"
-        class:active={analytics.topMetric === "messages"}
-        onclick={() => analytics.setTopMetric("messages")}
-      >
-        By Messages
-      </button>
-      <button
-        class="toggle-btn"
-        class:active={analytics.topMetric === "duration"}
-        onclick={() => analytics.setTopMetric("duration")}
-      >
-        By Duration
-      </button>
-      {#if supportsOutputTokens}
+    <div class="header-controls">
+      {#if uncleanCount > 0}
         <button
-          class="toggle-btn"
-          class:active={analytics.topMetric === "output_tokens"}
-          onclick={() => analytics.setTopMetric("output_tokens")}
+          class="status-count-pill"
+          onclick={() => sessions.setTerminationFilter("unclean")}
+          title="Filter to unclean sessions"
         >
-          By Output Tokens
+          {uncleanCount} unclean
         </button>
       {/if}
+      <div class="metric-toggle">
+        <button
+          class="toggle-btn"
+          class:active={analytics.topMetric === "messages"}
+          onclick={() => analytics.setTopMetric("messages")}
+        >
+          By Messages
+        </button>
+        <button
+          class="toggle-btn"
+          class:active={analytics.topMetric === "duration"}
+          onclick={() => analytics.setTopMetric("duration")}
+        >
+          By Duration
+        </button>
+        {#if supportsOutputTokens}
+          <button
+            class="toggle-btn"
+            class:active={analytics.topMetric === "output_tokens"}
+            onclick={() => analytics.setTopMetric("output_tokens")}
+          >
+            By Output Tokens
+          </button>
+        {/if}
+      </div>
     </div>
   </div>
 
-  {#if analytics.loading.topSessions}
-    <div class="loading">Loading top sessions...</div>
-  {:else if analytics.errors.topSessions}
+  {#if analytics.errors.topSessions}
     <div class="error">
       {analytics.errors.topSessions}
       <button
@@ -84,6 +104,7 @@
   {:else if analytics.topSessions && analytics.topSessions.sessions.length > 0}
     <div class="session-list">
       {#each analytics.topSessions.sessions as session, i}
+        {@const preview = normalizeMessagePreview(session.first_message)}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
@@ -91,10 +112,13 @@
           onclick={() => handleSessionClick(session.id)}
         >
           <span class="rank">{i + 1}</span>
+          <span class="session-status">
+            <StatusDot session={session} size={7} />
+          </span>
           <div class="session-info">
             <span class="session-label">
-              {session.first_message
-                ? truncate(session.first_message, 50)
+              {preview
+                ? truncate(preview, 50)
                 : session.id.slice(0, 12)}
             </span>
             <span class="session-project">{session.project}</span>
@@ -134,6 +158,40 @@
     font-size: 12px;
     font-weight: 600;
     color: var(--text-primary);
+  }
+
+  .header-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .status-count-pill {
+    padding: 2px 8px;
+    font-size: 10px;
+    font-weight: 500;
+    border-radius: 999px;
+    color: var(--accent-amber);
+    background: color-mix(
+      in srgb,
+      var(--accent-amber) 10%,
+      transparent
+    );
+    border: 1px solid color-mix(
+      in srgb,
+      var(--accent-amber) 35%,
+      transparent
+    );
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+
+  .status-count-pill:hover {
+    background: color-mix(
+      in srgb,
+      var(--accent-amber) 18%,
+      transparent
+    );
   }
 
   .metric-toggle {
@@ -195,6 +253,16 @@
     font-family: var(--font-mono);
   }
 
+  .session-status {
+    flex-shrink: 0;
+    width: 14px;
+    display: inline-flex;
+    justify-content: center;
+    align-items: center;
+    font-size: 11px;
+    line-height: 1;
+  }
+
   .session-info {
     flex: 1;
     min-width: 0;
@@ -229,7 +297,7 @@
     text-align: right;
   }
 
-  .loading, .empty {
+  .empty {
     color: var(--text-muted);
     font-size: 12px;
     padding: 24px;

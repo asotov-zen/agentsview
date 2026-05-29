@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	_ "embed"
@@ -16,7 +17,8 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 
-	"github.com/wesm/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 // dataVersion tracks parser changes that require a full
@@ -26,17 +28,98 @@ import (
 // trigger a non-destructive re-sync (mtime reset + skip cache
 // clear) so existing session data is preserved.
 //
-// Bumped to 11: codex incremental parser was not seeding
-// currentModel from prior turn_context lines, causing all
-// incrementally parsed messages to store an empty model
-// string. The usage query filters these out, so codex cost
-// tracking froze after the initial full parse.
-const dataVersion = 11
+// Bumped to 29: secret findings now record tool_result_event
+// coordinates by the persisted slice position (matching
+// tool_result_events.event_index) instead of the parser's raw event
+// index. Existing rows need re-scanning so stored findings normalize
+// and `secrets list --reveal` can re-read the source.
+//
+// (28: Gemini parser now persists normalized
+// (Anthropic-style) per-message token_usage JSON instead of the raw
+// tokens object, and rolls thoughts tokens into OutputTokens so
+// per-message and session output totals match the cost JSON.
+// Existing Gemini rows need re-parsing so usage and cost reports
+// reflect the new shape and include thoughts tokens.)
+//
+// (27: Piebald parser now persists normalized per-message
+// token_usage JSON. Existing Piebald rows need re-parsing so Usage
+// reports can include older Piebald sessions.)
+//
+// (26: Claude parser now (a) links Task / Agent tool
+// calls to child subagent sessions via toolUseResult.agentId
+// when queue/progress mappings are absent, populating
+// tool_calls.subagent_session_id, and (b) merges additive
+// same-message.id assistant chunks instead of keeping only the
+// last entry, preserving sibling tool_use blocks and
+// progressively-built text. Existing rows need re-parsing so
+// these linkages and merged content show up.)
+//
+// (25: Codex parser now also links codex_app subagents
+// via collab_agent_spawn_end event_msgs, wait_agent function
+// calls, and agent_path subagent notifications. Existing rows
+// need re-parsing so codex_app subagent linkage works.)
+//
+// (24: Codex parser now annotates spawn_agent tool calls
+// with subagent_session_id once the spawned agent id is known.
+// Existing rows need re-parsing so inline subagent expansion can
+// resolve child sessions from persisted tool call metadata.)
+//
+// (23: split termination_status into awaiting_user vs
+// clean (Claude end_turn / Codex task_complete vs other clean
+// stops); Codex parser now classifies based on task lifecycle
+// events. Existing rows need re-parsing so the new awaiting_user
+// value populates correctly.)
+//
+// (22: added termination_status column to sessions; existing
+// rows need re-parsing so the Claude classifier can populate
+// the new column.)
+//
+// (21: Copilot parser now reads workspace.yaml to use the
+// LLM-generated session name as first_message. Existing
+// directory-format sessions where workspace.yaml.mtime <=
+// events.jsonl.mtime would be permanently skipped without this
+// bump, leaving first_message as the raw first user message.)
+//
+// (20: Claude parser now surfaces queued_command attachment
+// entries (user messages typed mid-tool-call) as real user
+// messages with source_subtype="queued_command".)
+//
+// (19: Copilot parser now filters synthetic skill context
+// user messages.)
+//
+// (18: Claude parser now skips /clear and /effort
+// command envelopes when computing first_message, so sessions
+// that opened with one of those commands show the next real
+// user message in the sidebar instead of the command text.
+// Re-parsing rewrites first_message with the new logic.)
+//
+// (17: Codex <skill> template filtering.)
+// (16: <turn_aborted> system messages.)
+const dataVersion = 29
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
+// ClassifierHashKey is the shared SQLite stats / PG sync_metadata key
+// under which the current is_automated classifier hash is stored.
+// Exported so the postgres package and the classifier rebuild CLI
+// reference one definition instead of repeating the literal.
+const ClassifierHashKey = "is_automated_classifier_hash"
+
 //go:embed schema.sql
 var schemaSQL string
+
+// messagesADTriggerDDL is the AFTER DELETE trigger that mirrors row
+// removals into the FTS5 shadow tables. ReplaceSessionMessages drops
+// this trigger inside its transaction (replacing N per-row FTS deletes
+// with a single bulk INSERT...SELECT) and then re-runs this DDL to
+// restore it before commit. Keeping the statement in one place keeps
+// the two installation sites byte-identical.
+const messagesADTriggerDDL = `
+CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content)
+        VALUES('delete', old.id, old.content);
+END;
+`
 
 const schemaFTS = `
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -49,12 +132,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
 CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
     INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
 END;
-
-CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content)
-        VALUES('delete', old.id, old.content);
-END;
-
+` + messagesADTriggerDDL + `
 CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, content)
         VALUES('delete', old.id, old.content);
@@ -71,15 +149,83 @@ type DB struct {
 	writer    atomic.Pointer[sql.DB]
 	reader    atomic.Pointer[sql.DB]
 	mu        sync.Mutex // serializes writes
-	retired   []*sql.DB  // old pools kept open for in-flight reads
-	dataStale bool       // set by Open when user_version < dataVersion
+	connMu    sync.RWMutex
+	retired   []*sql.DB // old pools kept open for in-flight reads
+	dataStale bool      // set by Open when user_version < dataVersion
 
 	cursorMu     sync.RWMutex
 	cursorSecret []byte
+
+	customPricing map[string]config.CustomModelRate
 }
 
-// getReader returns the current read-only connection pool.
-func (db *DB) getReader() *sql.DB { return db.reader.Load() }
+// Reader exposes guarded read-only query operations. It intentionally does
+// not expose the underlying *sql.DB so callers cannot retain a raw pool across
+// Reopen.
+type Reader interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryContext(
+		ctx context.Context, query string, args ...any,
+	) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+	QueryRowContext(
+		ctx context.Context, query string, args ...any,
+	) *sql.Row
+}
+
+type readerHandle struct {
+	owner *DB
+}
+
+func (r *readerHandle) current() *sql.DB {
+	return r.owner.reader.Load()
+}
+
+func (r *readerHandle) Exec(
+	query string, args ...any,
+) (sql.Result, error) {
+	r.owner.connMu.RLock()
+	defer r.owner.connMu.RUnlock()
+	return r.current().Exec(query, args...)
+}
+
+func (r *readerHandle) Query(
+	query string, args ...any,
+) (*sql.Rows, error) {
+	r.owner.connMu.RLock()
+	defer r.owner.connMu.RUnlock()
+	return r.current().Query(query, args...)
+}
+
+func (r *readerHandle) QueryContext(
+	ctx context.Context, query string, args ...any,
+) (*sql.Rows, error) {
+	r.owner.connMu.RLock()
+	defer r.owner.connMu.RUnlock()
+	return r.current().QueryContext(ctx, query, args...)
+}
+
+func (r *readerHandle) QueryRow(
+	query string, args ...any,
+) *sql.Row {
+	r.owner.connMu.RLock()
+	defer r.owner.connMu.RUnlock()
+	return r.current().QueryRow(query, args...)
+}
+
+func (r *readerHandle) QueryRowContext(
+	ctx context.Context, query string, args ...any,
+) *sql.Row {
+	r.owner.connMu.RLock()
+	defer r.owner.connMu.RUnlock()
+	return r.current().QueryRowContext(ctx, query, args...)
+}
+
+// getReader returns a guarded facade for the current read-only connection pool.
+func (db *DB) getReader() *readerHandle { return &readerHandle{owner: db} }
+
+func (db *DB) rawReader() *sql.DB { return db.reader.Load() }
 
 // getWriter returns the current write connection.
 func (db *DB) getWriter() *sql.DB { return db.writer.Load() }
@@ -91,6 +237,10 @@ func (db *DB) Path() string {
 
 // ReadOnly returns false for the local SQLite store.
 func (db *DB) ReadOnly() bool { return false }
+
+func (db *DB) SetCustomPricing(p map[string]config.CustomModelRate) {
+	db.customPricing = p
+}
 
 // SetCursorSecret updates the secret key used for cursor signing.
 func (db *DB) SetCursorSecret(secret []byte) {
@@ -332,6 +482,30 @@ func (db *DB) migrateColumns() error {
 			"ALTER TABLE messages ADD COLUMN claude_request_id TEXT NOT NULL DEFAULT ''",
 		},
 		{
+			"messages", "source_type",
+			"ALTER TABLE messages ADD COLUMN source_type TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"messages", "source_subtype",
+			"ALTER TABLE messages ADD COLUMN source_subtype TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"messages", "source_uuid",
+			"ALTER TABLE messages ADD COLUMN source_uuid TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"messages", "source_parent_uuid",
+			"ALTER TABLE messages ADD COLUMN source_parent_uuid TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"messages", "is_sidechain",
+			"ALTER TABLE messages ADD COLUMN is_sidechain INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"messages", "is_compact_boundary",
+			"ALTER TABLE messages ADD COLUMN is_compact_boundary INTEGER NOT NULL DEFAULT 0",
+		},
+		{
 			"sessions", "total_output_tokens",
 			"ALTER TABLE sessions ADD COLUMN total_output_tokens INTEGER NOT NULL DEFAULT 0",
 		},
@@ -354,6 +528,122 @@ func (db *DB) migrateColumns() error {
 		{
 			"sessions", "is_automated",
 			"ALTER TABLE sessions ADD COLUMN is_automated INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "tool_failure_signal_count",
+			"ALTER TABLE sessions ADD COLUMN tool_failure_signal_count INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "tool_retry_count",
+			"ALTER TABLE sessions ADD COLUMN tool_retry_count INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "edit_churn_count",
+			"ALTER TABLE sessions ADD COLUMN edit_churn_count INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "consecutive_failure_max",
+			"ALTER TABLE sessions ADD COLUMN consecutive_failure_max INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "outcome",
+			"ALTER TABLE sessions ADD COLUMN outcome TEXT NOT NULL DEFAULT 'unknown'",
+		},
+		{
+			"sessions", "outcome_confidence",
+			"ALTER TABLE sessions ADD COLUMN outcome_confidence TEXT NOT NULL DEFAULT 'low'",
+		},
+		{
+			"sessions", "ended_with_role",
+			"ALTER TABLE sessions ADD COLUMN ended_with_role TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"sessions", "final_failure_streak",
+			"ALTER TABLE sessions ADD COLUMN final_failure_streak INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "signals_pending_since",
+			"ALTER TABLE sessions ADD COLUMN signals_pending_since TEXT",
+		},
+		{
+			"sessions", "compaction_count",
+			"ALTER TABLE sessions ADD COLUMN compaction_count INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "context_pressure_max",
+			"ALTER TABLE sessions ADD COLUMN context_pressure_max REAL",
+		},
+		{
+			"sessions", "health_score",
+			"ALTER TABLE sessions ADD COLUMN health_score INTEGER",
+		},
+		{
+			"sessions", "health_grade",
+			"ALTER TABLE sessions ADD COLUMN health_grade TEXT",
+		},
+		{
+			"sessions", "has_tool_calls",
+			"ALTER TABLE sessions ADD COLUMN has_tool_calls INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "has_context_data",
+			"ALTER TABLE sessions ADD COLUMN has_context_data INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "data_version",
+			"ALTER TABLE sessions ADD COLUMN data_version INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "mid_task_compaction_count",
+			"ALTER TABLE sessions ADD COLUMN mid_task_compaction_count INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "cwd",
+			"ALTER TABLE sessions ADD COLUMN cwd TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"sessions", "git_branch",
+			"ALTER TABLE sessions ADD COLUMN git_branch TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"sessions", "source_session_id",
+			"ALTER TABLE sessions ADD COLUMN source_session_id TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"sessions", "source_version",
+			"ALTER TABLE sessions ADD COLUMN source_version TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"sessions", "parser_malformed_lines",
+			"ALTER TABLE sessions ADD COLUMN parser_malformed_lines INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "is_truncated",
+			"ALTER TABLE sessions ADD COLUMN is_truncated INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "file_inode",
+			"ALTER TABLE sessions ADD COLUMN file_inode INTEGER",
+		},
+		{
+			"sessions", "file_device",
+			"ALTER TABLE sessions ADD COLUMN file_device INTEGER",
+		},
+		{
+			"messages", "thinking_text",
+			"ALTER TABLE messages ADD COLUMN thinking_text TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"sessions", "termination_status",
+			"ALTER TABLE sessions ADD COLUMN termination_status TEXT",
+		},
+		{
+			"sessions", "secret_leak_count",
+			"ALTER TABLE sessions ADD COLUMN secret_leak_count INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "secrets_rules_version",
+			"ALTER TABLE sessions ADD COLUMN secrets_rules_version TEXT NOT NULL DEFAULT ''",
 		},
 	}
 
@@ -383,7 +673,57 @@ func (db *DB) migrateColumns() error {
 			)
 		}
 	}
+	if err := db.createPartialIndexesLocked(w); err != nil {
+		return err
+	}
 	if err := db.backfillIsAutomatedLocked(w); err != nil {
+		return err
+	}
+
+	if _, err := w.Exec(
+		`CREATE INDEX IF NOT EXISTS idx_sessions_termination_status
+		 ON sessions(termination_status)`,
+	); err != nil {
+		return fmt.Errorf(
+			"creating idx_sessions_termination_status: %w", err,
+		)
+	}
+
+	if _, err := w.Exec(`
+		CREATE TABLE IF NOT EXISTS remote_skipped_files (
+			host       TEXT NOT NULL,
+			path       TEXT NOT NULL,
+			file_mtime INTEGER NOT NULL,
+			PRIMARY KEY (host, path)
+		)`,
+	); err != nil {
+		return fmt.Errorf(
+			"creating remote_skipped_files: %w", err,
+		)
+	}
+
+	if _, err := w.Exec(`
+		CREATE TABLE IF NOT EXISTS worktree_project_mappings (
+			id          INTEGER PRIMARY KEY,
+			machine     TEXT NOT NULL,
+			path_prefix TEXT NOT NULL,
+			project     TEXT NOT NULL,
+			enabled     INTEGER NOT NULL DEFAULT 1,
+			created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+			updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+			UNIQUE(machine, path_prefix)
+		);
+		CREATE INDEX IF NOT EXISTS idx_worktree_project_mappings_match
+			ON worktree_project_mappings(machine, enabled, path_prefix);
+		CREATE INDEX IF NOT EXISTS idx_worktree_project_mappings_project
+			ON worktree_project_mappings(machine, project);
+	`); err != nil {
+		return fmt.Errorf(
+			"creating worktree_project_mappings: %w", err,
+		)
+	}
+
+	if err := db.ensureUsageEventsSchemaLocked(w); err != nil {
 		return err
 	}
 
@@ -403,31 +743,53 @@ func (db *DB) migrateColumns() error {
 	return nil
 }
 
-// backfillIsAutomatedLocked recomputes is_automated for all
-// sessions, correcting both false negatives (new patterns) and
-// stale false positives (patterns tightened since last run).
-// Guarded by a stats marker so it only runs once per pattern
-// version.
-func (db *DB) backfillIsAutomatedLocked(w *sql.DB) error {
-	const marker = "is_automated_backfill_v1"
-	var done int
-	if err := w.QueryRow(
-		`SELECT count(*) FROM stats
-		 WHERE key = ? AND value != 0`, marker,
-	).Scan(&done); err != nil {
-		return fmt.Errorf(
-			"probing automated backfill marker: %w", err,
-		)
+// createPartialIndexesLocked creates partial indexes that are not
+// covered by the initial schema DDL. Idempotent via IF NOT EXISTS.
+func (db *DB) createPartialIndexesLocked(w *sql.DB) error {
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_sessions_cwd
+		 ON sessions(cwd) WHERE cwd != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_compact_boundary
+		 ON messages(session_id, ordinal) WHERE is_compact_boundary = 1`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_sidechain
+		 ON messages(session_id) WHERE is_sidechain = 1`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_source_uuid
+		 ON messages(source_uuid) WHERE source_uuid != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_has_secret
+		 ON sessions(secret_leak_count) WHERE secret_leak_count > 0`,
 	}
-	if done > 0 {
-		return nil
+	for _, ddl := range indexes {
+		if _, err := w.Exec(ddl); err != nil {
+			return fmt.Errorf("creating index: %w", err)
+		}
+	}
+	return nil
+}
+
+// backfillIsAutomatedLocked verifies is_automated for all
+// sessions, correcting both false negatives (new patterns or
+// stale imported rows) and stale false positives (patterns
+// tightened since last run). The stored classifier hash records
+// which classifier wrote the current audit, but it is not a
+// complete integrity marker: rows can be copied from older DBs
+// or stale remote machines after the hash was stamped.
+func (db *DB) backfillIsAutomatedLocked(w *sql.DB) error {
+	current := ClassifierHash()
+	var stored string
+	err := w.QueryRow(
+		`SELECT value FROM stats WHERE key = ?`,
+		ClassifierHashKey,
+	).Scan(&stored)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf(
+			"probing classifier hash: %w", err,
+		)
 	}
 
 	rows, err := w.Query(
 		`SELECT id, first_message, user_message_count,
 			is_automated
-		 FROM sessions
-		 WHERE first_message IS NOT NULL`,
+		 FROM sessions`,
 	)
 	if err != nil {
 		return fmt.Errorf(
@@ -438,20 +800,24 @@ func (db *DB) backfillIsAutomatedLocked(w *sql.DB) error {
 
 	var setIDs, clearIDs []string
 	for rows.Next() {
-		var id, fm string
+		var id string
+		var fm sql.NullString
 		var umc int
-		var current bool
+		var rowAutomated bool
 		if err := rows.Scan(
-			&id, &fm, &umc, &current,
+			&id, &fm, &umc, &rowAutomated,
 		); err != nil {
 			return fmt.Errorf(
 				"scanning backfill candidate: %w", err,
 			)
 		}
-		want := umc <= 1 && IsAutomatedSession(fm)
-		if want && !current {
+		want := false
+		if fm.Valid {
+			want = umc <= 1 && IsAutomatedSession(fm.String)
+		}
+		if want && !rowAutomated {
 			setIDs = append(setIDs, id)
-		} else if !want && current {
+		} else if !want && rowAutomated {
 			clearIDs = append(clearIDs, id)
 		}
 	}
@@ -478,12 +844,41 @@ func (db *DB) backfillIsAutomatedLocked(w *sql.DB) error {
 		)
 	}
 
-	_, err = w.Exec(
-		`INSERT INTO stats (key, value) VALUES (?, 1)
+	// stats.value is INTEGER affinity; SQLite stores hex text
+	// here verbatim. Switching to STRICT tables would require
+	// moving this row to a TEXT-typed table.
+	if _, err := w.Exec(
+		`INSERT INTO stats (key, value) VALUES (?, ?)
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-		marker,
-	)
-	return err
+		ClassifierHashKey, current,
+	); err != nil {
+		return fmt.Errorf(
+			"storing classifier hash: %w", err,
+		)
+	}
+	return nil
+}
+
+// ForceBackfillIsAutomated reclassifies is_automated across
+// every session, ignoring any cached classifier hash. ResyncAll
+// calls this after CopyOrphanedDataFrom because orphan-copied
+// rows carry is_automated values computed against the *old* DB's
+// classifier set; the temp DB's at-Open backfill already ran on
+// an empty table and stamped the current hash, so without this
+// call those rows would be permanently stuck with stale flags.
+func (db *DB) ForceBackfillIsAutomated() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	w := db.getWriter()
+	if _, err := w.Exec(
+		`DELETE FROM stats WHERE key = ?`,
+		ClassifierHashKey,
+	); err != nil {
+		return fmt.Errorf(
+			"clearing classifier hash: %w", err,
+		)
+	}
+	return db.backfillIsAutomatedLocked(w)
 }
 
 func batchUpdateAutomated(
@@ -501,7 +896,9 @@ func batchUpdateAutomated(
 			phs[j] = "?"
 		}
 		_, err := w.Exec(
-			"UPDATE sessions SET is_automated = ?"+
+			"UPDATE sessions"+
+				" SET is_automated = ?,"+
+				"     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')"+
 				" WHERE id IN ("+
 				strings.Join(phs, ",")+
 				")",
@@ -854,6 +1251,19 @@ func (db *DB) NeedsResync() bool {
 	return db.dataStale
 }
 
+// CurrentDataVersion returns the current parser data version.
+func CurrentDataVersion() int {
+	return dataVersion
+}
+
+// Vacuum runs VACUUM on the database to reclaim space.
+func (db *DB) Vacuum() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	_, err := db.getWriter().Exec("VACUUM")
+	return err
+}
+
 func dropDatabase(path string) error {
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		if err := os.Remove(path + suffix); err != nil &&
@@ -1040,10 +1450,12 @@ func (db *DB) init() error {
 // retired pools left over from previous Reopen calls.
 func (db *DB) Close() error {
 	db.mu.Lock()
+	db.connMu.Lock()
 	w := db.getWriter()
-	r := db.getReader()
+	r := db.rawReader()
 	retired := db.retired
 	db.retired = nil
+	db.connMu.Unlock()
 	db.mu.Unlock()
 
 	errs := []error{w.Close(), r.Close()}
@@ -1060,10 +1472,12 @@ func (db *DB) Close() error {
 func (db *DB) CloseConnections() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	db.connMu.Lock()
+	defer db.connMu.Unlock()
 
 	errs := []error{
 		db.getWriter().Close(),
-		db.getReader().Close(),
+		db.rawReader().Close(),
 	}
 	for _, p := range db.retired {
 		errs = append(errs, p.Close())
@@ -1102,18 +1516,8 @@ func (db *DB) reopenLocked() error {
 	}
 	reader.SetMaxOpenConns(4)
 
-	// Close pools from any previous reopen. They have been
-	// retired for at least one full Reopen cycle, so all
-	// in-flight queries on them have long since completed.
-	for _, p := range db.retired {
-		if err := p.Close(); err != nil {
-			log.Printf(
-				"warning: closing retired db pool: %v", err,
-			)
-		}
-	}
-	db.retired = db.retired[:0]
-
+	db.connMu.Lock()
+	retired := append([]*sql.DB(nil), db.retired...)
 	oldWriter := db.writer.Swap(writer)
 	oldReader := db.reader.Swap(reader)
 
@@ -1121,7 +1525,19 @@ func (db *DB) reopenLocked() error {
 	// loaded the old pointer before the swap may still have
 	// in-flight queries; these pools will be closed on the
 	// next Reopen, CloseConnections, or Close call.
-	db.retired = append(db.retired, oldWriter, oldReader)
+	db.retired = []*sql.DB{oldWriter, oldReader}
+	db.connMu.Unlock()
+
+	// Close pools from earlier reopens outside connMu. database/sql
+	// may wait for active rows to finish, and that wait must not
+	// block new reads from acquiring the guarded current reader.
+	for _, p := range retired {
+		if err := p.Close(); err != nil {
+			log.Printf(
+				"warning: closing retired db pool: %v", err,
+			)
+		}
+	}
 	return nil
 }
 
@@ -1144,8 +1560,8 @@ func (db *DB) Update(fn func(tx *sql.Tx) error) error {
 	return tx.Commit()
 }
 
-// Reader returns the read-only connection pool.
-func (db *DB) Reader() *sql.DB {
+// Reader returns guarded read-only query access.
+func (db *DB) Reader() Reader {
 	return db.getReader()
 }
 

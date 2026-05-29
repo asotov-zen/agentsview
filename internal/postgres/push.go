@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wesm/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/db"
 )
 
 const lastPushBoundaryStateKey = "last_push_boundary_state"
@@ -36,33 +36,20 @@ type PushResult struct {
 	Duration       time.Duration
 }
 
+// PushProgress is reported after each batch during Push.
+type PushProgress struct {
+	SessionsDone  int
+	SessionsTotal int
+	MessagesDone  int
+	Errors        int
+}
+
 // Push syncs local sessions and messages to PostgreSQL.
-// Only sessions modified since the last push are processed.
-// When full is true, the per-message content heuristic is
-// bypassed and every candidate session's messages are
-// re-pushed unconditionally.
-//
-// When project filters are set (via SyncOptions), only
-// matching sessions are pushed. Filtered pushes do not
-// advance the global watermark (last_push_at) because the
-// watermark covers all projects — advancing it would cause
-// unfiltered sessions to be skipped. Instead, filtered
-// pushes rely on fingerprints for incrementality: each run
-// re-queries all sessions since the last unfiltered push
-// and skips those whose fingerprint hasn't changed. The
-// query window grows between unfiltered pushes, but
-// fingerprint matching keeps the actual PG writes minimal.
-// Run an occasional unfiltered push (or use --all-projects)
-// to advance the watermark and bound the query window.
-//
-// Known limitation: sessions that are permanently deleted
-// from SQLite (via prune) are not propagated as deletions
-// to PG because the local rows no longer exist at push time.
-// Sessions soft-deleted with deleted_at are synced correctly.
-// Use a direct PG DELETE to remove permanently pruned
-// sessions from PG if needed.
+// The onProgress callback, if non-nil, is called after each
+// batch with current totals.
 func (s *Sync) Push(
 	ctx context.Context, full bool,
+	onProgress func(PushProgress),
 ) (PushResult, error) {
 	start := time.Now()
 	var result PushResult
@@ -137,6 +124,9 @@ func (s *Sync) Push(
 			}
 		}
 	}
+	if err := s.syncModelPricing(ctx); err != nil {
+		return result, err
+	}
 
 	cutoff := time.Now().UTC().Format(LocalSyncTimestampLayout)
 
@@ -157,11 +147,10 @@ func (s *Sync) Push(
 	}
 
 	var priorFingerprints map[string]string
-	var boundaryState map[string]string
-	var boundaryOK bool
+	sessionFingerprints := make(map[string]string, len(sessionByID))
 	if !full {
 		var bErr error
-		priorFingerprints, boundaryState, boundaryOK, bErr = readBoundaryAndFingerprints(
+		priorFingerprints, _, _, bErr = readBoundaryAndFingerprints(
 			s.local, lastPush,
 		)
 		if bErr != nil {
@@ -170,7 +159,6 @@ func (s *Sync) Push(
 	}
 
 	if lastPush != "" {
-		ok := boundaryOK
 		windowStart, err := PreviousLocalSyncTimestamp(
 			lastPush,
 		)
@@ -194,12 +182,6 @@ func (s *Sync) Push(
 			if marker != lastPush {
 				continue
 			}
-			if ok {
-				fp := sessionPushFingerprint(sess)
-				if boundaryState[sess.ID] == fp {
-					continue
-				}
-			}
 			if _, exists := sessionByID[sess.ID]; exists {
 				continue
 			}
@@ -207,10 +189,23 @@ func (s *Sync) Push(
 		}
 	}
 
+	usageFingerprints, err := s.local.UsageEventFingerprints(
+		mapKeys(sessionByID),
+	)
+	if err != nil {
+		return result, fmt.Errorf(
+			"computing local usage event fingerprints: %w", err,
+		)
+	}
+	for id, sess := range sessionByID {
+		sessionFingerprints[id] = sessionPushFingerprint(
+			sess, usageFingerprints[id],
+		)
+	}
+
 	if len(priorFingerprints) > 0 {
-		for id, sess := range sessionByID {
-			fp := sessionPushFingerprint(sess)
-			if priorFingerprints[id] == fp {
+		for id := range sessionByID {
+			if priorFingerprints[id] == sessionFingerprints[id] {
 				delete(sessionByID, id)
 			}
 		}
@@ -238,13 +233,14 @@ func (s *Sync) Push(
 			}
 			if err := writePushBoundaryState(
 				s.local, boundaryKey, sessions,
-				priorFingerprints,
+				priorFingerprints, sessionFingerprints,
 			); err != nil {
 				return result, err
 			}
 		} else {
 			if err := finalizePushState(
 				s.local, cutoff, sessions, nil,
+				sessionFingerprints,
 			); err != nil {
 				return result, err
 			}
@@ -268,24 +264,32 @@ func (s *Sync) Push(
 		if batchResult.ok {
 			result.SessionsPushed += batchResult.sessions
 			result.MessagesPushed += batchResult.messages
-			continue
+		} else {
+			// Batch failed — retry each session individually
+			// so one bad session doesn't block the rest.
+			for _, sess := range batch {
+				sr, retryErr := s.pushBatch(
+					ctx, []db.Session{sess},
+					full, &pushed,
+				)
+				if retryErr != nil {
+					return result, retryErr
+				}
+				if sr.ok {
+					result.SessionsPushed += sr.sessions
+					result.MessagesPushed += sr.messages
+				} else {
+					result.Errors++
+				}
+			}
 		}
-		// Batch failed — retry each session individually
-		// so one bad session doesn't block the rest.
-		for _, sess := range batch {
-			sr, retryErr := s.pushBatch(
-				ctx, []db.Session{sess},
-				full, &pushed,
-			)
-			if retryErr != nil {
-				return result, retryErr
-			}
-			if sr.ok {
-				result.SessionsPushed += sr.sessions
-				result.MessagesPushed += sr.messages
-			} else {
-				result.Errors++
-			}
+		if onProgress != nil {
+			onProgress(PushProgress{
+				SessionsDone:  end,
+				SessionsTotal: len(sessions),
+				MessagesDone:  result.MessagesPushed,
+				Errors:        result.Errors,
+			})
 		}
 	}
 
@@ -304,7 +308,7 @@ func (s *Sync) Push(
 		}
 		if err := writePushBoundaryState(
 			s.local, boundaryKey, pushed,
-			priorFingerprints,
+			priorFingerprints, sessionFingerprints,
 		); err != nil {
 			return result, err
 		}
@@ -323,7 +327,7 @@ func (s *Sync) Push(
 		}
 		if err := finalizePushState(
 			s.local, finalizeCutoff, pushed,
-			mergedFingerprints,
+			mergedFingerprints, sessionFingerprints,
 		); err != nil {
 			return result, err
 		}
@@ -407,10 +411,22 @@ func (s *Sync) pushBatch(
 			return batchResult{}, nil
 		}
 
-		// Bump updated_at when messages were rewritten
-		// but pushSession was a metadata no-op (its
-		// WHERE clause skips unchanged rows).
-		if msgCount > 0 {
+		findingsChanged, err := s.pushSecretFindings(ctx, tx, sess.ID)
+		if err != nil {
+			log.Printf(
+				"pgsync: secret findings %s: %v",
+				sess.ID, err,
+			)
+			_ = tx.Rollback()
+			*pushed = (*pushed)[:len(*pushed)-n]
+			return batchResult{}, nil
+		}
+
+		// Bump updated_at when messages or secret findings were
+		// rewritten but pushSession was a metadata no-op (its
+		// WHERE clause skips unchanged rows). PG read-mode session
+		// watchers rely on updated_at to surface secret-only changes.
+		if msgCount > 0 || findingsChanged {
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE sessions
 				SET updated_at = NOW()
@@ -447,6 +463,7 @@ func finalizePushState(
 	cutoff string,
 	sessions []db.Session,
 	priorFingerprints map[string]string,
+	sessionFingerprints map[string]string,
 ) error {
 	if err := local.SetSyncState(
 		"last_push_at", cutoff,
@@ -455,6 +472,7 @@ func finalizePushState(
 	}
 	return writePushBoundaryState(
 		local, cutoff, sessions, priorFingerprints,
+		sessionFingerprints,
 	)
 }
 
@@ -523,6 +541,7 @@ func writePushBoundaryState(
 	cutoff string,
 	sessions []db.Session,
 	priorFingerprints map[string]string,
+	sessionFingerprints map[string]string,
 ) error {
 	state := pushBoundaryState{
 		Cutoff: cutoff,
@@ -533,7 +552,14 @@ func writePushBoundaryState(
 	}
 	maps.Copy(state.Fingerprints, priorFingerprints)
 	for _, sess := range sessions {
-		state.Fingerprints[sess.ID] = sessionPushFingerprint(sess)
+		fp, ok := sessionFingerprints[sess.ID]
+		if !ok {
+			return fmt.Errorf(
+				"missing session fingerprint for %s",
+				sess.ID,
+			)
+		}
+		state.Fingerprints[sess.ID] = fp
 	}
 	data, err := json.Marshal(state)
 	if err != nil {
@@ -551,6 +577,14 @@ func writePushBoundaryState(
 		)
 	}
 	return nil
+}
+
+func mapKeys(m map[string]db.Session) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func localSessionSyncMarker(sess db.Session) string {
@@ -602,7 +636,9 @@ func localSessionSyncMarker(sess db.Session) string {
 	return marker
 }
 
-func sessionPushFingerprint(sess db.Session) string {
+func sessionPushFingerprint(
+	sess db.Session, usageEventFingerprint string,
+) string {
 	fields := []string{
 		sess.ID,
 		sess.Project,
@@ -615,6 +651,7 @@ func sessionPushFingerprint(sess db.Session) string {
 		stringValue(sess.DeletedAt),
 		fmt.Sprintf("%d", sess.MessageCount),
 		fmt.Sprintf("%d", sess.UserMessageCount),
+		fmt.Sprintf("%t", sess.IsAutomated),
 		fmt.Sprintf("%d", sess.TotalOutputTokens),
 		fmt.Sprintf("%d", sess.PeakContextTokens),
 		fmt.Sprintf("%t", sess.HasTotalOutputTokens),
@@ -625,6 +662,33 @@ func sessionPushFingerprint(sess db.Session) string {
 		int64Value(sess.FileMtime),
 		stringValue(sess.LocalModifiedAt),
 		sess.CreatedAt,
+		fmt.Sprintf("%d", sess.ToolFailureSignalCount),
+		fmt.Sprintf("%d", sess.ToolRetryCount),
+		fmt.Sprintf("%d", sess.EditChurnCount),
+		fmt.Sprintf("%d", sess.ConsecutiveFailureMax),
+		sess.Outcome,
+		sess.OutcomeConfidence,
+		sess.EndedWithRole,
+		fmt.Sprintf("%d", sess.FinalFailureStreak),
+		stringValue(sess.SignalsPendingSince),
+		fmt.Sprintf("%d", sess.CompactionCount),
+		fmt.Sprintf("%d", sess.MidTaskCompactionCount),
+		float64Value(sess.ContextPressureMax),
+		intPtrValue(sess.HealthScore),
+		stringValue(sess.HealthGrade),
+		fmt.Sprintf("%t", sess.HasToolCalls),
+		fmt.Sprintf("%t", sess.HasContextData),
+		fmt.Sprintf("%d", sess.DataVersion),
+		sess.Cwd,
+		sess.GitBranch,
+		sess.SourceSessionID,
+		sess.SourceVersion,
+		fmt.Sprintf("%d", sess.ParserMalformedLines),
+		fmt.Sprintf("%t", sess.IsTruncated),
+		stringValue(sess.TerminationStatus),
+		fmt.Sprintf("%d", sess.SecretLeakCount),
+		sess.SecretsRulesVersion,
+		usageEventFingerprint,
 	}
 	var b strings.Builder
 	for _, f := range fields {
@@ -641,6 +705,20 @@ func stringValue(value *string) string {
 }
 
 func int64Value(value *int64) string {
+	if value == nil {
+		return ""
+	}
+	return fmt.Sprintf("%d", *value)
+}
+
+func float64Value(value *float64) string {
+	if value == nil {
+		return ""
+	}
+	return fmt.Sprintf("%g", *value)
+}
+
+func intPtrValue(value *int) string {
 	if value == nil {
 		return ""
 	}
@@ -683,9 +761,7 @@ func (s *Sync) pushSession(
 	ctx context.Context, tx *sql.Tx, sess db.Session,
 ) error {
 	createdAt, _ := ParseSQLiteTimestamp(sess.CreatedAt)
-	isAutomated := sess.UserMessageCount <= 1 &&
-		sess.FirstMessage != nil &&
-		db.IsAutomatedSession(*sess.FirstMessage)
+	isAutomated := sess.IsAutomated
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO sessions (
 			id, machine, project, agent,
@@ -694,14 +770,37 @@ func (s *Sync) pushSession(
 			message_count, user_message_count,
 			total_output_tokens, peak_context_tokens,
 			has_total_output_tokens, has_peak_context_tokens,
-			is_automated,
+			is_automated, data_version,
+			cwd, git_branch, source_session_id,
+			source_version, parser_malformed_lines,
+			is_truncated, termination_status,
 			parent_session_id, relationship_type,
+			tool_failure_signal_count, tool_retry_count,
+			edit_churn_count, consecutive_failure_max,
+			outcome, outcome_confidence,
+			ended_with_role, final_failure_streak,
+			signals_pending_since,
+			compaction_count, mid_task_compaction_count,
+			context_pressure_max,
+			health_score, health_grade,
+			has_tool_calls, has_context_data,
+			secret_leak_count, secrets_rules_version,
 			updated_at
 		) VALUES (
 			$1, $2, $3, $4, $5, $6,
 			$7, $8, $9, $10,
 			$11, $12, $13, $14,
-			$15, $16, $17, $18, $19, NOW()
+			$15, $16, $17, $18,
+			$19, $20, $21, $22, $23, $24, $25,
+			$26, $27,
+			$28, $29, $30, $31,
+			$32, $33, $34, $35,
+			$36,
+			$37, $38,
+			$39,
+			$40, $41, $42, $43,
+			$44, $45,
+			NOW()
 		)
 		ON CONFLICT (id) DO UPDATE SET
 			machine = EXCLUDED.machine,
@@ -720,8 +819,34 @@ func (s *Sync) pushSession(
 			has_total_output_tokens = EXCLUDED.has_total_output_tokens,
 			has_peak_context_tokens = EXCLUDED.has_peak_context_tokens,
 			is_automated = EXCLUDED.is_automated,
+			data_version = EXCLUDED.data_version,
+			cwd = EXCLUDED.cwd,
+			git_branch = EXCLUDED.git_branch,
+			source_session_id = EXCLUDED.source_session_id,
+			source_version = EXCLUDED.source_version,
+			parser_malformed_lines = EXCLUDED.parser_malformed_lines,
+			is_truncated = EXCLUDED.is_truncated,
+			termination_status = EXCLUDED.termination_status,
 			parent_session_id = EXCLUDED.parent_session_id,
 			relationship_type = EXCLUDED.relationship_type,
+			tool_failure_signal_count = EXCLUDED.tool_failure_signal_count,
+			tool_retry_count = EXCLUDED.tool_retry_count,
+			edit_churn_count = EXCLUDED.edit_churn_count,
+			consecutive_failure_max = EXCLUDED.consecutive_failure_max,
+			outcome = EXCLUDED.outcome,
+			outcome_confidence = EXCLUDED.outcome_confidence,
+			ended_with_role = EXCLUDED.ended_with_role,
+			final_failure_streak = EXCLUDED.final_failure_streak,
+			signals_pending_since = EXCLUDED.signals_pending_since,
+			compaction_count = EXCLUDED.compaction_count,
+			mid_task_compaction_count = EXCLUDED.mid_task_compaction_count,
+			context_pressure_max = EXCLUDED.context_pressure_max,
+			health_score = EXCLUDED.health_score,
+			health_grade = EXCLUDED.health_grade,
+			has_tool_calls = EXCLUDED.has_tool_calls,
+			has_context_data = EXCLUDED.has_context_data,
+			secret_leak_count = EXCLUDED.secret_leak_count,
+			secrets_rules_version = EXCLUDED.secrets_rules_version,
 			updated_at = NOW()
 		WHERE sessions.machine IS DISTINCT FROM EXCLUDED.machine
 			OR sessions.project IS DISTINCT FROM EXCLUDED.project
@@ -739,8 +864,34 @@ func (s *Sync) pushSession(
 			OR sessions.has_total_output_tokens IS DISTINCT FROM EXCLUDED.has_total_output_tokens
 			OR sessions.has_peak_context_tokens IS DISTINCT FROM EXCLUDED.has_peak_context_tokens
 			OR sessions.is_automated IS DISTINCT FROM EXCLUDED.is_automated
+			OR sessions.data_version IS DISTINCT FROM EXCLUDED.data_version
+			OR sessions.cwd IS DISTINCT FROM EXCLUDED.cwd
+			OR sessions.git_branch IS DISTINCT FROM EXCLUDED.git_branch
+			OR sessions.source_session_id IS DISTINCT FROM EXCLUDED.source_session_id
+			OR sessions.source_version IS DISTINCT FROM EXCLUDED.source_version
+			OR sessions.parser_malformed_lines IS DISTINCT FROM EXCLUDED.parser_malformed_lines
+			OR sessions.is_truncated IS DISTINCT FROM EXCLUDED.is_truncated
+			OR sessions.termination_status IS DISTINCT FROM EXCLUDED.termination_status
 			OR sessions.parent_session_id IS DISTINCT FROM EXCLUDED.parent_session_id
-			OR sessions.relationship_type IS DISTINCT FROM EXCLUDED.relationship_type`,
+			OR sessions.relationship_type IS DISTINCT FROM EXCLUDED.relationship_type
+			OR sessions.tool_failure_signal_count IS DISTINCT FROM EXCLUDED.tool_failure_signal_count
+			OR sessions.tool_retry_count IS DISTINCT FROM EXCLUDED.tool_retry_count
+			OR sessions.edit_churn_count IS DISTINCT FROM EXCLUDED.edit_churn_count
+			OR sessions.consecutive_failure_max IS DISTINCT FROM EXCLUDED.consecutive_failure_max
+			OR sessions.outcome IS DISTINCT FROM EXCLUDED.outcome
+			OR sessions.outcome_confidence IS DISTINCT FROM EXCLUDED.outcome_confidence
+			OR sessions.ended_with_role IS DISTINCT FROM EXCLUDED.ended_with_role
+			OR sessions.final_failure_streak IS DISTINCT FROM EXCLUDED.final_failure_streak
+			OR sessions.signals_pending_since IS DISTINCT FROM EXCLUDED.signals_pending_since
+			OR sessions.compaction_count IS DISTINCT FROM EXCLUDED.compaction_count
+			OR sessions.mid_task_compaction_count IS DISTINCT FROM EXCLUDED.mid_task_compaction_count
+			OR sessions.context_pressure_max IS DISTINCT FROM EXCLUDED.context_pressure_max
+			OR sessions.health_score IS DISTINCT FROM EXCLUDED.health_score
+			OR sessions.health_grade IS DISTINCT FROM EXCLUDED.health_grade
+			OR sessions.has_tool_calls IS DISTINCT FROM EXCLUDED.has_tool_calls
+			OR sessions.has_context_data IS DISTINCT FROM EXCLUDED.has_context_data
+			OR sessions.secret_leak_count IS DISTINCT FROM EXCLUDED.secret_leak_count
+			OR sessions.secrets_rules_version IS DISTINCT FROM EXCLUDED.secrets_rules_version`,
 		sess.ID, s.machine,
 		sanitizePG(sess.Project),
 		sess.Agent,
@@ -753,9 +904,22 @@ func (s *Sync) pushSession(
 		sess.MessageCount, sess.UserMessageCount,
 		sess.TotalOutputTokens, sess.PeakContextTokens,
 		sess.HasTotalOutputTokens, sess.HasPeakContextTokens,
-		isAutomated,
+		isAutomated, sess.DataVersion,
+		sess.Cwd, sess.GitBranch, sess.SourceSessionID,
+		sess.SourceVersion, sess.ParserMalformedLines,
+		sess.IsTruncated, nilStr(sess.TerminationStatus),
 		nilStr(sess.ParentSessionID),
 		sess.RelationshipType,
+		sess.ToolFailureSignalCount, sess.ToolRetryCount,
+		sess.EditChurnCount, sess.ConsecutiveFailureMax,
+		sess.Outcome, sess.OutcomeConfidence,
+		sess.EndedWithRole, sess.FinalFailureStreak,
+		nilStr(sess.SignalsPendingSince),
+		sess.CompactionCount, sess.MidTaskCompactionCount,
+		sess.ContextPressureMax,
+		sess.HealthScore, nilStr(sess.HealthGrade),
+		sess.HasToolCalls, sess.HasContextData,
+		sess.SecretLeakCount, sess.SecretsRulesVersion,
 	)
 	return err
 }
@@ -800,6 +964,11 @@ func (s *Sync) pushMessages(
 			return 0, fmt.Errorf(
 				"deleting stale pg messages: %w", err,
 			)
+		}
+		if err := reconcilePinnedMessages(
+			ctx, tx, sessionID,
+		); err != nil {
+			return 0, err
 		}
 		return 0, nil
 	}
@@ -882,13 +1051,26 @@ func (s *Sync) pushMessages(
 				"computing pg token fingerprint: %w", err,
 			)
 		}
+		localUsageFP, err := s.local.UsageEventFingerprint(sessionID)
+		if err != nil {
+			return 0, fmt.Errorf(
+				"computing local usage event fingerprint: %w", err,
+			)
+		}
+		pgUsageFP, err := pgUsageEventFingerprint(ctx, tx, sessionID)
+		if err != nil {
+			return 0, fmt.Errorf(
+				"computing pg usage event fingerprint: %w", err,
+			)
+		}
 		if localSum == pgContentSum &&
 			localMax == pgContentMax &&
 			localMin == pgContentMin &&
 			localSysFP == pgSystemFP.String &&
 			localTCCount == pgToolCallCount &&
 			localTCSum == pgTCContentSum &&
-			localTokenFP == pgTokenFP {
+			localTokenFP == pgTokenFP &&
+			localUsageFP == pgUsageFP {
 			return 0, nil
 		}
 	}
@@ -916,6 +1098,22 @@ func (s *Sync) pushMessages(
 		return 0, fmt.Errorf(
 			"deleting pg messages: %w", err,
 		)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM usage_events
+		WHERE session_id = $1
+	`, sessionID); err != nil {
+		return 0, fmt.Errorf(
+			"deleting pg usage_events: %w", err,
+		)
+	}
+
+	usageEvents, err := s.local.GetUsageEvents(ctx, sessionID)
+	if err != nil {
+		return 0, fmt.Errorf("reading local usage events: %w", err)
+	}
+	if err := bulkInsertUsageEvents(ctx, tx, usageEvents); err != nil {
+		return 0, err
 	}
 
 	count := 0
@@ -963,7 +1161,184 @@ func (s *Sync) pushMessages(
 		startOrdinal = nextOrdinal
 	}
 
+	if err := reconcilePinnedMessages(ctx, tx, sessionID); err != nil {
+		return count, err
+	}
+
 	return count, nil
+}
+
+func reconcilePinnedMessages(
+	ctx context.Context, tx *sql.Tx, sessionID string,
+) error {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE pinned_messages p
+		SET source_uuid = m.source_uuid
+		FROM messages m
+		WHERE p.session_id = $1
+			AND m.session_id = p.session_id
+			AND m.ordinal = p.message_id
+			AND p.source_uuid = ''
+			AND m.source_uuid <> ''`,
+		sessionID,
+	); err != nil {
+		return fmt.Errorf(
+			"backfilling pg pin source_uuid: %w", err,
+		)
+	}
+
+	// Move shifted source-backed pins out of the real ordinal range
+	// first. Pins already on their resolved target stay in place so
+	// duplicate repairs prefer the current target row's metadata.
+	// When multiple messages share a source_uuid (the schema allows
+	// it), prefer the message at the pin's current message_id so a
+	// correctly-placed pin is not relocated to a different duplicate.
+	if _, err := tx.ExecContext(ctx, `
+		WITH matched AS (
+			SELECT DISTINCT ON (p.id)
+				p.id, p.message_id, p.ordinal,
+				m.ordinal AS target_ordinal
+			FROM pinned_messages p
+			JOIN messages m
+				ON m.session_id = p.session_id
+				AND m.source_uuid = p.source_uuid
+			WHERE p.session_id = $1
+				AND p.source_uuid <> ''
+			ORDER BY p.id,
+				CASE WHEN m.ordinal = p.message_id THEN 0 ELSE 1 END,
+				m.ordinal
+		),
+		numbered AS (
+			SELECT id,
+				ROW_NUMBER() OVER (ORDER BY id) AS temp_ordinal
+			FROM matched
+			WHERE target_ordinal <> message_id
+				OR target_ordinal <> ordinal
+		)
+		UPDATE pinned_messages p
+		SET message_id = (-2000000000 + numbered.temp_ordinal::INT),
+			ordinal = (-2000000000 + numbered.temp_ordinal::INT)
+		FROM numbered
+		WHERE p.id = numbered.id`,
+		sessionID,
+	); err != nil {
+		return fmt.Errorf(
+			"staging pg pins for source_uuid realignment: %w", err,
+		)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		WITH matched AS (
+			SELECT DISTINCT ON (p.id)
+				p.id, p.message_id, p.created_at,
+				m.ordinal AS target_ordinal
+			FROM pinned_messages p
+			JOIN messages m
+				ON m.session_id = p.session_id
+				AND m.source_uuid = p.source_uuid
+			WHERE p.session_id = $1
+				AND p.source_uuid <> ''
+			ORDER BY p.id,
+				CASE WHEN m.ordinal = p.message_id THEN 0 ELSE 1 END,
+				m.ordinal
+		),
+		ranked AS (
+			SELECT id, target_ordinal,
+				ROW_NUMBER() OVER (
+					PARTITION BY target_ordinal
+					ORDER BY
+						(message_id = target_ordinal) DESC,
+						created_at DESC,
+						id DESC
+				) AS target_rank
+			FROM matched
+		)
+		DELETE FROM pinned_messages p
+		USING ranked r
+		WHERE p.session_id = $1
+			AND r.target_rank = 1
+			AND p.message_id = r.target_ordinal
+			AND p.id <> r.id`,
+		sessionID,
+	); err != nil {
+		return fmt.Errorf(
+			"clearing pg pin target conflicts: %w", err,
+		)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		WITH matched AS (
+			SELECT DISTINCT ON (p.id)
+				p.id, p.message_id, p.created_at,
+				m.ordinal AS target_ordinal
+			FROM pinned_messages p
+			JOIN messages m
+				ON m.session_id = p.session_id
+				AND m.source_uuid = p.source_uuid
+			WHERE p.session_id = $1
+				AND p.source_uuid <> ''
+			ORDER BY p.id,
+				CASE WHEN m.ordinal = p.message_id THEN 0 ELSE 1 END,
+				m.ordinal
+		),
+		ranked AS (
+			SELECT id, target_ordinal,
+				ROW_NUMBER() OVER (
+					PARTITION BY target_ordinal
+					ORDER BY
+						(message_id = target_ordinal) DESC,
+						created_at DESC,
+						id DESC
+				) AS target_rank
+			FROM matched
+		)
+		UPDATE pinned_messages p
+		SET message_id = r.target_ordinal,
+			ordinal = r.target_ordinal
+		FROM ranked r
+		WHERE p.id = r.id
+			AND r.target_rank = 1`,
+		sessionID,
+	); err != nil {
+		return fmt.Errorf(
+			"realigning pg pins by source_uuid: %w", err,
+		)
+	}
+
+	// Prune pins whose anchor no longer exists. For source-backed
+	// pins (source_uuid <> '') the canonical anchor is source_uuid,
+	// so a pin must be dropped when no message in this session has
+	// that source_uuid — otherwise a stale pin can survive on top
+	// of an unrelated message that now occupies the same ordinal.
+	// The ordinal-NOT-EXISTS clause additionally removes legacy
+	// pins (source_uuid = '') with a stale ordinal and clears any
+	// non-rank-1 duplicate left at the sentinel ordinal by step 2.
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM pinned_messages p
+		WHERE p.session_id = $1
+			AND (
+				(
+					p.source_uuid <> ''
+					AND NOT EXISTS (
+						SELECT 1 FROM messages m
+						WHERE m.session_id = p.session_id
+							AND m.source_uuid = p.source_uuid
+					)
+				)
+				OR NOT EXISTS (
+					SELECT 1 FROM messages m
+					WHERE m.session_id = p.session_id
+						AND m.ordinal = p.message_id
+				)
+			)`,
+		sessionID,
+	); err != nil {
+		return fmt.Errorf(
+			"pruning stale pg pins: %w", err,
+		)
+	}
+
+	return nil
 }
 
 func pgMessageTokenFingerprint(
@@ -972,7 +1347,9 @@ func pgMessageTokenFingerprint(
 	rows, err := tx.QueryContext(ctx,
 		`SELECT ordinal, model, token_usage, context_tokens,
 			output_tokens, has_context_tokens, has_output_tokens,
-			claude_message_id, claude_request_id
+			claude_message_id, claude_request_id,
+			source_type, source_subtype, source_uuid,
+			source_parent_uuid, is_sidechain, is_compact_boundary
 		 FROM messages
 		 WHERE session_id = $1
 		 ORDER BY ordinal ASC`,
@@ -989,20 +1366,95 @@ func pgMessageTokenFingerprint(
 		var model, tokenUsage string
 		var hasContextTokens, hasOutputTokens bool
 		var claudeMsgID, claudeReqID string
+		var srcType, srcSubtype, srcUUID, srcParentUUID string
+		var isSidechain, isCompactBoundary bool
 		if err := rows.Scan(
 			&ordinal, &model, &tokenUsage, &contextTokens,
 			&outputTokens, &hasContextTokens, &hasOutputTokens,
 			&claudeMsgID, &claudeReqID,
+			&srcType, &srcSubtype, &srcUUID, &srcParentUUID,
+			&isSidechain, &isCompactBoundary,
 		); err != nil {
 			return "", err
 		}
-		fmt.Fprintf(&b, "%d|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s;",
+		fmt.Fprintf(&b,
+			"%d|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s|"+
+				"%d:%s|%d:%s|%d:%s|%d:%s|%t|%t;",
 			ordinal,
 			len(model), model,
 			len(tokenUsage), tokenUsage,
 			contextTokens, outputTokens,
 			hasContextTokens, hasOutputTokens,
 			claudeMsgID, claudeReqID,
+			len(srcType), srcType,
+			len(srcSubtype), srcSubtype,
+			len(srcUUID), srcUUID,
+			len(srcParentUUID), srcParentUUID,
+			isSidechain, isCompactBoundary,
+		)
+	}
+	return b.String(), rows.Err()
+}
+
+func pgUsageEventFingerprint(
+	ctx context.Context, tx *sql.Tx, sessionID string,
+) (string, error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT message_ordinal, source, model,
+			input_tokens, output_tokens,
+			cache_creation_input_tokens, cache_read_input_tokens,
+			reasoning_tokens, cost_usd, cost_status, cost_source,
+			occurred_at, dedup_key
+		 FROM usage_events
+		 WHERE session_id = $1
+		 ORDER BY occurred_at NULLS FIRST, id`,
+		sessionID,
+	)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var b strings.Builder
+	for rows.Next() {
+		var ordinal sql.NullInt64
+		var source, model, costStatus, costSource string
+		var inputTokens, outputTokens int
+		var cacheCreationInputTokens, cacheReadInputTokens int
+		var reasoningTokens int
+		var cost sql.NullFloat64
+		var occurredAt sql.NullTime
+		var dedupKey sql.NullString
+		if err := rows.Scan(
+			&ordinal, &source, &model,
+			&inputTokens, &outputTokens,
+			&cacheCreationInputTokens, &cacheReadInputTokens,
+			&reasoningTokens, &cost, &costStatus, &costSource,
+			&occurredAt, &dedupKey,
+		); err != nil {
+			return "", err
+		}
+		occurred := ""
+		if occurredAt.Valid {
+			occurred = FormatISO8601(occurredAt.Time)
+		}
+		fmt.Fprintf(&b,
+			"%t|%d|%d:%s|%d:%s|%d|%d|%d|%d|%d|%t|%g|%d:%s|%d:%s|%d:%s|%d:%s;",
+			ordinal.Valid,
+			ordinal.Int64,
+			len(source), source,
+			len(model), model,
+			inputTokens,
+			outputTokens,
+			cacheCreationInputTokens,
+			cacheReadInputTokens,
+			reasoningTokens,
+			cost.Valid,
+			cost.Float64,
+			len(costStatus), costStatus,
+			len(costSource), costSource,
+			len(occurred), occurred,
+			len(dedupKey.String), dedupKey.String,
 		)
 	}
 	return b.String(), rows.Err()
@@ -1021,24 +1473,28 @@ func bulkInsertMessages(
 
 		var b strings.Builder
 		b.WriteString(`INSERT INTO messages (
-			session_id, ordinal, role, content,
+			session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use,
 			content_length, is_system, model, token_usage,
 			context_tokens, output_tokens,
 			has_context_tokens, has_output_tokens,
-			claude_message_id, claude_request_id) VALUES `)
-		args := make([]any, 0, len(batch)*17)
+			claude_message_id, claude_request_id,
+			source_type, source_subtype, source_uuid,
+			source_parent_uuid, is_sidechain,
+			is_compact_boundary) VALUES `)
+		args := make([]any, 0, len(batch)*24)
 		for j, m := range batch {
 			if j > 0 {
 				b.WriteByte(',')
 			}
-			p := j*17 + 1
+			p := j*24 + 1
 			fmt.Fprintf(&b,
-				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-				p, p+1, p+2, p+3,
-				p+4, p+5, p+6, p+7, p+8,
-				p+9, p+10, p+11, p+12, p+13, p+14,
-				p+15, p+16,
+				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				p, p+1, p+2, p+3, p+4,
+				p+5, p+6, p+7, p+8, p+9,
+				p+10, p+11, p+12, p+13, p+14, p+15,
+				p+16, p+17, p+18, p+19, p+20,
+				p+21, p+22, p+23,
 			)
 			var ts any
 			if m.Timestamp != "" {
@@ -1050,13 +1506,17 @@ func bulkInsertMessages(
 			}
 			args = append(args,
 				sessionID, m.Ordinal, m.Role,
-				sanitizePG(m.Content), ts,
+				sanitizePG(m.Content),
+				sanitizePG(m.ThinkingText), ts,
 				m.HasThinking,
 				m.HasToolUse, m.ContentLength, m.IsSystem,
 				m.Model, string(m.TokenUsage),
 				m.ContextTokens, m.OutputTokens,
 				m.HasContextTokens, m.HasOutputTokens,
 				m.ClaudeMessageID, m.ClaudeRequestID,
+				m.SourceType, m.SourceSubtype, m.SourceUUID,
+				m.SourceParentUUID, m.IsSidechain,
+				m.IsCompactBoundary,
 			)
 		}
 		if _, err := tx.ExecContext(
@@ -1064,6 +1524,75 @@ func bulkInsertMessages(
 		); err != nil {
 			return fmt.Errorf(
 				"bulk inserting messages: %w", err,
+			)
+		}
+	}
+	return nil
+}
+
+func bulkInsertUsageEvents(
+	ctx context.Context, tx *sql.Tx, events []db.UsageEvent,
+) error {
+	if len(events) == 0 {
+		return nil
+	}
+	const usageBatch = 100
+	for i := 0; i < len(events); i += usageBatch {
+		end := min(i+usageBatch, len(events))
+		batch := events[i:end]
+
+		var b strings.Builder
+		b.WriteString(`INSERT INTO usage_events (
+			session_id, message_ordinal, source, model,
+			input_tokens, output_tokens,
+			cache_creation_input_tokens, cache_read_input_tokens,
+			reasoning_tokens, cost_usd, cost_status, cost_source,
+			occurred_at, dedup_key) VALUES `)
+		args := make([]any, 0, len(batch)*14)
+		for j, ev := range batch {
+			if j > 0 {
+				b.WriteByte(',')
+			}
+			p := j*14 + 1
+			fmt.Fprintf(&b,
+				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				p, p+1, p+2, p+3, p+4, p+5, p+6,
+				p+7, p+8, p+9, p+10, p+11, p+12, p+13,
+			)
+			var occurred any
+			if ev.OccurredAt != "" {
+				if t, ok := ParseSQLiteTimestamp(ev.OccurredAt); ok {
+					occurred = t
+				}
+			}
+			var ordinal any
+			if ev.MessageOrdinal != nil {
+				ordinal = *ev.MessageOrdinal
+			}
+			var cost any
+			if ev.CostUSD != nil {
+				cost = *ev.CostUSD
+			}
+			args = append(args,
+				ev.SessionID,
+				ordinal,
+				sanitizePG(ev.Source),
+				sanitizePG(ev.Model),
+				ev.InputTokens,
+				ev.OutputTokens,
+				ev.CacheCreationInputTokens,
+				ev.CacheReadInputTokens,
+				ev.ReasoningTokens,
+				cost,
+				sanitizePG(ev.CostStatus),
+				sanitizePG(ev.CostSource),
+				occurred,
+				sanitizePG(ev.DedupKey),
+			)
+		}
+		if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
+			return fmt.Errorf(
+				"bulk inserting usage_events: %w", err,
 			)
 		}
 	}
@@ -1210,6 +1739,92 @@ func bulkInsertToolResultEvents(
 		}
 	}
 	return nil
+}
+
+// pushSecretFindings replaces a session's secret findings in PG.
+// It deletes all existing rows for the session then bulk-inserts
+// the current local set. It reports whether it changed any rows
+// (deleted existing or inserted new) so the caller can bump
+// sessions.updated_at for secret-only changes that pushSession and
+// pushMessages would otherwise miss. Per-finding rules_version is
+// pushed via this table; the session-level
+// sessions.secrets_rules_version is pushed by pushSession alongside
+// the rest of the session columns.
+func (s *Sync) pushSecretFindings(
+	ctx context.Context, tx *sql.Tx, sessionID string,
+) (bool, error) {
+	res, err := tx.ExecContext(ctx,
+		`DELETE FROM secret_findings WHERE session_id = $1`,
+		sessionID,
+	)
+	if err != nil {
+		return false, fmt.Errorf(
+			"deleting pg secret_findings for %s: %w",
+			sessionID, err,
+		)
+	}
+	deleted, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf(
+			"counting deleted secret_findings for %s: %w",
+			sessionID, err,
+		)
+	}
+
+	findings, err := s.local.SessionSecretFindings(ctx, sessionID)
+	if err != nil {
+		return false, fmt.Errorf(
+			"reading local secret_findings for %s: %w",
+			sessionID, err,
+		)
+	}
+	if len(findings) == 0 {
+		return deleted > 0, nil
+	}
+
+	const sfBatch = 50
+	for i := 0; i < len(findings); i += sfBatch {
+		end := min(i+sfBatch, len(findings))
+		batch := findings[i:end]
+
+		var b strings.Builder
+		b.WriteString(`INSERT INTO secret_findings (
+			session_id, rule_name, confidence,
+			location_kind, message_ordinal,
+			call_index, event_index,
+			match_start, match_end, match_index,
+			redacted_match, rules_version) VALUES `)
+		const cols = 12
+		args := make([]any, 0, len(batch)*cols)
+		for j, f := range batch {
+			if j > 0 {
+				b.WriteByte(',')
+			}
+			p := j*cols + 1
+			fmt.Fprintf(&b,
+				"($%d,$%d,$%d,$%d,$%d,"+
+					"$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				p, p+1, p+2, p+3, p+4,
+				p+5, p+6, p+7, p+8, p+9, p+10, p+11,
+			)
+			args = append(args,
+				f.SessionID, f.RuleName, f.Confidence,
+				f.LocationKind, f.MessageOrdinal,
+				f.CallIndex, f.EventIndex,
+				f.MatchStart, f.MatchEnd, f.MatchIndex,
+				f.RedactedMatch, f.RulesVersion,
+			)
+		}
+		if _, err := tx.ExecContext(
+			ctx, b.String(), args...,
+		); err != nil {
+			return false, fmt.Errorf(
+				"bulk inserting secret_findings for %s: %w",
+				sessionID, err,
+			)
+		}
+	}
+	return true, nil
 }
 
 // normalizeSyncTimestamps ensures schema exists and normalizes

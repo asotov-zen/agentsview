@@ -37,7 +37,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f  # v6.3.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
         with:
           node-version: "24"
 
@@ -130,7 +130,7 @@ jobs:
           cp "$app_sig" "staging/${app_sig_name%.app.tar.gz.sig}_${{ matrix.arch }}.app.tar.gz.sig"
           ls -la staging/
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: agentsview-desktop-macos-${{ matrix.arch }}
           path: staging/*
@@ -156,12 +156,23 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f  # v6.3.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
         with:
           node-version: "24"
 
       - name: Setup MinGW
-        uses: msys2/setup-msys2@cafece8e6baf9247cf9b1bf95097b0b983cc558d  # v2
+        id: setup_mingw
+        continue-on-error: true
+        uses: msys2/setup-msys2@e9898307ac31d1a803454791be09ab9973336e1c  # v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+
+      - name: Setup MinGW (retry on transient failure)
+        if: steps.setup_mingw.outcome == 'failure'
+        uses: msys2/setup-msys2@e9898307ac31d1a803454791be09ab9973336e1c  # v2
         with:
           msystem: MINGW64
           update: false
@@ -208,7 +219,7 @@ jobs:
           cp desktop/src-tauri/target/release/bundle/nsis/*.nsis.zip.sig staging/
           ls -la staging/
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: agentsview-desktop-windows
           path: staging/*
@@ -245,7 +256,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f  # v6.3.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
         with:
           node-version: "24"
 
@@ -309,7 +320,7 @@ jobs:
           fi
           ls -la staging/
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: ${{ matrix.artifact_name }}
           path: staging/*
@@ -428,7 +439,7 @@ jobs:
           cat artifacts/latest.json
 
       - name: Upload installers to versioned release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe  # v2.6.1
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3.0.0
         with:
           files: |
             artifacts/*.dmg

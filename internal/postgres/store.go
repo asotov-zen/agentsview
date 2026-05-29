@@ -5,7 +5,8 @@ import (
 	"database/sql"
 	"time"
 
-	"github.com/wesm/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 )
 
 // Compile-time check: *Store satisfies db.Store.
@@ -34,6 +35,10 @@ func (s *Store) Close() error {
 	return s.pg.Close()
 }
 
+func (s *Store) SetCustomPricing(p map[string]config.CustomModelRate) {
+	s.customPricing = p
+}
+
 // SetCursorSecret sets the HMAC key used for cursor signing.
 func (s *Store) SetCursorSecret(secret []byte) {
 	s.cursorMu.Lock()
@@ -41,7 +46,9 @@ func (s *Store) SetCursorSecret(secret []byte) {
 	s.cursorSecret = append([]byte(nil), secret...)
 }
 
-// ReadOnly returns true; this is a read-only data source.
+// ReadOnly returns true because PG serve does not mutate synced
+// session content. Small dashboard-owned curation metadata (stars
+// and pins) is writable through dedicated methods.
 func (s *Store) ReadOnly() bool { return true }
 
 // GetSessionVersion returns the message count and a hash of
@@ -68,79 +75,8 @@ func (s *Store) GetSessionVersion(
 }
 
 // ------------------------------------------------------------
-// Usage stubs (not yet implemented for PG)
-//
-// These return db.ErrReadOnly so the usage HTTP handlers can map
-// them to 501 Not Implemented. Returning empty results silently
-// would look like "no usage data" on a fully populated PG
-// deployment, which is far worse than an explicit error.
+// Unsupported write stubs (return db.ErrReadOnly)
 // ------------------------------------------------------------
-
-// GetDailyUsage is not implemented for PG.
-func (s *Store) GetDailyUsage(
-	_ context.Context, _ db.UsageFilter,
-) (db.DailyUsageResult, error) {
-	return db.DailyUsageResult{}, db.ErrReadOnly
-}
-
-// GetTopSessionsByCost is not implemented for PG.
-func (s *Store) GetTopSessionsByCost(
-	_ context.Context, _ db.UsageFilter, _ int,
-) ([]db.TopSessionEntry, error) {
-	return nil, db.ErrReadOnly
-}
-
-// GetUsageSessionCounts is not implemented for PG.
-func (s *Store) GetUsageSessionCounts(
-	_ context.Context, _ db.UsageFilter,
-) (db.UsageSessionCounts, error) {
-	return db.UsageSessionCounts{}, db.ErrReadOnly
-}
-
-// ------------------------------------------------------------
-// Write stubs (all return db.ErrReadOnly)
-// ------------------------------------------------------------
-
-// StarSession is not supported in read-only mode.
-func (s *Store) StarSession(_ string) (bool, error) {
-	return false, db.ErrReadOnly
-}
-
-// UnstarSession is not supported in read-only mode.
-func (s *Store) UnstarSession(_ string) error {
-	return db.ErrReadOnly
-}
-
-// ListStarredSessionIDs returns an empty slice.
-func (s *Store) ListStarredSessionIDs(
-	_ context.Context,
-) ([]string, error) {
-	return []string{}, nil
-}
-
-// BulkStarSessions is not supported in read-only mode.
-func (s *Store) BulkStarSessions(_ []string) error {
-	return db.ErrReadOnly
-}
-
-// PinMessage is not supported in read-only mode.
-func (s *Store) PinMessage(
-	_ string, _ int64, _ *string,
-) (int64, error) {
-	return 0, db.ErrReadOnly
-}
-
-// UnpinMessage is not supported in read-only mode.
-func (s *Store) UnpinMessage(_ string, _ int64) error {
-	return db.ErrReadOnly
-}
-
-// ListPinnedMessages returns an empty slice.
-func (s *Store) ListPinnedMessages(
-	_ context.Context, _ string, _ string,
-) ([]db.PinnedMessage, error) {
-	return []db.PinnedMessage{}, nil
-}
 
 // InsertInsight is not supported in read-only mode.
 func (s *Store) InsertInsight(
@@ -214,4 +150,12 @@ func (s *Store) ReplaceSessionMessages(
 	_ string, _ []db.Message,
 ) error {
 	return db.ErrReadOnly
+}
+
+// WriteSessionBatchAtomic is not supported in read-only mode.
+func (s *Store) WriteSessionBatchAtomic(
+	_ []db.SessionBatchWrite,
+	_ ...func() error,
+) (db.SessionBatchResult, error) {
+	return db.SessionBatchResult{}, db.ErrReadOnly
 }

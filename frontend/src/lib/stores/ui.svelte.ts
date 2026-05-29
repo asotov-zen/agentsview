@@ -35,7 +35,9 @@ export const ALL_BLOCK_TYPES: BlockType[] = [
 
 const BLOCK_FILTER_KEY = "agentsview-block-filters";
 const TRANSCRIPT_MODE_KEY = "agentsview-transcript-mode";
-const MINIMAP_KEY = "agentsview-activity-minimap";
+const VITALS_KEY = "agentsview-session-vitals";
+const SIGNAL_PANEL_KEY = "agentsview-signal-panel";
+const FOLLOW_LATEST_KEY = "agentsview-follow-latest";
 
 function readBlockFilters(): Set<BlockType> {
   try {
@@ -171,9 +173,16 @@ class UIStore {
 
   sidebarOpen: boolean = $state(true);
   isMobileViewport: boolean = $state(false);
-  activityMinimapOpen: boolean = $state(
-    readStoredBool(MINIMAP_KEY, false),
+  vitalsOpen: boolean = $state(
+    readStoredBool(VITALS_KEY, false),
   );
+  signalPanelOpen: boolean = $state(
+    readStoredBool(SIGNAL_PANEL_KEY, false),
+  );
+  followLatest: boolean = $state(
+    readStoredBool(FOLLOW_LATEST_KEY, false),
+  );
+  followLatestRequest: number = $state(0);
 
   /** Set of block types currently visible. */
   visibleBlocks: Set<BlockType> = $state(readBlockFilters());
@@ -249,8 +258,30 @@ class UIStore {
       $effect(() => {
         try {
           localStorage?.setItem(
-            MINIMAP_KEY,
-            String(this.activityMinimapOpen),
+            VITALS_KEY,
+            String(this.vitalsOpen),
+          );
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(
+            SIGNAL_PANEL_KEY,
+            String(this.signalPanelOpen),
+          );
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(
+            FOLLOW_LATEST_KEY,
+            String(this.followLatest),
           );
         } catch {
           // ignore
@@ -383,9 +414,24 @@ class UIStore {
   }
 
   scrollToOrdinal(ordinal: number, sessionId?: string) {
+    this.followLatest = false;
     this.selectedOrdinal = ordinal;
     this.pendingScrollOrdinal = ordinal;
     this.pendingScrollSession = sessionId ?? null;
+  }
+
+  setFollowLatest(enabled: boolean) {
+    this.followLatest = enabled;
+    if (enabled) {
+      this.followLatestRequest += 1;
+      this.selectedOrdinal = null;
+      this.pendingScrollOrdinal = null;
+      this.pendingScrollSession = null;
+    }
+  }
+
+  toggleFollowLatest() {
+    this.setFollowLatest(!this.followLatest);
   }
 
   zoomIn() {
@@ -414,8 +460,16 @@ class UIStore {
     this.sidebarOpen = false;
   }
 
-  toggleActivityMinimap() {
-    this.activityMinimapOpen = !this.activityMinimapOpen;
+  toggleVitals() {
+    this.vitalsOpen = !this.vitalsOpen;
+  }
+
+  closeVitals() {
+    this.vitalsOpen = false;
+  }
+
+  toggleSignalPanel() {
+    this.signalPanelOpen = !this.signalPanelOpen;
   }
 
   closeAll() {
