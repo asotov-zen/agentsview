@@ -16,7 +16,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     file_inode  INTEGER,
     file_device INTEGER,
     file_hash   TEXT,
-    cwd         TEXT,
     local_modified_at TEXT,
     parent_session_id TEXT,
     relationship_type TEXT NOT NULL DEFAULT '',

@@ -5001,7 +5001,6 @@ func toDBSession(pw pendingWrite) db.Session {
 		UserMessageCount:     pw.sess.UserMessageCount,
 		ParentSessionID:      strPtr(pw.sess.ParentSessionID),
 		RelationshipType:     string(pw.sess.RelationshipType),
-		Cwd:                  strPtr(pw.sess.Cwd),
 		TotalOutputTokens:    pw.sess.TotalOutputTokens,
 		PeakContextTokens:    pw.sess.PeakContextTokens,
 		HasTotalOutputTokens: hasTotal,
