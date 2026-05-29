@@ -673,6 +673,19 @@ func (db *DB) migrateColumns() error {
 			)
 		}
 	}
+	// Normalize legacy NULL cwd values. Older fork databases created
+	// sessions.cwd as a nullable TEXT column, so the ADD COLUMN
+	// migration above is skipped (the column already exists) and any
+	// rows written before this merge can still hold NULL. The merged
+	// code scans cwd into a non-nullable string, so backfill NULL to ''
+	// to keep those archived sessions readable. Idempotent.
+	if res, err := w.Exec(
+		"UPDATE sessions SET cwd = '' WHERE cwd IS NULL",
+	); err != nil {
+		return fmt.Errorf("backfilling NULL cwd: %w", err)
+	} else if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("migration: backfilled %d NULL cwd values", n)
+	}
 	if err := db.createPartialIndexesLocked(w); err != nil {
 		return err
 	}
