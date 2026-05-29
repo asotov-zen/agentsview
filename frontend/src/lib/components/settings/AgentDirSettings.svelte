@@ -14,8 +14,14 @@
     iflow: "iFlow",
     "vscode-copilot": "VSCode Copilot",
     pi: "Pi",
+    qwen: "Qwen Code",
     openclaw: "OpenClaw",
+    qclaw: "QClaw",
     kimi: "Kimi",
+    workbuddy: "WorkBuddy",
+    piebald: "Piebald",
+    antigravity: "Antigravity",
+    "antigravity-cli": "Antigravity CLI",
   };
 </script>
 

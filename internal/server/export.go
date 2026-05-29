@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 // getSessionWithMessages fetches a session and its messages by ID,
@@ -316,11 +316,13 @@ type exportData struct {
 }
 
 type exportMessage struct {
-	RoleClass   string
-	ExtraClass  string
-	Role        string
-	Timestamp   string
-	ContentHTML template.HTML
+	Ordinal       int
+	RoleClass     string
+	ExtraClass    string
+	Role          string
+	Timestamp     string
+	ContentHTML   template.HTML
+	FocusedHidden bool
 }
 
 var exportTmpl = template.Must(
@@ -497,6 +499,9 @@ main { max-width: 900px; margin: 0 auto; padding: 16px; }
 #thinking-toggle:checked ~ main .message.thinking-only {
   display: block;
 }
+#transcript-focused:checked ~ main .message.focused-hidden {
+  display: none;
+}
 .tool-block {
   border-left: 2px solid var(--accent-amber);
   background: var(--tool-bg);
@@ -520,6 +525,8 @@ main { max-width: 900px; margin: 0 auto; padding: 16px; }
   color: var(--text-primary);
   cursor: pointer; font-size: 11px;
 }
+#transcript-normal:checked ~ header label[for="transcript-normal"],
+#transcript-focused:checked ~ header label[for="transcript-focused"],
 #thinking-toggle:checked ~ header label[for="thinking-toggle"],
 #sort-toggle:checked ~ header label[for="sort-toggle"] {
   background: var(--accent-blue); color: #fff;
@@ -548,6 +555,8 @@ footer a:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
+<input type="radio" id="transcript-normal" name="transcript-mode" class="toggle-input" checked>
+<input type="radio" id="transcript-focused" name="transcript-mode" class="toggle-input">
 <input type="checkbox" id="thinking-toggle" class="toggle-input">
 <input type="checkbox" id="sort-toggle" class="toggle-input">
 <header>
@@ -561,6 +570,8 @@ footer a:hover { text-decoration: underline; }
   </div>
 </div>
 <div class="controls">
+  <label for="transcript-normal" class="toggle-label">Normal</label>
+  <label for="transcript-focused" class="toggle-label">Focused</label>
   <label for="thinking-toggle" class="toggle-label">Thinking</label>
   <label for="sort-toggle" class="toggle-label">Newest first</label>
   <button class="theme-btn" onclick="document.documentElement.classList.toggle('dark');this.textContent=document.documentElement.classList.contains('dark')?'Light':'Dark'">Dark</button>
@@ -569,10 +580,10 @@ footer a:hover { text-decoration: underline; }
 </header>
 <main><div class="messages">
 {{- range .Messages}}
-<div class="message {{.RoleClass}}{{.ExtraClass}}"><div class="message-header"><span class="message-role">{{.Role}}</span><span class="message-time">{{.Timestamp}}</span></div><div class="message-content">{{.ContentHTML}}</div></div>
+<div class="message {{.RoleClass}}{{.ExtraClass}}{{if .FocusedHidden}} focused-hidden{{end}}" data-ordinal="{{.Ordinal}}"><div class="message-header"><span class="message-role">{{.Role}}</span><span class="message-time">{{.Timestamp}}</span></div><div class="message-content">{{.ContentHTML}}</div></div>
 {{- end}}
 </div></main>
-<footer>Exported from <a href="https://github.com/wesm/agentsview">agentsview</a></footer>
+<footer>Exported from <a href="https://github.com/kenn-io/agentsview">agentsview</a></footer>
 </body></html>`
 
 func generateExportHTML(
@@ -598,6 +609,7 @@ func generateExportHTML(
 		Messages:     make([]exportMessage, len(msgs)),
 	}
 
+	focusedVisible := focusedExportOrdinals(msgs)
 	for i, m := range msgs {
 		roleClass := "unknown"
 		if m.Role == "user" || m.Role == "assistant" {
@@ -609,11 +621,13 @@ func generateExportHTML(
 		}
 
 		data.Messages[i] = exportMessage{
-			RoleClass:   roleClass,
-			ExtraClass:  extraClass,
-			Role:        m.Role,
-			Timestamp:   formatTimestamp(m.Timestamp),
-			ContentHTML: template.HTML(formatContentForExport(m.Content)),
+			Ordinal:       m.Ordinal,
+			RoleClass:     roleClass,
+			ExtraClass:    extraClass,
+			Role:          m.Role,
+			Timestamp:     formatTimestamp(m.Timestamp),
+			ContentHTML:   template.HTML(formatContentForExport(m.Content)),
+			FocusedHidden: !focusedVisible[m.Ordinal],
 		}
 	}
 
@@ -632,11 +646,7 @@ var (
 	thinkingLegacyRe = regexp.MustCompile(
 		`(?s)\[Thinking\]\n?(.*?)(?:\n\[|\n\n|$)`)
 	toolBlockRe = regexp.MustCompile(
-		`(?s)\[(Tool|Read|Write|Edit|Bash|Glob|Grep|Task|Agent|` +
-			`Question|Todo List|Entering Plan Mode|` +
-			`Exiting Plan Mode|exec_command|shell_command|` +
-			`write_stdin|apply_patch|shell|parallel|` +
-			`view_image|request_user_input|update_plan` +
+		`(?s)\[(` + exportToolNames +
 			`)([^\]]*)\](.*?)(?:\n\[|\n\n|$)`)
 )
 
@@ -661,6 +671,75 @@ func isThinkingOnly(content string) bool {
 	without := thinkingMarkedRe.ReplaceAllString(content, "")
 	without = thinkingLegacyRe.ReplaceAllString(without, "")
 	return strings.TrimSpace(without) == ""
+}
+
+func focusedExportOrdinals(msgs []db.Message) map[int]bool {
+	visible := make(map[int]bool, len(msgs))
+	pendingOrdinal := 0
+	hasPendingAssistant := false
+	toolAfterPendingAssistant := false
+
+	flushPending := func() {
+		if hasPendingAssistant && !toolAfterPendingAssistant {
+			visible[pendingOrdinal] = true
+		}
+		hasPendingAssistant = false
+		toolAfterPendingAssistant = false
+	}
+
+	for _, m := range msgs {
+		if m.IsCompactBoundary {
+			flushPending()
+			visible[m.Ordinal] = true
+			continue
+		}
+
+		if m.IsSystem || isThinkingOnly(m.Content) {
+			continue
+		}
+
+		if isExportToolOnly(m) {
+			if hasPendingAssistant {
+				toolAfterPendingAssistant = true
+			}
+			continue
+		}
+
+		if m.Role == "user" {
+			flushPending()
+			visible[m.Ordinal] = true
+			continue
+		}
+
+		// Match the app's focused transcript mode: consecutive
+		// assistant-like messages collapse to the last visible answer.
+		pendingOrdinal = m.Ordinal
+		hasPendingAssistant = true
+		toolAfterPendingAssistant = false
+	}
+
+	flushPending()
+	return visible
+}
+
+func isExportToolOnly(m db.Message) bool {
+	if m.Role != "assistant" || !m.HasToolUse {
+		return false
+	}
+	for _, segment := range parseMarkdownSegments(m) {
+		switch segment.Type {
+		case markdownSegmentThinking, markdownSegmentTool:
+			continue
+		case markdownSegmentText:
+			if strings.TrimSpace(segment.Content) == "" {
+				continue
+			}
+			return false
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // parseTimestamp tries RFC3339Nano then RFC3339.

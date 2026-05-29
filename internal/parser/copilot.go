@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -96,6 +97,9 @@ func (b *copilotSessionBuilder) handleUserMessage(
 	if content == "" {
 		return
 	}
+	if isCopilotSyntheticSkillMessage(data, content) {
+		return
+	}
 
 	if b.firstMessage == "" {
 		b.firstMessage = truncate(
@@ -111,6 +115,16 @@ func (b *copilotSessionBuilder) handleUserMessage(
 		ContentLength: len(content),
 	})
 	b.ordinal++
+}
+
+func isCopilotSyntheticSkillMessage(
+	data gjson.Result, content string,
+) bool {
+	source := strings.TrimSpace(data.Get("source").Str)
+	if strings.HasPrefix(source, "skill-") {
+		return true
+	}
+	return strings.HasPrefix(content, "<skill-context")
 }
 
 func (b *copilotSessionBuilder) handleAssistantMessage(
@@ -210,8 +224,8 @@ func (b *copilotSessionBuilder) handleToolComplete(
 func (b *copilotSessionBuilder) handleAssistantReasoning() {
 	// Mark the most recent assistant message as having
 	// thinking, if one exists.
-	for i := len(b.messages) - 1; i >= 0; i-- {
-		if b.messages[i].Role == RoleAssistant {
+	for i, v := range slices.Backward(b.messages) {
+		if v.Role == RoleAssistant {
 			b.messages[i].HasThinking = true
 			return
 		}
@@ -227,6 +241,36 @@ func formatCopilotToolCalls(
 			formatToolHeader(tc.Category, tc.ToolName))
 	}
 	return strings.Join(parts, "\n")
+}
+
+// readCopilotWorkspaceName reads the session name from the
+// workspace.yaml sibling file in a directory-format session.
+// Returns an empty string for flat .jsonl sessions or when
+// no name is present.
+func readCopilotWorkspaceName(eventsPath string) string {
+	if filepath.Base(eventsPath) != "events.jsonl" {
+		return ""
+	}
+	yamlPath := filepath.Join(
+		filepath.Dir(eventsPath), "workspace.yaml",
+	)
+	data, err := os.ReadFile(yamlPath)
+	if err != nil {
+		return ""
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		after, ok := strings.CutPrefix(line, "name: ")
+		if !ok {
+			continue
+		}
+		name := strings.TrimSpace(after)
+		if name != "" {
+			return truncate(
+				strings.ReplaceAll(name, "\n", " "), 300,
+			)
+		}
+	}
+	return ""
 }
 
 // ParseCopilotSession parses a Copilot JSONL session file.
@@ -286,6 +330,14 @@ func ParseCopilotSession(
 	}
 	sessionID = "copilot:" + sessionID
 
+	// Prefer the workspace.yaml name (LLM-generated or user-set
+	// title) over the raw first user message. Falls back to the
+	// first user message when no name is present.
+	firstMessage := b.firstMessage
+	if wsName := readCopilotWorkspaceName(path); wsName != "" {
+		firstMessage = wsName
+	}
+
 	userCount := 0
 	for _, m := range b.messages {
 		if m.Role == RoleUser && m.Content != "" {
@@ -299,7 +351,7 @@ func ParseCopilotSession(
 		Machine:          machine,
 		Agent:            AgentCopilot,
 		Cwd:              b.cwd,
-		FirstMessage:     b.firstMessage,
+		FirstMessage:     firstMessage,
 		StartedAt:        b.startedAt,
 		EndedAt:          b.endedAt,
 		MessageCount:     len(b.messages),

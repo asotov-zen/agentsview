@@ -13,10 +13,10 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/wesm/agentsview/internal/config"
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/postgres"
-	"github.com/wesm/agentsview/internal/server"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/postgres"
+	"go.kenn.io/agentsview/internal/server"
 )
 
 type PGPushConfig struct {
@@ -78,6 +78,7 @@ func runPGPush(cfg PGPushConfig) {
 			"are mutually exclusive")
 	}
 
+	applyClassifierConfig(appCfg)
 	database, err := db.Open(appCfg.DBPath)
 	if err != nil {
 		fatal("opening database: %v", err)
@@ -101,6 +102,8 @@ func runPGPush(cfg PGPushConfig) {
 	didResync := runLocalSync(appCfg, database, cfg.Full)
 	forceFull := cfg.Full || didResync
 
+	fmt.Println("Connecting to PostgreSQL...")
+	connectStart := time.Now()
 	ps, err := postgres.New(
 		pgCfg.URL, pgCfg.Schema, database,
 		pgCfg.MachineName, pgCfg.AllowInsecure,
@@ -113,16 +116,36 @@ func runPGPush(cfg PGPushConfig) {
 		fatal("pg push: %v", err)
 	}
 	defer ps.Close()
+	fmt.Printf(
+		"Connected to PostgreSQL in %s\n",
+		time.Since(connectStart).Round(time.Millisecond),
+	)
 
 	ctx, stop := signal.NotifyContext(
 		context.Background(), os.Interrupt,
 	)
 	defer stop()
 
+	fmt.Println("Preparing PostgreSQL schema...")
+	schemaStart := time.Now()
 	if err := ps.EnsureSchema(ctx); err != nil {
 		fatal("pg push schema: %v", err)
 	}
-	result, err := ps.Push(ctx, forceFull)
+	fmt.Printf(
+		"PostgreSQL schema ready in %s\n",
+		time.Since(schemaStart).Round(time.Millisecond),
+	)
+	fmt.Println("Starting PostgreSQL push...")
+	result, err := ps.Push(ctx, forceFull,
+		func(p postgres.PushProgress) {
+			fmt.Printf(
+				"\rPushing... %d/%d sessions, %d messages",
+				p.SessionsDone, p.SessionsTotal,
+				p.MessagesDone,
+			)
+		},
+	)
+	fmt.Print("\r\033[K") // clear progress line
 	if err != nil {
 		fatal("pg push: %v", err)
 	}
@@ -148,6 +171,7 @@ func runPGStatus() {
 	}
 	setupLogFile(appCfg.DataDir)
 
+	applyClassifierConfig(appCfg)
 	database, err := db.Open(appCfg.DBPath)
 	if err != nil {
 		fatal("opening database: %v", err)
@@ -205,15 +229,11 @@ func loadPGServeConfig(cmd *cobra.Command) (config.Config, string, error) {
 
 func runPGServe(appCfg config.Config, basePath string) {
 	setupLogFile(appCfg.DataDir)
-	// Enable remote access with auth when binding to a
-	// non-loopback address; keep it off for localhost.
-	if !isLoopbackHost(appCfg.Host) {
-		appCfg.RemoteAccess = true
+	// Generate auth token when auth is explicitly required.
+	if appCfg.RequireAuth {
 		if err := appCfg.EnsureAuthToken(); err != nil {
 			fatal("pg serve: generating auth token: %v", err)
 		}
-	} else {
-		appCfg.RemoteAccess = false
 	}
 
 	if err := validateServeConfig(appCfg); err != nil {
@@ -228,6 +248,7 @@ func runPGServe(appCfg config.Config, basePath string) {
 		fatal("pg serve: url not configured")
 	}
 
+	applyClassifierConfig(appCfg)
 	store, err := postgres.NewStore(
 		pgCfg.URL, pgCfg.Schema, pgCfg.AllowInsecure,
 	)
@@ -235,6 +256,10 @@ func runPGServe(appCfg config.Config, basePath string) {
 		fatal("pg serve: %v", err)
 	}
 	defer store.Close()
+
+	if len(appCfg.CustomModelPricing) > 0 {
+		store.SetCustomPricing(appCfg.CustomModelPricing)
+	}
 
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
@@ -300,7 +325,22 @@ func runPGServe(appCfg config.Config, basePath string) {
 		fatal("pg serve: %v", err)
 	}
 
-	if rt.Cfg.RemoteAccess && rt.Cfg.AuthToken != "" {
+	// Write the state file so CLI commands can discover this
+	// daemon. ReadOnly=true marks it as pg serve (read-only)
+	// so clients can select an appropriate transport.
+	if _, sfErr := server.WriteStateFile(
+		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version, true,
+	); sfErr != nil {
+		log.Printf(
+			"warning: could not write state file: %v"+
+				" (pg serve daemon may not be discoverable by CLI)",
+			sfErr,
+		)
+	} else {
+		defer server.RemoveStateFile(rt.Cfg.DataDir, rt.Cfg.Port)
+	}
+
+	if rt.Cfg.RequireAuth && rt.Cfg.AuthToken != "" {
 		fmt.Printf("Auth token: %s\n", rt.Cfg.AuthToken)
 	}
 	if rt.PublicURL == rt.LocalURL {

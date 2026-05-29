@@ -20,10 +20,16 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     label: "VS Code Copilot",
   },
   { name: "pi", color: "var(--accent-indigo)", label: "Pi" },
+  { name: "qwen", color: "var(--accent-cyan)", label: "Qwen Code" },
   {
     name: "openclaw",
     color: "var(--accent-orange)",
     label: "OpenClaw",
+  },
+  {
+    name: "qclaw",
+    color: "var(--accent-orange)",
+    label: "QClaw",
   },
   { name: "iflow", color: "var(--accent-sky)", label: "iFlow" },
   { name: "kimi", color: "var(--accent-pink)", label: "Kimi" },
@@ -31,7 +37,19 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "chatgpt", color: "var(--accent-lime)", label: "ChatGPT" },
   { name: "kiro", color: "var(--accent-lime)", label: "Kiro" },
   { name: "kiro-ide", color: "var(--accent-lime)", label: "Kiro IDE" },
-  { name: "cortex", color: "var(--accent-cyan)", label: "Cortex Code" }
+  { name: "cortex", color: "var(--accent-cyan)", label: "Cortex Code" },
+  { name: "workbuddy", color: "var(--accent-violet)", label: "WorkBuddy" },
+  { name: "piebald", color: "var(--accent-orange)", label: "Piebald" },
+  {
+    name: "antigravity",
+    color: "var(--accent-violet)",
+    label: "Antigravity",
+  },
+  {
+    name: "antigravity-cli",
+    color: "var(--accent-violet)",
+    label: "Antigravity CLI",
+  },
 ];
 
 const agentColorMap = new Map(

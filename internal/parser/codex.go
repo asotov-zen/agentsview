@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,6 +50,13 @@ type codexSessionBuilder struct {
 	pendingAgentEvents   map[string][]codexPendingEvent
 	orphanNotificationIx map[string]int
 	lastTokenUsageRaw    string // dedup streaming duplicates
+
+	// Most recent task lifecycle event seen on the file. Used to
+	// classify termination_status — task_complete maps to
+	// "awaiting user input" while task_started in flight (no
+	// matching task_complete after) means the agent was working
+	// when the file was last written.
+	lastTaskEvent string
 }
 
 type codexToolCallRef struct {
@@ -158,9 +166,11 @@ func (b *codexSessionBuilder) handleResponseItem(
 		return
 	}
 
-	isSystem := role == "user" && isCodexSystemMessage(content)
+	if role == "user" && isCodexSystemMessage(content) {
+		return
+	}
 
-	if role == "user" && !isSystem && b.firstMessage == "" {
+	if role == "user" && b.firstMessage == "" {
 		b.firstMessage = truncate(
 			strings.ReplaceAll(content, "\n", " "), 300,
 		)
@@ -177,7 +187,6 @@ func (b *codexSessionBuilder) handleResponseItem(
 		Role:          RoleType(role),
 		Content:       content,
 		Timestamp:     ts,
-		IsSystem:      isSystem,
 		ContentLength: len(content),
 		ModelID:       modelID,
 		ProviderID:    providerID,
@@ -186,12 +195,20 @@ func (b *codexSessionBuilder) handleResponseItem(
 	b.ordinal++
 }
 
-func (b *codexSessionBuilder) handleEventMsg(
+func (b *codexSessionBuilder) handleEventMsg(payload gjson.Result) {
+	switch payload.Get("type").Str {
+	case "task_started", "task_complete", "turn_aborted":
+		b.lastTaskEvent = payload.Get("type").Str
+	case "token_count":
+		b.handleTokenCountEvent(payload)
+	case "collab_agent_spawn_end":
+		b.handleCollabAgentSpawnEnd(payload)
+	}
+}
+
+func (b *codexSessionBuilder) handleTokenCountEvent(
 	payload gjson.Result,
 ) {
-	if payload.Get("type").Str != "token_count" {
-		return
-	}
 	raw := payload.Get("info.last_token_usage").Raw
 	if raw == "" || raw == b.lastTokenUsageRaw {
 		return
@@ -201,34 +218,54 @@ func (b *codexSessionBuilder) handleEventMsg(
 	// Find last assistant message without usage in the current
 	// turn. Stop at user message boundary so we don't cross
 	// turns.
-	for i := len(b.messages) - 1; i >= 0; i-- {
-		if b.messages[i].Role == RoleUser {
+	for i, v := range slices.Backward(b.messages) {
+		if v.Role == RoleUser {
 			break
 		}
-		if b.messages[i].Role == RoleAssistant &&
-			b.messages[i].TokenUsage == nil {
+		if v.Role == RoleAssistant &&
+			v.TokenUsage == nil {
 			b.applyCodexTokenUsage(&b.messages[i], raw)
 			return
 		}
 	}
 }
 
+func (b *codexSessionBuilder) handleCollabAgentSpawnEnd(
+	payload gjson.Result,
+) {
+	callID := payload.Get("call_id").Str
+	agentID := strings.TrimSpace(payload.Get("new_thread_id").Str)
+	if callID == "" || agentID == "" {
+		return
+	}
+	b.agentSpawnCalls[agentID] = callID
+	b.setCallSubagentSessionID(callID, codexSubagentSessionID(agentID))
+}
+
 // applyCodexTokenUsage normalizes Codex token usage fields
-// into the format expected by the usage query:
+// into the Anthropic-style shape expected by the usage and cost
+// queries. Codex reports input_tokens as the full input count
+// (cached portion included), while the downstream cost formula
+// treats input_tokens as the uncached remainder and bills
+// cache_read_input_tokens separately. Subtracting cached here
+// prevents double-counting the cached portion at the full input
+// rate.
 //
-//	input_tokens        → input_tokens
-//	output_tokens       → output_tokens
-//	cached_input_tokens → cache_read_input_tokens
+//	input_tokens - cached_input_tokens → input_tokens  (uncached)
+//	output_tokens                      → output_tokens
+//	cached_input_tokens                → cache_read_input_tokens
 func (b *codexSessionBuilder) applyCodexTokenUsage(
 	msg *ParsedMessage, raw string,
 ) {
 	usage := gjson.Parse(raw)
-	input := int(usage.Get("input_tokens").Int())
+	totalInput := int(usage.Get("input_tokens").Int())
 	cached := int(usage.Get("cached_input_tokens").Int())
 	output := int(usage.Get("output_tokens").Int())
 
+	uncached := max(totalInput-cached, 0)
+
 	normalized := map[string]int{
-		"input_tokens":            input,
+		"input_tokens":            uncached,
 		"output_tokens":           output,
 		"cache_read_input_tokens": cached,
 	}
@@ -239,8 +276,8 @@ func (b *codexSessionBuilder) applyCodexTokenUsage(
 	msg.TokenUsage = j
 	msg.OutputTokens = output
 	msg.HasOutputTokens = output > 0
-	msg.ContextTokens = input + cached
-	msg.HasContextTokens = input > 0 || cached > 0
+	msg.ContextTokens = uncached + cached
+	msg.HasContextTokens = totalInput > 0 || cached > 0
 }
 
 func (b *codexSessionBuilder) handleFunctionCall(
@@ -258,7 +295,7 @@ func (b *codexSessionBuilder) handleFunctionCall(
 	content := formatCodexFunctionCall(name, payload)
 	inputJSON := extractCodexInputJSON(payload)
 	waitAgentIDs := []string(nil)
-	if name == "wait" && callID != "" {
+	if isCodexWaitAgentCall(name) && callID != "" {
 		args, _ := parseCodexFunctionArgs(payload)
 		waitAgentIDs = codexWaitAgentIDs(args)
 	}
@@ -294,7 +331,7 @@ func (b *codexSessionBuilder) handleFunctionCall(
 	}
 	b.ordinal++
 
-	if name == "wait" && callID != "" {
+	if isCodexWaitAgentCall(name) && callID != "" {
 		for _, agentID := range waitAgentIDs {
 			b.agentWaitCalls[agentID] = callID
 			b.claimPendingAgentEvents(callID, agentID)
@@ -322,7 +359,8 @@ func (b *codexSessionBuilder) handleFunctionCallOutput(
 			return
 		}
 		b.agentSpawnCalls[agentID] = callID
-	case "wait":
+		b.setCallSubagentSessionID(callID, codexSubagentSessionID(agentID))
+	case "wait", "wait_agent":
 		status := output.Get("status")
 		if !status.Exists() || !status.IsObject() {
 			return
@@ -345,6 +383,29 @@ func (b *codexSessionBuilder) handleFunctionCallOutput(
 			return true
 		})
 	}
+}
+
+// setCallSubagentSessionID links a tool call to the session of
+// the subagent it spawned. Callers must invoke this only after
+// the originating function_call has been processed (which
+// populates b.callRefs[callID]); otherwise the link is silently
+// dropped. In real codex session files the spawn function_call
+// always precedes both its function_call_output and the
+// collab_agent_spawn_end event_msg.
+func (b *codexSessionBuilder) setCallSubagentSessionID(
+	callID, sessionID string,
+) {
+	if callID == "" || sessionID == "" {
+		return
+	}
+	ref, ok := b.callRefs[callID]
+	if !ok || ref.messageIndex < 0 || ref.messageIndex >= len(b.messages) {
+		return
+	}
+	if ref.callIndex < 0 || ref.callIndex >= len(b.messages[ref.messageIndex].ToolCalls) {
+		return
+	}
+	b.messages[ref.messageIndex].ToolCalls[ref.callIndex].SubagentSessionID = sessionID
 }
 
 func (b *codexSessionBuilder) handleSubagentNotification(
@@ -480,6 +541,9 @@ func codexSubagentSessionID(agentID string) string {
 	agentID = strings.TrimSpace(agentID)
 	if agentID == "" {
 		return ""
+	}
+	if strings.HasPrefix(agentID, "codex:") {
+		return agentID
 	}
 	return "codex:" + agentID
 }
@@ -937,6 +1001,9 @@ func codexWaitAgentIDs(args gjson.Result) []string {
 		return nil
 	}
 	ids := args.Get("ids")
+	if !ids.Exists() {
+		ids = args.Get("targets")
+	}
 	if !ids.Exists() || !ids.IsArray() {
 		return nil
 	}
@@ -950,6 +1017,10 @@ func codexWaitAgentIDs(args gjson.Result) []string {
 		out = append(out, id)
 	}
 	return out
+}
+
+func isCodexWaitAgentCall(name string) bool {
+	return name == "wait" || name == "wait_agent"
 }
 
 func parseCodexSubagentNotification(
@@ -966,7 +1037,10 @@ func parseCodexSubagentNotification(
 		return "", "", ""
 	}
 	parsed := gjson.Parse(body)
-	agentID = strings.TrimSpace(parsed.Get("agent_id").Str)
+	agentID = firstNonEmpty(
+		parsed.Get("agent_id").Str,
+		parsed.Get("agent_path").Str,
+	)
 	status := parsed.Get("status")
 	statusName, text = codexTerminalSubagentEvent(status)
 	return agentID, statusName, text
@@ -1131,16 +1205,17 @@ func ParseCodexSession(
 	}
 
 	sess := &ParsedSession{
-		ID:               sessionID,
-		Project:          b.project,
-		Machine:          machine,
-		Agent:            AgentCodex,
-		Cwd:              b.cwd,
-		FirstMessage:     b.firstMessage,
-		StartedAt:        b.startedAt,
-		EndedAt:          b.endedAt,
-		MessageCount:     len(b.messages),
-		UserMessageCount: userCount,
+		ID:                sessionID,
+		Project:           b.project,
+		Machine:           machine,
+		Agent:             AgentCodex,
+		Cwd:               b.cwd,
+		FirstMessage:      b.firstMessage,
+		StartedAt:         b.startedAt,
+		EndedAt:           b.endedAt,
+		MessageCount:      len(b.messages),
+		UserMessageCount:  userCount,
+		TerminationStatus: classifyCodexTermination(b.lastTaskEvent),
 		File: FileInfo{
 			Path:  path,
 			Size:  info.Size(),
@@ -1151,6 +1226,26 @@ func ParseCodexSession(
 	accumulateMessageTokenUsage(sess, b.messages)
 
 	return sess, b.messages, nil
+}
+
+// classifyCodexTermination maps the most recent task lifecycle
+// event seen on a Codex session file to a TerminationStatus.
+// Codex emits explicit task_started / task_complete / turn_aborted
+// events, so the classification is unambiguous when any are
+// present. Returns "" (unknown) for files where no task event
+// was seen — typically very short or malformed sessions.
+func classifyCodexTermination(lastTaskEvent string) TerminationStatus {
+	switch lastTaskEvent {
+	case "task_complete":
+		return TerminationAwaitingUser
+	case "task_started", "turn_aborted":
+		// task_started without a matching task_complete after
+		// means the agent was mid-turn when the file last
+		// flushed — treat the same as an orphan tool call.
+		// turn_aborted means the user interrupted; same shape.
+		return TerminationToolCallPending
+	}
+	return ""
 }
 
 // readCodexModelAtOffset scans a Codex JSONL file from the
@@ -1244,15 +1339,19 @@ func ParseCodexSessionFrom(
 }
 
 // IsIncrementalFullParseFallback reports whether an incremental
-// Codex parse error requires the caller to fall back to a full parse.
+// parse error requires the caller to fall back to a full parse.
 func IsIncrementalFullParseFallback(err error) bool {
-	return errors.Is(err, errCodexIncrementalNeedsFullParse)
+	return errors.Is(err, errCodexIncrementalNeedsFullParse) ||
+		errors.Is(err, ErrClaudeIncrementalNeedsFullParse)
 }
 
 func isCodexSystemMessage(content string) bool {
+	trimmed := strings.TrimSpace(content)
 	return strings.HasPrefix(content, "# AGENTS.md") ||
 		strings.HasPrefix(content, "<environment_context>") ||
 		strings.HasPrefix(content, "<INSTRUCTIONS>") ||
+		strings.HasPrefix(trimmed, "<turn_aborted>") ||
+		strings.HasPrefix(trimmed, "<skill>") ||
 		isCodexSubagentNotification(content)
 }
 
@@ -1264,14 +1363,19 @@ func isCodexSubagentNotification(content string) bool {
 }
 
 func codexIncrementalNeedsFullParse(line string) bool {
-	if gjson.Get(line, "type").Str != codexTypeResponseItem {
+	switch gjson.Get(line, "type").Str {
+	case codexTypeEventMsg:
+		return gjson.Get(line, "payload.type").Str ==
+			"collab_agent_spawn_end"
+	case codexTypeResponseItem:
+	default:
 		return false
 	}
 
 	payload := gjson.Get(line, "payload")
 	switch payload.Get("type").Str {
 	case "function_call":
-		return payload.Get("name").Str == "wait"
+		return isCodexWaitAgentCall(payload.Get("name").Str)
 	case "function_call_output":
 		output, _ := parseCodexFunctionOutput(payload)
 		return isCodexSubagentFunctionOutput(output)

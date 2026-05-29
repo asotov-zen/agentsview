@@ -11,11 +11,11 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/wesm/agentsview/internal/config"
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/pricing"
-	"github.com/wesm/agentsview/internal/server"
-	"github.com/wesm/agentsview/internal/sync"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/server"
+	"go.kenn.io/agentsview/internal/sync"
 )
 
 // quickSyncMargin pads the mtime cutoff backward from the
@@ -144,6 +144,13 @@ func runUsageStatusline(cfg UsageStatuslineConfig) {
 	}
 }
 
+func applyCustomPricing(database *db.DB, cfg config.Config) {
+	if len(cfg.CustomModelPricing) == 0 {
+		return
+	}
+	database.SetCustomPricing(cfg.CustomModelPricing)
+}
+
 func openUsageDB() (*db.DB, config.Config) {
 	cfg, err := config.LoadMinimal()
 	if err != nil {
@@ -151,7 +158,7 @@ func openUsageDB() (*db.DB, config.Config) {
 		os.Exit(1)
 	}
 
-	database, err := db.Open(cfg.DBPath)
+	database, err := openDB(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr,
 			"error opening database: %v\n", err)
@@ -184,6 +191,14 @@ func ensureFreshData(
 
 	ctx := context.Background()
 
+	// Silence engine worker log.Printf lines (e.g. "db:
+	// InsertMessages (N msgs)") for both branches so --json and
+	// statusline output stay clean. Progress goes to stderr
+	// below to stay out of stdout-bound payloads.
+	origLog := log.Writer()
+	log.SetOutput(io.Discard)
+	defer log.SetOutput(origLog)
+
 	if database.NeedsResync() {
 		engine := sync.NewEngine(database, sync.EngineConfig{
 			AgentDirs: appCfg.AgentDirs,
@@ -191,11 +206,17 @@ func ensureFreshData(
 		})
 		fmt.Fprintln(os.Stderr,
 			"Data version changed, running full resync...")
-		engine.ResyncAll(ctx, nil)
+		t := time.Now()
+		stats := engine.ResyncAll(ctx, printSyncProgressStderr)
+		printSyncSummaryStderr(stats, t)
 		return
 	}
 
-	if server.IsServerActive(appCfg.DataDir) {
+	// Skip on-demand sync only when a writable local daemon is
+	// already keeping the SQLite archive fresh. pg serve daemons
+	// (read-only) do not sync the local DB, so we still want to
+	// run our own sync when only one of those is present.
+	if server.IsLocalServerActive(appCfg.DataDir) {
 		return
 	}
 
@@ -209,16 +230,45 @@ func ensureFreshData(
 		since = since.Add(-quickSyncMargin)
 	}
 
-	// Silence engine progress and incremental-parse logging
-	// so --json and statusline output stay clean. The engine
-	// emits unconditional log.Printf calls from worker paths
-	// that aren't gated by a verbose flag, so redirect the
-	// global logger for the duration of the sync.
-	origLog := log.Writer()
-	log.SetOutput(io.Discard)
-	defer log.SetOutput(origLog)
-
 	engine.SyncAllSince(ctx, since, func(sync.Progress) {})
+}
+
+// printSyncProgressStderr mirrors printSyncProgress but writes
+// to stderr so it does not pollute stdout-bound JSON or
+// statusline output from the usage commands.
+func printSyncProgressStderr(p sync.Progress) {
+	if p.SessionsTotal > 0 {
+		fmt.Fprintf(os.Stderr,
+			"\r  %d/%d sessions (%.0f%%) · %d messages",
+			p.SessionsDone, p.SessionsTotal,
+			p.Percent(), p.MessagesIndexed,
+		)
+	}
+}
+
+// printSyncSummaryStderr mirrors printSyncSummary but writes to
+// stderr, for the same reason as printSyncProgressStderr.
+func printSyncSummaryStderr(stats sync.SyncStats, t time.Time) {
+	summary := fmt.Sprintf(
+		"\nSync complete: %d sessions synced",
+		stats.Synced,
+	)
+	if stats.OrphanedCopied > 0 {
+		summary += fmt.Sprintf(
+			", %d archived sessions preserved",
+			stats.OrphanedCopied,
+		)
+	}
+	if stats.Failed > 0 {
+		summary += fmt.Sprintf(", %d failed", stats.Failed)
+	}
+	summary += fmt.Sprintf(
+		" in %s\n", time.Since(t).Round(time.Millisecond),
+	)
+	fmt.Fprint(os.Stderr, summary)
+	for _, w := range stats.Warnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
 }
 
 // seedPricing ensures fallback rates are present in
@@ -266,6 +316,61 @@ func refreshPricingFromLiteLLM(database *db.DB) {
 	}
 }
 
+// pricingRefreshMetaKey marks the last time the CLI tried to
+// refresh model_pricing from LiteLLM. Cooldown is enforced
+// against this value, win or fail, so a repeatedly-failing
+// fetch (offline, DNS broken) does not block every CLI call.
+const pricingRefreshMetaKey = "_litellm_last_attempt"
+
+// pricingRefreshCooldown is the minimum interval between
+// CLI-triggered LiteLLM fetches. Short enough that a newly
+// released model gets priced within hours of the user noticing,
+// long enough that statusline-style repeated CLI invocations
+// don't hammer LiteLLM when a session uses a truly unpriced
+// model (e.g. a local Ollama model).
+const pricingRefreshCooldown = time.Hour
+
+// refreshPricingIfStale fetches the LiteLLM pricing catalog
+// and upserts it when the last attempt is older than cooldown
+// (or has never run). The fetcher is injectable for tests so
+// the cooldown logic can be exercised without network. Returns
+// true when an upsert succeeded; callers can re-query pricing
+// after a true result. Errors from the fetch are returned so
+// the caller can emit a warning; cooldown is recorded before
+// the fetch so a persistent failure won't retry every call.
+func refreshPricingIfStale(
+	database *db.DB,
+	fetch func() ([]pricing.ModelPricing, error),
+	cooldown time.Duration,
+	now time.Time,
+) (bool, error) {
+	stored, err := database.GetPricingMeta(pricingRefreshMetaKey)
+	if err != nil {
+		return false, fmt.Errorf(
+			"reading pricing refresh meta: %w", err)
+	}
+	if stored != "" {
+		last, perr := time.Parse(time.RFC3339, stored)
+		if perr == nil && now.Sub(last) < cooldown {
+			return false, nil
+		}
+	}
+	if err := database.SetPricingMeta(
+		pricingRefreshMetaKey, now.UTC().Format(time.RFC3339),
+	); err != nil {
+		return false, fmt.Errorf(
+			"recording pricing refresh attempt: %w", err)
+	}
+	prices, err := fetch()
+	if err != nil {
+		return false, err
+	}
+	if err := upsertPricing(database, prices); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func ensurePricing(database *db.DB, offline bool) {
 	var prices []pricing.ModelPricing
 
@@ -306,6 +411,26 @@ func upsertPricing(
 		}
 	}
 	return database.UpsertModelPricing(dbPrices)
+}
+
+// insertMissingPricing inserts fallback rows for models not already
+// priced, without overwriting existing rows. Used by the direct
+// usage path so a CLI-only data dir still prices fallback-catalog
+// models, while never clobbering richer LiteLLM rows.
+func insertMissingPricing(
+	database *db.DB, prices []pricing.ModelPricing,
+) error {
+	dbPrices := make([]db.ModelPricing, len(prices))
+	for i, p := range prices {
+		dbPrices[i] = db.ModelPricing{
+			ModelPattern:         p.ModelPattern,
+			InputPerMTok:         p.InputPerMTok,
+			OutputPerMTok:        p.OutputPerMTok,
+			CacheCreationPerMTok: p.CacheCreationPerMTok,
+			CacheReadPerMTok:     p.CacheReadPerMTok,
+		}
+	}
+	return database.InsertMissingModelPricing(dbPrices)
 }
 
 func printDailyTable(

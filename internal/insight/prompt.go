@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/wesm/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/db"
 )
 
 const maxSessions = 50
@@ -27,9 +27,10 @@ func BuildPrompt(
 	req GenerateRequest,
 ) (string, error) {
 	filter := db.SessionFilter{
-		DateFrom: req.DateFrom,
-		DateTo:   req.DateTo,
-		Limit:    maxSessions + 1,
+		DateFrom:         req.DateFrom,
+		DateTo:           req.DateTo,
+		Limit:            maxSessions + 1,
+		ExcludeAutomated: true,
 	}
 	if req.Project != "" {
 		filter.Project = req.Project

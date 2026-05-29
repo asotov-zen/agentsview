@@ -11,6 +11,7 @@ import type {
   Granularity,
   HeatmapMetric,
   TopSessionsMetric,
+  SignalsAnalyticsResponse,
 } from "../api/types.js";
 import {
   getAnalyticsSummary,
@@ -22,6 +23,7 @@ import {
   getAnalyticsVelocity,
   getAnalyticsTools,
   getAnalyticsTopSessions,
+  getAnalyticsSignals,
   type AnalyticsParams,
 } from "../api/client.js";
 import { sessions } from "./sessions.svelte.js";
@@ -54,16 +56,21 @@ type Panel =
   | "sessionShape"
   | "velocity"
   | "tools"
-  | "topSessions";
+  | "topSessions"
+  | "signals";
 
 class AnalyticsStore {
   from: string = $state(daysAgo(365));
   to: string = $state(today());
+  isPinned: boolean = $state(false);
+  windowDays: number = $state(365);
   granularity: Granularity = $state("day");
   metric: HeatmapMetric = $state("messages");
   selectedDate: string | null = $state(null);
   project: string = $state("");
+  machine: string = $state("");
   agent: string = $state("");
+  termination: string = $state("");
   minUserMessages: number = $state(0);
   includeOneShot: boolean = $state(true);
   includeAutomated: boolean = $state(false);
@@ -80,6 +87,7 @@ class AnalyticsStore {
   velocity = $state<VelocityResponse | null>(null);
   tools = $state<ToolsAnalyticsResponse | null>(null);
   topSessions = $state<TopSessionsResponse | null>(null);
+  signals = $state<SignalsAnalyticsResponse | null>(null);
   topMetric: TopSessionsMetric = $state("messages");
 
   loading = $state({
@@ -92,6 +100,7 @@ class AnalyticsStore {
     velocity: false,
     tools: false,
     topSessions: false,
+    signals: false,
   });
 
   errors = $state<Record<Panel, string | null>>({
@@ -104,6 +113,7 @@ class AnalyticsStore {
     velocity: null,
     tools: null,
     topSessions: null,
+    signals: null,
   });
 
   private versions: Record<Panel, number> = {
@@ -116,6 +126,7 @@ class AnalyticsStore {
     velocity: 0,
     tools: 0,
     topSessions: 0,
+    signals: 0,
   };
 
   get timezone(): string {
@@ -126,7 +137,9 @@ class AnalyticsStore {
     return (
       this.selectedDate !== null ||
       this.project !== "" ||
+      this.machine !== "" ||
       this.agent !== "" ||
+      this.termination !== "" ||
       this.minUserMessages > 0 ||
       !this.includeOneShot ||
       this.includeAutomated ||
@@ -139,7 +152,9 @@ class AnalyticsStore {
   clearAllFilters() {
     this.selectedDate = null;
     this.project = "";
+    this.machine = "";
     this.agent = "";
+    this.termination = "";
     this.minUserMessages = 0;
     this.includeOneShot = true;
     this.includeAutomated = false;
@@ -147,7 +162,9 @@ class AnalyticsStore {
     this.selectedDow = null;
     this.selectedHour = null;
     sessions.filters.project = "";
+    sessions.filters.machine = "";
     sessions.filters.agent = "";
+    sessions.filters.termination = "";
     sessions.filters.minUserMessages = 0;
     sessions.filters.includeOneShot = true;
     sessions.filters.includeAutomated = false;
@@ -223,11 +240,51 @@ class AnalyticsStore {
     this.fetchVelocity();
     this.fetchTools();
     this.fetchTopSessions();
+    this.fetchSignals();
   }
 
   clearProject() {
     this.project = "";
     sessions.filters.project = "";
+    sessions.activeSessionId = null;
+    sessions.load();
+    this.fetchAll();
+  }
+
+  clearMachine() {
+    this.machine = "";
+    sessions.filters.machine = "";
+    sessions.activeSessionId = null;
+    sessions.load();
+    this.fetchAll();
+  }
+
+  removeMachine(machine: string) {
+    const current = this.machine ? this.machine.split(",") : [];
+    this.machine = current.filter((m) => m !== machine).join(",");
+    sessions.filters.machine = this.machine;
+    sessions.activeSessionId = null;
+    sessions.load();
+    this.fetchAll();
+  }
+
+  clearTermination() {
+    this.termination = "";
+    sessions.filters.termination = "";
+    sessions.activeSessionId = null;
+    sessions.load();
+    this.fetchAll();
+  }
+
+  toggleTerminationStatus(status: string) {
+    const set = new Set(
+      this.termination.split(",").filter((s) => s.length > 0),
+    );
+    if (set.has(status)) set.delete(status);
+    else set.add(status);
+    const next = [...set].join(",");
+    this.termination = next;
+    sessions.filters.termination = next;
     sessions.activeSessionId = null;
     sessions.load();
     this.fetchAll();
@@ -244,6 +301,7 @@ class AnalyticsStore {
     this.fetchVelocity();
     this.fetchTools();
     this.fetchTopSessions();
+    this.fetchSignals();
   }
 
   private baseParams(
@@ -262,7 +320,9 @@ class AnalyticsStore {
     if (includeProject && this.project) {
       p.project = this.project;
     }
+    if (this.machine) p.machine = this.machine;
     if (this.agent) p.agent = this.agent;
+    if (this.termination) p.termination = this.termination;
     if (this.minUserMessages > 0) {
       p.min_user_messages = this.minUserMessages;
     }
@@ -303,7 +363,9 @@ class AnalyticsStore {
       if (includeProject && this.project) {
         p.project = this.project;
       }
+      if (this.machine) p.machine = this.machine;
       if (this.agent) p.agent = this.agent;
+      if (this.termination) p.termination = this.termination;
       if (this.minUserMessages > 0) {
         p.min_user_messages = this.minUserMessages;
       }
@@ -335,18 +397,35 @@ class AnalyticsStore {
     panel: Panel,
     fetchRequest: () => Promise<T>,
     onSuccess: (data: T) => void,
+    hasExistingData: () => boolean = () => false,
   ) {
     const v = ++this.versions[panel];
-    this.loading[panel] = true;
-    this.errors[panel] = null;
+    // Only show the skeleton when we don't already have data to
+    // display. Refetches triggered by live events or filter changes
+    // replace data in place instead of flashing to loading state.
+    const isFirstLoad = !hasExistingData();
+    if (isFirstLoad) this.loading[panel] = true;
+    // On refetch, keep any prior error state in place until we have
+    // a definitive result. First-load clears up front so we start
+    // fresh.
+    if (isFirstLoad) this.errors[panel] = null;
     try {
       const data = await fetchRequest();
       if (this.versions[panel] === v) {
         onSuccess(data);
+        this.errors[panel] = null;
       }
     } catch (e) {
       if (this.versions[panel] === v) {
-        this.errors[panel] = e instanceof Error ? e.message : "Failed to load";
+        // On refetch failure with cached data, swallow the error so
+        // existing values stay visible instead of flipping to an
+        // error state. First-load failures still surface.
+        if (isFirstLoad) {
+          this.errors[panel] =
+            e instanceof Error ? e.message : "Failed to load";
+        } else {
+          console.warn(`analytics.${panel} refetch failed:`, e);
+        }
       }
     } finally {
       if (this.versions[panel] === v) {
@@ -355,7 +434,14 @@ class AnalyticsStore {
     }
   }
 
+  private rollDates(): void {
+    if (this.isPinned) return;
+    this.from = daysAgo(this.windowDays);
+    this.to = today();
+  }
+
   async fetchAll() {
+    this.rollDates();
     await Promise.all([
       this.fetchSummary(),
       this.fetchActivity(),
@@ -366,6 +452,7 @@ class AnalyticsStore {
       this.fetchVelocity(),
       this.fetchTools(),
       this.fetchTopSessions(),
+      this.fetchSignals(),
     ]);
   }
 
@@ -376,6 +463,7 @@ class AnalyticsStore {
       (data) => {
         this.summary = data;
       },
+      () => this.summary !== null,
     );
   }
 
@@ -393,6 +481,7 @@ class AnalyticsStore {
       (data) => {
         this.activity = data;
       },
+      () => this.activity !== null,
     );
   }
 
@@ -407,6 +496,7 @@ class AnalyticsStore {
       (data) => {
         this.heatmap = data;
       },
+      () => this.heatmap !== null,
     );
   }
 
@@ -420,6 +510,7 @@ class AnalyticsStore {
       (data) => {
         this.projects = data;
       },
+      () => this.projects !== null,
     );
   }
 
@@ -430,6 +521,7 @@ class AnalyticsStore {
       (data) => {
         this.hourOfWeek = data;
       },
+      () => this.hourOfWeek !== null,
     );
   }
 
@@ -440,6 +532,7 @@ class AnalyticsStore {
       (data) => {
         this.sessionShape = data;
       },
+      () => this.sessionShape !== null,
     );
   }
 
@@ -450,6 +543,7 @@ class AnalyticsStore {
       (data) => {
         this.velocity = data;
       },
+      () => this.velocity !== null,
     );
   }
 
@@ -460,6 +554,7 @@ class AnalyticsStore {
       (data) => {
         this.tools = data;
       },
+      () => this.tools !== null,
     );
   }
 
@@ -474,6 +569,18 @@ class AnalyticsStore {
       (data) => {
         this.topSessions = data;
       },
+      () => this.topSessions !== null,
+    );
+  }
+
+  async fetchSignals() {
+    await this.executeFetch(
+      "signals",
+      () => getAnalyticsSignals(this.filterParams()),
+      (data) => {
+        this.signals = data;
+      },
+      () => this.signals !== null,
     );
   }
 
@@ -483,11 +590,22 @@ class AnalyticsStore {
   }
 
   setDateRange(from: string, to: string) {
+    this.isPinned = true;
     this.from = from;
     this.to = to;
     this.selectedDate = null;
     this.selectedDow = null;
     this.selectedHour = null;
+    this.fetchAll();
+  }
+
+  setRollingWindow(days: number) {
+    this.windowDays = days;
+    this.isPinned = false;
+    this.selectedDate = null;
+    this.selectedDow = null;
+    this.selectedHour = null;
+    this.rollDates();
     this.fetchAll();
   }
 
@@ -503,6 +621,7 @@ class AnalyticsStore {
     this.fetchVelocity();
     this.fetchTools();
     this.fetchTopSessions();
+    this.fetchSignals();
   }
 
   setGranularity(g: Granularity) {
@@ -532,6 +651,7 @@ class AnalyticsStore {
     this.fetchVelocity();
     this.fetchTools();
     this.fetchTopSessions();
+    this.fetchSignals();
   }
 
   setProject(name: string) {

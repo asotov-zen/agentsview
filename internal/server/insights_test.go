@@ -15,9 +15,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/insight"
-	"github.com/wesm/agentsview/internal/server"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/insight"
+	"go.kenn.io/agentsview/internal/server"
 )
 
 type listInsightsResponse struct {
@@ -77,8 +80,8 @@ func TestListInsights(t *testing.T) {
 		{
 			name: "WithData",
 			seed: func(t *testing.T, te *testEnv) {
-				te.seedInsight(t, "daily_activity", "2025-01-15", strPtr("my-app"))
-				te.seedInsight(t, "daily_activity", "2025-01-15", strPtr("other-app"))
+				te.seedInsight(t, "daily_activity", "2025-01-15", new("my-app"))
+				te.seedInsight(t, "daily_activity", "2025-01-15", new("other-app"))
 				te.seedInsight(t, "agent_analysis", "2025-01-15", nil)
 			},
 			path:       "/api/v1/insights",
@@ -88,7 +91,7 @@ func TestListInsights(t *testing.T) {
 		{
 			name: "TypeFilter",
 			seed: func(t *testing.T, te *testEnv) {
-				te.seedInsight(t, "daily_activity", "2025-01-15", strPtr("my-app"))
+				te.seedInsight(t, "daily_activity", "2025-01-15", new("my-app"))
 				te.seedInsight(t, "agent_analysis", "2025-01-15", nil)
 			},
 			path:       "/api/v1/insights?type=daily_activity",
@@ -98,8 +101,8 @@ func TestListInsights(t *testing.T) {
 		{
 			name: "ReturnsAll",
 			seed: func(t *testing.T, te *testEnv) {
-				te.seedInsight(t, "daily_activity", "2025-01-15", strPtr("my-app"))
-				te.seedInsight(t, "daily_activity", "2025-01-16", strPtr("my-app"))
+				te.seedInsight(t, "daily_activity", "2025-01-15", new("my-app"))
+				te.seedInsight(t, "daily_activity", "2025-01-16", new("my-app"))
 			},
 			path:       "/api/v1/insights",
 			wantStatus: http.StatusOK,
@@ -128,9 +131,7 @@ func TestListInsights(t *testing.T) {
 
 			if tt.wantStatus == http.StatusOK {
 				r := decode[listInsightsResponse](t, w)
-				if len(r.Insights) != tt.wantCount {
-					t.Fatalf("expected %d insights, got %d", tt.wantCount, len(r.Insights))
-				}
+				require.Len(t, r.Insights, tt.wantCount)
 			}
 		})
 	}
@@ -140,18 +141,14 @@ func TestGetInsight_Found(t *testing.T) {
 	te := setup(t)
 
 	id := te.seedInsight(t, "daily_activity", "2025-01-15",
-		strPtr("my-app"))
+		new("my-app"))
 
 	w := te.get(t, fmt.Sprintf("/api/v1/insights/%d", id))
 	assertStatus(t, w, http.StatusOK)
 
 	r := decode[db.Insight](t, w)
-	if r.ID != id {
-		t.Fatalf("expected id=%d, got %d", id, r.ID)
-	}
-	if r.Type != "daily_activity" {
-		t.Errorf("type = %q, want daily_activity", r.Type)
-	}
+	require.Equal(t, id, r.ID)
+	assert.Equal(t, "daily_activity", r.Type)
 }
 
 func TestGenerateInsight_Validation(t *testing.T) {
@@ -185,9 +182,7 @@ func TestGenerateInsight_DefaultAgent(t *testing.T) {
 	stubGen := func(
 		_ context.Context, agent, _ string,
 	) (insight.Result, error) {
-		if agent != "claude" {
-			t.Errorf("expected default agent claude, got %q", agent)
-		}
+		assert.Equal(t, "claude", agent, "expected default agent claude")
 		return insight.Result{}, fmt.Errorf("stub: no CLI")
 	}
 	te := setupWithServerOpts(t, []server.Option{
@@ -217,12 +212,9 @@ func TestGenerateInsight_ErrorMessageStripsStderr(t *testing.T) {
 		`{"type":"daily_activity","date_from":"2025-01-15","date_to":"2025-01-15"}`)
 	assertStatus(t, w, http.StatusOK)
 	body := w.Body.String()
-	if !strings.Contains(body, "claude CLI failed: exit status 1") {
-		t.Fatalf("expected error detail in response, got: %s", body)
-	}
-	if strings.Contains(body, "some debug output") {
-		t.Fatalf("expected stderr to be stripped from client message")
-	}
+	require.Contains(t, body, "claude CLI failed: exit status 1")
+	require.NotContains(t, body, "some debug output",
+		"expected stderr to be stripped from client message")
 }
 
 func TestGenerateInsight_ErrorMessageStripsRaw(t *testing.T) {
@@ -241,12 +233,9 @@ func TestGenerateInsight_ErrorMessageStripsRaw(t *testing.T) {
 		`{"type":"daily_activity","date_from":"2025-01-15","date_to":"2025-01-15"}`)
 	assertStatus(t, w, http.StatusOK)
 	body := w.Body.String()
-	if !strings.Contains(body, "claude returned empty result") {
-		t.Fatalf("expected error detail in response, got: %s", body)
-	}
-	if strings.Contains(body, `"type":"result"`) {
-		t.Fatalf("expected raw payload to be stripped from client message")
-	}
+	require.Contains(t, body, "claude returned empty result")
+	require.NotContains(t, body, `"type":"result"`,
+		"expected raw payload to be stripped from client message")
 }
 
 func TestGenerateInsight_InitialStatusWriteFailureSkipsGeneration(t *testing.T) {
@@ -271,9 +260,8 @@ func TestGenerateInsight_InitialStatusWriteFailureSkipsGeneration(t *testing.T) 
 	w := newFailFirstWriteRecorder()
 	te.handler.ServeHTTP(w, req)
 
-	if called.Load() {
-		t.Fatalf("generation should not run when initial SSE status write fails")
-	}
+	require.False(t, called.Load(),
+		"generation should not run when initial SSE status write fails")
 }
 
 func TestGenerateInsight_StreamsLogs(t *testing.T) {
@@ -303,34 +291,19 @@ func TestGenerateInsight_StreamsLogs(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 
 	events := parseSSE(w.Body.String())
-	if len(events) < 4 {
-		t.Fatalf("expected >=4 SSE events, got %d: %s", len(events), w.Body.String())
-	}
-	if events[0].Event != "status" {
-		t.Fatalf("first event = %q, want status", events[0].Event)
-	}
-	if events[1].Event != "log" || events[2].Event != "log" {
-		t.Fatalf("expected two log events, got: %#v", events)
-	}
-	if events[len(events)-1].Event != "done" {
-		t.Fatalf("last event = %q, want done", events[len(events)-1].Event)
-	}
+	require.GreaterOrEqual(t, len(events), 4, "expected >=4 SSE events: %s", w.Body.String())
+	require.Equal(t, "status", events[0].Event, "first event")
+	require.Equal(t, "log", events[1].Event, "events: %#v", events)
+	require.Equal(t, "log", events[2].Event, "events: %#v", events)
+	require.Equal(t, "done", events[len(events)-1].Event, "last event")
 
 	var log1 insight.LogEvent
-	if err := json.Unmarshal([]byte(events[1].Data), &log1); err != nil {
-		t.Fatalf("unmarshal first log event: %v", err)
-	}
-	if log1.Stream != "stdout" {
-		t.Fatalf("first log stream = %q, want stdout", log1.Stream)
-	}
+	require.NoError(t, json.Unmarshal([]byte(events[1].Data), &log1))
+	require.Equal(t, "stdout", log1.Stream)
 
 	var log2 insight.LogEvent
-	if err := json.Unmarshal([]byte(events[2].Data), &log2); err != nil {
-		t.Fatalf("unmarshal second log event: %v", err)
-	}
-	if log2.Stream != "stderr" {
-		t.Fatalf("second log stream = %q, want stderr", log2.Stream)
-	}
+	require.NoError(t, json.Unmarshal([]byte(events[2].Data), &log2))
+	require.Equal(t, "stderr", log2.Stream)
 }
 
 type slowFlushRecorder struct {
@@ -573,7 +546,7 @@ func TestGenerateInsight_LogDropSummaryAndCompletion(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(8 * time.Second):
-		t.Fatalf("timed out waiting for generate handler")
+		require.Fail(t, "timed out waiting for generate handler")
 	}
 
 	assertStatus(t, w.ResponseRecorder, http.StatusOK)
@@ -598,15 +571,9 @@ func TestGenerateInsight_LogDropSummaryAndCompletion(t *testing.T) {
 			foundDropSummary = true
 		}
 	}
-	if !foundDropSummary {
-		t.Fatalf(
-			"expected dropped-log summary event, got %d events",
-			len(events),
-		)
-	}
-	if !foundDone {
-		t.Fatalf("expected done event")
-	}
+	require.True(t, foundDropSummary,
+		"expected dropped-log summary event, got %d events", len(events))
+	require.True(t, foundDone, "expected done event")
 }
 
 func TestGenerateInsight_LogDrainTimeoutReturnsWithoutHang(t *testing.T) {
@@ -650,18 +617,16 @@ func TestGenerateInsight_LogDrainTimeoutReturnsWithoutHang(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(12 * time.Second):
-		t.Fatalf("timed out waiting for generate handler completion")
+		require.Fail(t, "timed out waiting for generate handler completion")
 	}
-	if elapsed := time.Since(started); elapsed > 7*time.Second {
-		t.Fatalf("handler should return within bounded timeout handling, took %s", elapsed)
-	}
+	require.LessOrEqual(t, time.Since(started), 7*time.Second,
+		"handler should return within bounded timeout handling")
 
 	assertStatus(t, w.ResponseRecorder, http.StatusOK)
 	events := parseSSE(w.BodyString())
 	for _, ev := range events {
-		if ev.Event == "done" {
-			t.Fatalf("did not expect done event when timeout path is triggered")
-		}
+		require.NotEqual(t, "done", ev.Event,
+			"did not expect done event when timeout path is triggered")
 	}
 }
 
@@ -705,7 +670,7 @@ func TestGenerateInsight_LogDrainTimeoutReportsBufferedDrops(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatalf("timed out waiting for generate handler completion")
+		require.Fail(t, "timed out waiting for generate handler completion")
 	}
 
 	assertStatus(t, w.ResponseRecorder, http.StatusOK)
@@ -713,9 +678,8 @@ func TestGenerateInsight_LogDrainTimeoutReportsBufferedDrops(t *testing.T) {
 	foundTimeoutError := false
 	foundDropSummary := false
 	for _, ev := range events {
-		if ev.Event == "done" {
-			t.Fatalf("did not expect done event when timeout path is triggered")
-		}
+		require.NotEqual(t, "done", ev.Event,
+			"did not expect done event when timeout path is triggered")
 		if ev.Event == "error" &&
 			strings.Contains(ev.Data, "timed out before completion") {
 			foundTimeoutError = true
@@ -742,17 +706,14 @@ func TestGenerateInsight_LogDrainTimeoutReportsBufferedDrops(t *testing.T) {
 		}
 		// 10 events were enqueued; timeout truncation should account
 		// for most buffered entries that were never flushed.
-		if dropped < 8 {
-			t.Fatalf("expected timeout drop summary >=8, got %d (%q)", dropped, line.Line)
-		}
+		require.GreaterOrEqual(t, dropped, 8,
+			"expected timeout drop summary >=8 (%q)", line.Line)
 		foundDropSummary = true
 	}
-	if !foundTimeoutError {
-		t.Fatalf("expected timeout error event, got %d events", len(events))
-	}
-	if !foundDropSummary {
-		t.Fatalf("expected timeout-aware drop summary, got %d events", len(events))
-	}
+	require.True(t, foundTimeoutError,
+		"expected timeout error event, got %d events", len(events))
+	require.True(t, foundDropSummary,
+		"expected timeout-aware drop summary, got %d events", len(events))
 }
 
 func TestGenerateInsight_LogDrainTimeoutBoundedWhenWriterStuck(t *testing.T) {
@@ -789,20 +750,18 @@ func TestGenerateInsight_LogDrainTimeoutBoundedWhenWriterStuck(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(7 * time.Second):
-		t.Fatalf("timed out waiting for bounded timeout behavior")
+		require.Fail(t, "timed out waiting for bounded timeout behavior")
 	}
 	elapsed := time.Since(started)
-	if elapsed > 6*time.Second {
-		t.Fatalf("handler returned too slowly for stuck writer path: %s", elapsed)
-	}
+	require.LessOrEqual(t, elapsed, 6*time.Second,
+		"handler returned too slowly for stuck writer path")
 	close(release)
 
 	assertStatus(t, w.ResponseRecorder, http.StatusOK)
 	events := parseSSE(w.BodyString())
 	for _, ev := range events {
-		if ev.Event == "done" {
-			t.Fatalf("did not expect done event on stuck writer timeout path")
-		}
+		require.NotEqual(t, "done", ev.Event,
+			"did not expect done event on stuck writer timeout path")
 	}
 }
 
@@ -837,40 +796,35 @@ func TestGenerateInsight_LogDrainTimeoutForceUnblocksAndNoPostReturnWrites(t *te
 	select {
 	case <-done:
 	case <-time.After(8 * time.Second):
-		t.Fatalf("timed out waiting for forced-unblock completion")
+		require.Fail(t, "timed out waiting for forced-unblock completion")
 	}
 
 	select {
 	case <-w.PostReturnAttempted():
-		t.Fatalf("expected no writes after handler return")
+		require.Fail(t, "expected no writes after handler return")
 	case <-time.After(300 * time.Millisecond):
 	}
-	if got := w.PostReturnWrites(); got != 0 {
-		t.Fatalf("expected no writes after handler return, got %d", got)
-	}
+	require.Zero(t, w.PostReturnWrites(), "expected no writes after handler return")
 
 	assertStatus(t, w.ResponseRecorder, http.StatusOK)
 	events := parseSSE(w.BodyString())
 	foundTimeoutError := false
 	for _, ev := range events {
-		if ev.Event == "done" {
-			t.Fatalf("did not expect done event on forced-unblock timeout path")
-		}
+		require.NotEqual(t, "done", ev.Event,
+			"did not expect done event on forced-unblock timeout path")
 		if ev.Event == "error" &&
 			strings.Contains(ev.Data, "timed out before completion") {
 			foundTimeoutError = true
 		}
 	}
-	if !foundTimeoutError {
-		t.Fatalf("expected timeout error event")
-	}
+	require.True(t, foundTimeoutError, "expected timeout error event")
 }
 
 func TestDeleteInsight_Found(t *testing.T) {
 	te := setup(t)
 
 	id := te.seedInsight(t, "daily_activity", "2025-01-15",
-		strPtr("my-app"))
+		new("my-app"))
 
 	w := te.del(t, fmt.Sprintf("/api/v1/insights/%d", id))
 	assertStatus(t, w, http.StatusNoContent)
@@ -909,8 +863,6 @@ func TestInsight_ResourceErrors(t *testing.T) {
 
 // --- helpers ---
 
-func strPtr(s string) *string { return &s }
-
 func (te *testEnv) seedInsight(
 	t *testing.T,
 	typ, date string,
@@ -925,8 +877,6 @@ func (te *testEnv) seedInsight(
 		Agent:    "claude",
 		Content:  "Test insight content",
 	})
-	if err != nil {
-		t.Fatalf("seeding insight: %v", err)
-	}
+	require.NoError(t, err)
 	return id
 }

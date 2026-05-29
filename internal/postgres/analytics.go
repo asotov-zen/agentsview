@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wesm/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/db"
 )
 
 // maxPGVars is the maximum bind variables per IN clause.
@@ -42,22 +42,52 @@ func pgInPlaceholders(
 }
 
 // analyticsUTCRange returns UTC time bounds padded by +/-14h
-// to cover all possible timezone offsets.
+// to cover all possible timezone offsets. Empty From/To
+// inputs (callers like the Store API can construct a zero
+// AnalyticsFilter when "all time" is intended) collapse to
+// effectively unbounded sentinel values so the resulting
+// ::timestamptz cast is always valid -- the previous version
+// concatenated empty + "T00:00:00Z" and produced literals
+// like "T00:00:00Z" which PG rejected at runtime.
 func analyticsUTCRange(
 	f db.AnalyticsFilter,
 ) (string, string) {
-	from := f.From + "T00:00:00Z"
-	to := f.To + "T23:59:59Z"
+	const (
+		// Wide-open sentinels. PG TIMESTAMPTZ tolerates
+		// these literals across every supported version.
+		unboundedFrom = "0001-01-01T00:00:00Z"
+		unboundedTo   = "9999-12-31T23:59:59Z"
+	)
+	from := unboundedFrom
+	if f.From != "" {
+		from = f.From + "T00:00:00Z"
+	}
+	to := unboundedTo
+	if f.To != "" {
+		to = f.To + "T23:59:59Z"
+	}
 	tFrom, err := time.Parse(time.RFC3339, from)
 	if err != nil {
-		return from, to
+		return unboundedFrom, unboundedTo
 	}
 	tTo, err := time.Parse(time.RFC3339, to)
 	if err != nil {
-		return from, to
+		return unboundedFrom, unboundedTo
 	}
-	return tFrom.Add(-14 * time.Hour).Format(time.RFC3339),
-		tTo.Add(14 * time.Hour).Format(time.RFC3339)
+	// Padding by ±14h could push the lower sentinel below
+	// year 1 (which TIMESTAMPTZ does not accept); skip the
+	// pad when we're already on a sentinel boundary.
+	if f.From == "" {
+		from = unboundedFrom
+	} else {
+		from = tFrom.Add(-14 * time.Hour).Format(time.RFC3339)
+	}
+	if f.To == "" {
+		to = unboundedTo
+	} else {
+		to = tTo.Add(14 * time.Hour).Format(time.RFC3339)
+	}
+	return from, to
 }
 
 // buildAnalyticsWhere builds a WHERE clause with PG
@@ -67,16 +97,38 @@ func buildAnalyticsWhere(
 	dateCol string,
 	pb *paramBuilder,
 ) string {
+	return buildAnalyticsWhereWithDate(f, dateCol, pb, true)
+}
+
+// buildAnalyticsWhereWithoutDate returns common analytics
+// predicates without adding session date bounds. Trends uses
+// this because date, day, and hour filters are evaluated
+// against message timestamps instead of session timestamps.
+func buildAnalyticsWhereWithoutDate(
+	f db.AnalyticsFilter,
+	pb *paramBuilder,
+) string {
+	return buildAnalyticsWhereWithDate(f, "", pb, false)
+}
+
+func buildAnalyticsWhereWithDate(
+	f db.AnalyticsFilter,
+	dateCol string,
+	pb *paramBuilder,
+	includeDate bool,
+) string {
 	preds := []string{
 		"message_count > 0",
 		"relationship_type NOT IN ('subagent', 'fork')",
 		"deleted_at IS NULL",
 	}
-	utcFrom, utcTo := analyticsUTCRange(f)
-	preds = append(preds,
-		dateCol+" >= "+pb.add(utcFrom)+"::timestamptz")
-	preds = append(preds,
-		dateCol+" <= "+pb.add(utcTo)+"::timestamptz")
+	if includeDate {
+		utcFrom, utcTo := analyticsUTCRange(f)
+		preds = append(preds,
+			dateCol+" >= "+pb.add(utcFrom)+"::timestamptz")
+		preds = append(preds,
+			dateCol+" <= "+pb.add(utcTo)+"::timestamptz")
+	}
 	if f.Machine != "" {
 		preds = append(preds,
 			"machine = "+pb.add(f.Machine))
@@ -123,6 +175,9 @@ func buildAnalyticsWhere(
 				" >= "+pb.add(f.ActiveSince)+
 				"::timestamptz")
 	}
+	if pred := pgTerminationPred(f.Termination, pb); pred != "" {
+		preds = append(preds, pred)
+	}
 	return strings.Join(preds, " AND ")
 }
 
@@ -155,8 +210,16 @@ func localDate(ts string, loc *time.Location) string {
 }
 
 // inDateRange checks if a local date falls within [from, to].
+// Empty bounds are treated as unbounded so callers can pass a
+// zero AnalyticsFilter to get every session.
 func inDateRange(date, from, to string) bool {
-	return date >= from && date <= to
+	if from != "" && date < from {
+		return false
+	}
+	if to != "" && date > to {
+		return false
+	}
+	return true
 }
 
 // medianInt returns the median of a sorted int slice.
@@ -957,7 +1020,10 @@ func (s *Store) GetAnalyticsProjects(
 		[]db.ProjectAnalytics, 0, len(projectMap),
 	)
 	for _, name := range projectOrder {
-		pd := projectMap[name]
+		pd, ok := projectMap[name]
+		if !ok || pd == nil {
+			continue
+		}
 		sort.Ints(pd.counts)
 		n := len(pd.counts)
 
@@ -1286,7 +1352,8 @@ func (s *Store) queryAutonomyChunk(
 	pb := &paramBuilder{}
 	ph := pgInPlaceholders(chunk, pb)
 	q := `SELECT session_id,
-		SUM(CASE WHEN role='user' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN role='user' AND is_system=false
+			THEN 1 ELSE 0 END),
 		SUM(CASE WHEN role='assistant'
 			AND has_tool_use=true THEN 1 ELSE 0 END)
 		FROM messages
@@ -1914,7 +1981,10 @@ func (s *Store) GetAnalyticsVelocity(
 		[]db.VelocityBreakdown, 0, len(agentKeys),
 	)
 	for _, k := range agentKeys {
-		a := byAgent[k]
+		a, ok := byAgent[k]
+		if !ok || a == nil {
+			continue
+		}
 		resp.ByAgent = append(resp.ByAgent,
 			db.VelocityBreakdown{
 				Label:    k,
@@ -1938,7 +2008,10 @@ func (s *Store) GetAnalyticsVelocity(
 		[]db.VelocityBreakdown, 0, len(compKeys),
 	)
 	for _, k := range compKeys {
-		a := byComplexity[k]
+		a, ok := byComplexity[k]
+		if !ok || a == nil {
+			continue
+		}
 		resp.ByComplexity = append(resp.ByComplexity,
 			db.VelocityBreakdown{
 				Label:    k,
@@ -1995,7 +2068,9 @@ func (s *Store) GetAnalyticsTopSessions(
 		first_message, message_count,
 		total_output_tokens,
 		EXTRACT(EPOCH FROM ended_at - started_at)
-			AS duration_sec
+			AS duration_sec,
+		started_at, ended_at,
+		termination_status
 		FROM sessions WHERE ` + where +
 		` ORDER BY ` + orderExpr + limitClause
 
@@ -2014,12 +2089,15 @@ func (s *Store) GetAnalyticsTopSessions(
 	for rows.Next() {
 		var id, project string
 		var ts *time.Time
-		var firstMsg *string
+		var startedAt, endedAt *time.Time
+		var firstMsg, termStatus *string
 		var mc, outputTokens int
 		var durationSec *float64
 		if err := rows.Scan(
 			&id, &ts, &project, &firstMsg,
 			&mc, &outputTokens, &durationSec,
+			&startedAt, &endedAt,
+			&termStatus,
 		); err != nil {
 			return db.TopSessionsResponse{},
 				fmt.Errorf(
@@ -2039,13 +2117,25 @@ func (s *Store) GetAnalyticsTopSessions(
 		} else if needsGoSort {
 			continue
 		}
+		var startedStr, endedStr *string
+		if startedAt != nil {
+			s := FormatISO8601(*startedAt)
+			startedStr = &s
+		}
+		if endedAt != nil {
+			s := FormatISO8601(*endedAt)
+			endedStr = &s
+		}
 		sessions = append(sessions, db.TopSession{
-			ID:           id,
-			Project:      project,
-			FirstMessage: firstMsg,
-			MessageCount: mc,
-			OutputTokens: outputTokens,
-			DurationMin:  durMin,
+			ID:                id,
+			Project:           project,
+			FirstMessage:      firstMsg,
+			MessageCount:      mc,
+			OutputTokens:      outputTokens,
+			DurationMin:       durMin,
+			StartedAt:         startedStr,
+			EndedAt:           endedStr,
+			TerminationStatus: termStatus,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -2061,6 +2151,81 @@ func (s *Store) GetAnalyticsTopSessions(
 		Metric:   metric,
 		Sessions: sessions,
 	}, nil
+}
+
+// GetAnalyticsSignals returns aggregated session signal data.
+// Mirrors the SQLite implementation: select per-session signal
+// columns, apply analytics filters, then hand the rows to the
+// shared db.AggregateSignals so the response shape stays
+// identical across stores.
+func (s *Store) GetAnalyticsSignals(
+	ctx context.Context, f db.AnalyticsFilter,
+) (db.SignalsAnalyticsResponse, error) {
+	loc := analyticsLocation(f)
+	pb := &paramBuilder{}
+	where := buildAnalyticsWhere(f, pgDateCol, pb)
+
+	var timeIDs map[string]bool
+	if f.HasTimeFilter() {
+		var err error
+		timeIDs, err = s.filteredSessionIDs(ctx, f)
+		if err != nil {
+			return db.SignalsAnalyticsResponse{}, err
+		}
+	}
+
+	query := `SELECT id, agent, project, ` + pgDateCol + `,
+		health_score, health_grade, outcome,
+		outcome_confidence,
+		tool_failure_signal_count, tool_retry_count,
+		edit_churn_count, compaction_count,
+		mid_task_compaction_count,
+		context_pressure_max
+		FROM sessions WHERE ` + where
+
+	rows, err := s.pg.QueryContext(ctx, query, pb.args...)
+	if err != nil {
+		return db.SignalsAnalyticsResponse{}, fmt.Errorf(
+			"querying analytics signals: %w", err,
+		)
+	}
+	defer rows.Close()
+
+	var all []db.SignalRow
+	for rows.Next() {
+		var (
+			r  db.SignalRow
+			ts *time.Time
+		)
+		if err := rows.Scan(
+			&r.ID, &r.Agent, &r.Project, &ts,
+			&r.HealthScore, &r.HealthGrade,
+			&r.Outcome, &r.OutcomeConfidence,
+			&r.ToolFailureSignalCount,
+			&r.ToolRetryCount, &r.EditChurnCount,
+			&r.CompactionCount, &r.MidTaskCompactionCount,
+			&r.ContextPressureMax,
+		); err != nil {
+			return db.SignalsAnalyticsResponse{}, fmt.Errorf(
+				"scanning signals row: %w", err,
+			)
+		}
+		r.Date = localDate(scanDateCol(ts), loc)
+		if !inDateRange(r.Date, f.From, f.To) {
+			continue
+		}
+		if timeIDs != nil && !timeIDs[r.ID] {
+			continue
+		}
+		all = append(all, r)
+	}
+	if err := rows.Err(); err != nil {
+		return db.SignalsAnalyticsResponse{}, fmt.Errorf(
+			"iterating signals rows: %w", err,
+		)
+	}
+
+	return db.AggregateSignals(all), nil
 }
 
 // rankTopSessions sorts sessions by duration (if

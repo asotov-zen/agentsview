@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // writeCopilotJSONL writes JSONL lines to a temp file and
@@ -16,11 +19,9 @@ func writeCopilotJSONL(
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test-session.jsonl")
 	content := strings.Join(lines, "\n") + "\n"
-	if err := os.WriteFile(
+	require.NoError(t, os.WriteFile(
 		path, []byte(content), 0o644,
-	); err != nil {
-		t.Fatal(err)
-	}
+	))
 	return path
 }
 
@@ -28,23 +29,15 @@ func writeCopilotJSONL(
 func parseAndValidateHelper(t *testing.T, path string, machine string, wantMsgs int) (*ParsedSession, []ParsedMessage) {
 	t.Helper()
 	sess, msgs, err := ParseCopilotSession(path, machine)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if sess == nil {
-		t.Fatal("expected non-nil session")
-	}
-	if len(msgs) != wantMsgs {
-		t.Fatalf("got %d messages, want %d", len(msgs), wantMsgs)
-	}
+	require.NoError(t, err)
+	require.NotNil(t, sess, "expected non-nil session")
+	require.Len(t, msgs, wantMsgs)
 	return sess, msgs
 }
 
 func assertEqual[T comparable](t *testing.T, want, got T, name string) {
 	t.Helper()
-	if want != got {
-		t.Errorf("%s = %v, want %v", name, got, want)
-	}
+	assert.Equal(t, want, got, name)
 }
 
 func TestParseCopilotSession_Basic(t *testing.T) {
@@ -81,9 +74,7 @@ func TestParseCopilotSession_ToolCalls(t *testing.T) {
 
 	// Check tool call message.
 	tcMsg := msgs[1]
-	if !tcMsg.HasToolUse {
-		t.Error("expected HasToolUse on tool call message")
-	}
+	assert.True(t, tcMsg.HasToolUse, "expected HasToolUse on tool call message")
 	assertToolCalls(t, tcMsg.ToolCalls, []ParsedToolCall{{
 		ToolName:  "view",
 		Category:  "Read",
@@ -141,21 +132,13 @@ func TestParseCopilotSession_Reasoning(t *testing.T) {
 	_, msgs := parseAndValidateHelper(t, path, "m", 2)
 
 	ast := msgs[1]
-	if !ast.HasThinking {
-		t.Error("expected HasThinking on assistant message with reasoningText")
-	}
-	if !strings.Contains(ast.Content, "[Thinking]\nLet me think about this carefully...\n[/Thinking]") {
-		t.Errorf("expected thinking block in content, got: %q", ast.Content)
-	}
-	if !strings.Contains(ast.Content, "Here is my analysis.") {
-		t.Errorf("expected visible content after thinking block, got: %q", ast.Content)
-	}
+	assert.True(t, ast.HasThinking, "expected HasThinking on assistant message with reasoningText")
+	assert.Contains(t, ast.Content, "[Thinking]\nLet me think about this carefully...\n[/Thinking]")
+	assert.Contains(t, ast.Content, "Here is my analysis.")
 	// Thinking block must precede the visible content.
 	thinkIdx := strings.Index(ast.Content, "[Thinking]")
 	visibleIdx := strings.Index(ast.Content, "Here is my analysis.")
-	if thinkIdx >= visibleIdx {
-		t.Errorf("thinking block should appear before visible content")
-	}
+	assert.Less(t, thinkIdx, visibleIdx, "thinking block should appear before visible content")
 }
 
 func TestParseCopilotSession_ReasoningOnly(t *testing.T) {
@@ -170,12 +153,8 @@ func TestParseCopilotSession_ReasoningOnly(t *testing.T) {
 	_, msgs := parseAndValidateHelper(t, path, "m", 2)
 
 	ast := msgs[1]
-	if !ast.HasThinking {
-		t.Error("expected HasThinking")
-	}
-	if !strings.Contains(ast.Content, "[Thinking]\nPondering the question...\n[/Thinking]") {
-		t.Errorf("expected thinking block in content, got: %q", ast.Content)
-	}
+	assert.True(t, ast.HasThinking, "expected HasThinking")
+	assert.Contains(t, ast.Content, "[Thinking]\nPondering the question...\n[/Thinking]")
 }
 
 func TestParseCopilotSession_AssistantReasoningEvent(t *testing.T) {
@@ -187,17 +166,13 @@ func TestParseCopilotSession_AssistantReasoningEvent(t *testing.T) {
 	)
 
 	_, msgs := parseAndValidateHelper(t, path, "m", 2)
-	if !msgs[1].HasThinking {
-		t.Error("expected HasThinking set by assistant.reasoning event")
-	}
+	assert.True(t, msgs[1].HasThinking, "expected HasThinking set by assistant.reasoning event")
 }
 
 func TestParseCopilotSession_DirectoryFormat(t *testing.T) {
 	dir := t.TempDir()
 	sessDir := filepath.Join(dir, "abc-456")
-	if err := os.MkdirAll(sessDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.MkdirAll(sessDir, 0o755))
 
 	content := strings.Join([]string{
 		`{"type":"session.start","data":{"sessionId":"abc-456"},"timestamp":"2025-01-15T10:00:00Z"}`,
@@ -206,22 +181,153 @@ func TestParseCopilotSession_DirectoryFormat(t *testing.T) {
 	}, "\n") + "\n"
 
 	path := filepath.Join(sessDir, "events.jsonl")
-	if err := os.WriteFile(
+	require.NoError(t, os.WriteFile(
 		path, []byte(content), 0o644,
-	); err != nil {
-		t.Fatal(err)
-	}
+	))
 
 	sess, _ := parseAndValidateHelper(t, path, "m", 2)
 	assertEqual(t, "copilot:abc-456", sess.ID, "session ID")
+	// No workspace.yaml, so first user message is used.
+	assertEqual(t, "hello", sess.FirstMessage, "FirstMessage")
+}
+
+// writeDirSession writes events.jsonl (and optionally
+// workspace.yaml) into a temporary session directory and
+// returns the path to events.jsonl.
+func writeDirSession(
+	t *testing.T,
+	sessID string,
+	events []string,
+	workspaceYAML string,
+) string {
+	t.Helper()
+	dir := t.TempDir()
+	sessDir := filepath.Join(dir, sessID)
+	require.NoError(t, os.MkdirAll(sessDir, 0o755))
+	eventsPath := filepath.Join(sessDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(
+		eventsPath,
+		[]byte(strings.Join(events, "\n")+"\n"),
+		0o644,
+	))
+	if workspaceYAML != "" {
+		yamlPath := filepath.Join(sessDir, "workspace.yaml")
+		require.NoError(t, os.WriteFile(
+			yamlPath, []byte(workspaceYAML), 0o644,
+		))
+	}
+	return eventsPath
+}
+
+func TestParseCopilotSession_WorkspaceName(t *testing.T) {
+	events := []string{
+		`{"type":"session.start","data":{"sessionId":"ws-name"},"timestamp":"2025-01-15T10:00:00Z"}`,
+		`{"type":"user.message","data":{"content":"Fix the login bug"},"timestamp":"2025-01-15T10:00:01Z"}`,
+		`{"type":"assistant.message","data":{"content":"Done."},"timestamp":"2025-01-15T10:00:02Z"}`,
+	}
+	yaml := "id: ws-name\nname: Fix Login Authentication Bug\nuser_named: false\nsummary_count: 1\n"
+
+	path := writeDirSession(t, "ws-name", events, yaml)
+	sess, _ := parseAndValidateHelper(t, path, "m", 2)
+
+	// workspace.yaml name takes precedence over first user message.
+	assertEqual(t, "Fix Login Authentication Bug", sess.FirstMessage, "FirstMessage")
+}
+
+func TestParseCopilotSession_WorkspaceNameUserNamed(t *testing.T) {
+	events := []string{
+		`{"type":"session.start","data":{"sessionId":"ws-user-named"},"timestamp":"2025-01-15T10:00:00Z"}`,
+		`{"type":"user.message","data":{"content":"Original prompt"},"timestamp":"2025-01-15T10:00:01Z"}`,
+		`{"type":"assistant.message","data":{"content":"Done."},"timestamp":"2025-01-15T10:00:02Z"}`,
+	}
+	yaml := "id: ws-user-named\nname: My Custom Session Name\nuser_named: true\nsummary_count: 0\n"
+
+	path := writeDirSession(t, "ws-user-named", events, yaml)
+	sess, _ := parseAndValidateHelper(t, path, "m", 2)
+
+	// user_named: true sessions also use name as FirstMessage.
+	assertEqual(t, "My Custom Session Name", sess.FirstMessage, "FirstMessage")
+}
+
+func TestParseCopilotSession_WorkspaceNameMissing(t *testing.T) {
+	// workspace.yaml exists but has no name field (older sessions).
+	events := []string{
+		`{"type":"session.start","data":{"sessionId":"ws-no-name"},"timestamp":"2025-01-15T10:00:00Z"}`,
+		`{"type":"user.message","data":{"content":"First user message"},"timestamp":"2025-01-15T10:00:01Z"}`,
+		`{"type":"assistant.message","data":{"content":"Done."},"timestamp":"2025-01-15T10:00:02Z"}`,
+	}
+	yaml := "id: ws-no-name\nsummary_count: 0\ncreated_at: 2026-03-08T12:38:01.203Z\n"
+
+	path := writeDirSession(t, "ws-no-name", events, yaml)
+	sess, _ := parseAndValidateHelper(t, path, "m", 2)
+
+	// Falls back to first user message.
+	assertEqual(t, "First user message", sess.FirstMessage, "FirstMessage")
+}
+
+func TestParseCopilotSession_WorkspaceNameWhitespaceOnly(t *testing.T) {
+	events := []string{
+		`{"type":"session.start","data":{"sessionId":"ws-blank"},"timestamp":"2025-01-15T10:00:00Z"}`,
+		`{"type":"user.message","data":{"content":"Do something"},"timestamp":"2025-01-15T10:00:01Z"}`,
+		`{"type":"assistant.message","data":{"content":"Done."},"timestamp":"2025-01-15T10:00:02Z"}`,
+	}
+	yaml := "id: ws-blank\nname:   \nsummary_count: 0\n"
+
+	path := writeDirSession(t, "ws-blank", events, yaml)
+	sess, _ := parseAndValidateHelper(t, path, "m", 2)
+
+	// Whitespace-only name falls back to first user message.
+	assertEqual(t, "Do something", sess.FirstMessage, "FirstMessage")
+}
+
+func TestParseCopilotSession_WorkspaceNoYAMLFile(t *testing.T) {
+	// Directory format session with no workspace.yaml at all.
+	events := []string{
+		`{"type":"session.start","data":{"sessionId":"ws-noyaml"},"timestamp":"2025-01-15T10:00:00Z"}`,
+		`{"type":"user.message","data":{"content":"Hello there"},"timestamp":"2025-01-15T10:00:01Z"}`,
+		`{"type":"assistant.message","data":{"content":"Hi."},"timestamp":"2025-01-15T10:00:02Z"}`,
+	}
+
+	path := writeDirSession(t, "ws-noyaml", events, "")
+	sess, _ := parseAndValidateHelper(t, path, "m", 2)
+
+	assertEqual(t, "Hello there", sess.FirstMessage, "FirstMessage")
+}
+
+func TestParseCopilotSession_FlatFileNoWorkspaceYAML(t *testing.T) {
+	// Flat .jsonl format never looks for workspace.yaml.
+	path := writeCopilotJSONL(t,
+		`{"type":"session.start","data":{"sessionId":"flat-sess"},"timestamp":"2025-01-15T10:00:00Z"}`,
+		`{"type":"user.message","data":{"content":"Flat file prompt"},"timestamp":"2025-01-15T10:00:01Z"}`,
+		`{"type":"assistant.message","data":{"content":"OK."},"timestamp":"2025-01-15T10:00:02Z"}`,
+	)
+
+	sess, _ := parseAndValidateHelper(t, path, "m", 2)
+
+	assertEqual(t, "Flat file prompt", sess.FirstMessage, "FirstMessage")
+}
+
+func TestParseCopilotSession_WorkspaceNameTruncated(t *testing.T) {
+	longName := strings.Repeat("a", 350)
+	events := []string{
+		`{"type":"session.start","data":{"sessionId":"ws-long"},"timestamp":"2025-01-15T10:00:00Z"}`,
+		`{"type":"user.message","data":{"content":"original"},"timestamp":"2025-01-15T10:00:01Z"}`,
+		`{"type":"assistant.message","data":{"content":"Done."},"timestamp":"2025-01-15T10:00:02Z"}`,
+	}
+	yaml := "id: ws-long\nname: " + longName + "\nsummary_count: 1\n"
+
+	path := writeDirSession(t, "ws-long", events, yaml)
+	sess, _ := parseAndValidateHelper(t, path, "m", 2)
+
+	// truncate(s, 300) returns at most 303 bytes (300 runes + "...").
+	assert.LessOrEqual(t, len(sess.FirstMessage), 303, "FirstMessage not truncated")
+	assert.NotEqual(t, len(longName), len(sess.FirstMessage), "FirstMessage was not truncated at all")
 }
 
 func TestParseCopilotSession_DirectoryFormatFallbackID(t *testing.T) {
 	dir := t.TempDir()
 	sessDir := filepath.Join(dir, "def-789")
-	if err := os.MkdirAll(sessDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.MkdirAll(sessDir, 0o755))
 
 	// No session.start event, so ID comes from dir name.
 	content := strings.Join([]string{
@@ -230,11 +336,9 @@ func TestParseCopilotSession_DirectoryFormatFallbackID(t *testing.T) {
 	}, "\n") + "\n"
 
 	path := filepath.Join(sessDir, "events.jsonl")
-	if err := os.WriteFile(
+	require.NoError(t, os.WriteFile(
 		path, []byte(content), 0o644,
-	); err != nil {
-		t.Fatal(err)
-	}
+	))
 
 	sess, _ := parseAndValidateHelper(t, path, "m", 2)
 	assertEqual(t, "copilot:def-789", sess.ID, "session ID")
@@ -246,30 +350,18 @@ func TestParseCopilotSession_EmptySession(t *testing.T) {
 	)
 
 	sess, msgs, err := ParseCopilotSession(path, "m")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if sess != nil {
-		t.Errorf("expected nil session for empty, got %+v", sess)
-	}
-	if msgs != nil {
-		t.Errorf("expected nil messages for empty, got %d", len(msgs))
-	}
+	require.NoError(t, err)
+	assert.Nil(t, sess, "expected nil session for empty")
+	assert.Nil(t, msgs, "expected nil messages for empty")
 }
 
 func TestParseCopilotSession_NonexistentFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nonexistent.jsonl")
 
 	sess, msgs, err := ParseCopilotSession(path, "m")
-	if err != nil {
-		t.Fatalf("expected nil error, got %v", err)
-	}
-	if sess != nil {
-		t.Error("expected nil session for nonexistent file")
-	}
-	if msgs != nil {
-		t.Error("expected nil messages for nonexistent file")
-	}
+	require.NoError(t, err, "expected nil error")
+	assert.Nil(t, sess, "expected nil session for nonexistent file")
+	assert.Nil(t, msgs, "expected nil messages for nonexistent file")
 }
 
 func TestParseCopilotSession_ObjectArguments(t *testing.T) {
@@ -311,6 +403,46 @@ func TestCopilotUserMessageCount(t *testing.T) {
 	// Only 2 real user prompts: "Fix the bug" and "Ship it".
 	// The tool-result message at index 2 has empty Content.
 	assertEqual(t, 2, sess.UserMessageCount, "UserMessageCount")
+}
+
+func TestParseCopilotSession_SkipsSyntheticSkillMessages(t *testing.T) {
+	tests := []struct {
+		name     string
+		dataJSON string
+	}{
+		{
+			name:     "SourceAndContent",
+			dataJSON: `{"content":"<skill-context name=\"gh-cli\">\nbody\n</skill-context>","source":"skill-gh-cli"}`,
+		},
+		{
+			name:     "SourceOnly",
+			dataJSON: `{"content":"skill payload without wrapper","source":"skill-prd"}`,
+		},
+		{
+			name:     "ContentOnly",
+			dataJSON: `{"content":"<skill-context name=\"daily-summary\">\nbody\n</skill-context>"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeCopilotJSONL(t,
+				`{"type":"session.start","data":{"sessionId":"skill-filter"},"timestamp":"2025-01-15T10:00:00Z"}`,
+				`{"type":"user.message","data":`+tt.dataJSON+`,"timestamp":"2025-01-15T10:00:01Z"}`,
+				`{"type":"user.message","data":{"content":"Fix the parser"},"timestamp":"2025-01-15T10:00:02Z"}`,
+				`{"type":"assistant.message","data":{"content":"Working on it."},"timestamp":"2025-01-15T10:00:03Z"}`,
+			)
+
+			sess, msgs := parseAndValidateHelper(t, path, "m", 2)
+
+			assertEqual(t, "Fix the parser", sess.FirstMessage, "FirstMessage")
+			assertEqual(t, 1, sess.UserMessageCount, "UserMessageCount")
+			assertEqual(t, RoleUser, msgs[0].Role, "msgs[0].Role")
+			assertEqual(t, "Fix the parser", msgs[0].Content, "msgs[0].Content")
+			assertEqual(t, 0, msgs[0].Ordinal, "msgs[0].Ordinal")
+			assertEqual(t, 1, msgs[1].Ordinal, "msgs[1].Ordinal")
+		})
+	}
 }
 
 func TestParseCopilotSession_ModelChange(t *testing.T) {

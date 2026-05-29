@@ -11,6 +11,9 @@
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { agentColor, agentLabel } from "../../utils/agents.js";
   import { formatTokenUsage } from "../../utils/format.js";
+  import { normalizeMessagePreview } from "../../utils/messages.js";
+  import { getGradeStyle, getGradeLabel } from "../../utils/grade.js";
+  import SignalPanel from "../content/SignalPanel.svelte";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import {
@@ -102,6 +105,16 @@
       : "",
   );
 
+  const gradeStyle = $derived(
+    getGradeStyle(session?.health_grade),
+  );
+
+  $effect(() => {
+    if (ui.signalPanelOpen && session?.id) {
+      sessions.fetchSignalDetail(session.id);
+    }
+  });
+
   function sessionDisplayId(id: string): string {
     const idx = id.indexOf(":");
     return idx >= 0 ? id.slice(idx + 1) : id;
@@ -161,7 +174,8 @@
   function startRename() {
     if (!session) return;
     renameValue =
-      session.display_name ?? session.first_message ?? "";
+      session.display_name
+      ?? normalizeMessagePreview(session.first_message);
     renaming = true;
     closeMenu();
     requestAnimationFrame(() => renameInput?.select());
@@ -301,8 +315,15 @@
     }
   }
 
+  // Remote sessions have host-prefixed IDs (host~rawID).
+  const isLocal = $derived(
+    !session?.id.includes("~"),
+  );
+
   const canResume = $derived(
-    session ? supportsResume(session.agent) : false,
+    session
+      ? supportsResume(session.agent) && isLocal
+      : false,
   );
 
   const terminalOpeners = $derived(
@@ -325,9 +346,11 @@
 
   const showDropdown = $derived(
     canResume ||
-    editorOpeners.length > 0 ||
-    fileOpeners.length > 0 ||
-    (sessionDir !== null && !!session?.file_path),
+    (isLocal && (
+      editorOpeners.length > 0 ||
+      fileOpeners.length > 0 ||
+      (sessionDir !== null && !!session?.file_path)
+    )),
   );
 
   const isClaudeAgent = $derived(
@@ -356,7 +379,7 @@
       }
       return;
     }
-    if (showOpenMenu) {
+    if (showOpenMenu && isLocal) {
       // Number key shortcuts (1-9) for quick selection.
       const num = parseInt(e.key);
       if (num >= 1 && num <= 9) {
@@ -395,7 +418,11 @@
 
 <div class="session-breadcrumb-wrapper">
 <div class="session-breadcrumb">
-  <button class="breadcrumb-link" onclick={onBack}>
+  <button
+    class="breadcrumb-link"
+    onclick={onBack}
+    title="Back to sessions"
+  >
     Sessions
   </button>
   <span class="breadcrumb-sep">/</span>
@@ -434,6 +461,16 @@
           )}
         </span>
       {/if}
+      <button
+        class="grade-badge"
+        style:background={gradeStyle.bg}
+        style:color={gradeStyle.text}
+        style:border-color={gradeStyle.border}
+        onclick={() => ui.toggleSignalPanel()}
+        title="Session health"
+      >
+        {getGradeLabel(session.health_grade)}
+      </button>
       {#if showDropdown}
         <span class="open-group">
           <button
@@ -486,6 +523,7 @@
                   <span class="open-menu-name">Copy command</span>
                 </button>
               {/if}
+              {#if isLocal}
               <button class="open-menu-item" onclick={handleCopyFilePath}>
                 <span class="open-menu-num">
                   <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
@@ -525,6 +563,7 @@
                   </button>
                 {/each}
               {/if}
+              {/if}
               {#if canResume && claudeDesktopOpener}
                 <div class="open-menu-divider"></div>
                 <button
@@ -550,6 +589,7 @@
           class:active={showInfoPanel}
           title="Session info"
           onclick={toggleInfoPanel}
+          aria-label="Session info"
         >
           {copiedSessionId === session.id
             ? "Copied!"
@@ -594,10 +634,14 @@
         </button>
         <button
           class="minimap-btn"
-          class:minimap-btn--active={ui.activityMinimapOpen}
-          title="Activity minimap"
-          onclick={() => ui.toggleActivityMinimap()}
-          aria-label="Toggle activity minimap"
+          class:minimap-btn--active={ui.vitalsOpen}
+          title={ui.vitalsOpen
+            ? "Hide session analysis"
+            : "Show session analysis"}
+          onclick={() => ui.toggleVitals()}
+          aria-label={ui.vitalsOpen
+            ? "Hide session analysis"
+            : "Show session analysis"}
         >
           <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
             <path d="M1 14V8h2v6H1zm4 0V2h2v12H5zm4 0V5h2v9H9zm4 0V9h2v5h-2z"/>
@@ -617,6 +661,7 @@
         <button
           class="actions-btn"
           title="Session actions"
+          aria-label="Session actions"
           bind:this={menuBtnEl}
           onclick={toggleMenu}
         >
@@ -683,6 +728,10 @@
         </div>
       {/if}
     </div>
+  {/if}
+
+  {#if ui.signalPanelOpen && session}
+    <SignalPanel {session} />
   {/if}
 </div>
 
@@ -770,6 +819,22 @@
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
     flex-shrink: 0;
+  }
+
+  .grade-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 700;
+    border: 1px solid;
+    cursor: pointer;
+    line-height: 1.4;
+  }
+
+  .grade-badge:hover {
+    opacity: 0.85;
   }
 
   .open-group {

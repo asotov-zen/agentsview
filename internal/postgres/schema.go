@@ -7,14 +7,22 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 const tokenCoverageRepairMetadataKey = "token_coverage_repair_v1"
 const tokenCoverageBackfillBatchSize = 1000
+
+type columnMigration struct {
+	table  string
+	column string
+	def    string
+	desc   string
+}
 
 // coreDDL creates the tables and indexes. It uses unqualified
 // names because Open() sets search_path to the target schema.
@@ -44,6 +52,21 @@ CREATE TABLE IF NOT EXISTS sessions (
     has_total_output_tokens BOOLEAN NOT NULL DEFAULT FALSE,
     has_peak_context_tokens BOOLEAN NOT NULL DEFAULT FALSE,
     is_automated       BOOLEAN NOT NULL DEFAULT FALSE,
+    tool_failure_signal_count INT NOT NULL DEFAULT 0,
+    tool_retry_count          INT NOT NULL DEFAULT 0,
+    edit_churn_count          INT NOT NULL DEFAULT 0,
+    consecutive_failure_max   INT NOT NULL DEFAULT 0,
+    outcome                   TEXT NOT NULL DEFAULT 'unknown',
+    outcome_confidence        TEXT NOT NULL DEFAULT 'low',
+    ended_with_role           TEXT NOT NULL DEFAULT '',
+    final_failure_streak      INT NOT NULL DEFAULT 0,
+    signals_pending_since     TEXT,
+    compaction_count          INT NOT NULL DEFAULT 0,
+    mid_task_compaction_count INT NOT NULL DEFAULT 0,
+    context_pressure_max      DOUBLE PRECISION,
+    health_score              INT,
+    health_grade              TEXT,
+    termination_status        TEXT,
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -52,6 +75,7 @@ CREATE TABLE IF NOT EXISTS messages (
     ordinal        INT NOT NULL,
     role           TEXT NOT NULL,
     content        TEXT NOT NULL,
+    thinking_text  TEXT NOT NULL DEFAULT '',
     timestamp      TIMESTAMPTZ,
     has_thinking   BOOLEAN NOT NULL DEFAULT FALSE,
     has_tool_use   BOOLEAN NOT NULL DEFAULT FALSE,
@@ -65,9 +89,84 @@ CREATE TABLE IF NOT EXISTS messages (
     has_output_tokens  BOOLEAN NOT NULL DEFAULT FALSE,
     claude_message_id  TEXT NOT NULL DEFAULT '',
     claude_request_id  TEXT NOT NULL DEFAULT '',
+    source_type        TEXT NOT NULL DEFAULT '',
+    source_subtype     TEXT NOT NULL DEFAULT '',
+    source_uuid        TEXT NOT NULL DEFAULT '',
+    source_parent_uuid TEXT NOT NULL DEFAULT '',
+    is_sidechain       BOOLEAN NOT NULL DEFAULT FALSE,
+    is_compact_boundary BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (session_id, ordinal),
     FOREIGN KEY (session_id)
         REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS usage_events (
+    id BIGSERIAL PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    message_ordinal INT,
+    source TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INT NOT NULL DEFAULT 0,
+    output_tokens INT NOT NULL DEFAULT 0,
+    cache_creation_input_tokens INT NOT NULL DEFAULT 0,
+    cache_read_input_tokens INT NOT NULL DEFAULT 0,
+    reasoning_tokens INT NOT NULL DEFAULT 0,
+    cost_usd DOUBLE PRECISION,
+    cost_status TEXT NOT NULL DEFAULT '',
+    cost_source TEXT NOT NULL DEFAULT '',
+    occurred_at TIMESTAMPTZ,
+    dedup_key TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (session_id)
+        REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_dedup
+    ON usage_events (session_id, source, dedup_key)
+    WHERE dedup_key != '';
+
+CREATE INDEX IF NOT EXISTS idx_usage_events_session
+    ON usage_events (session_id);
+
+CREATE INDEX IF NOT EXISTS idx_usage_events_occurred
+    ON usage_events (occurred_at);
+
+CREATE TABLE IF NOT EXISTS starred_sessions (
+    session_id TEXT PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (session_id)
+        REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS pinned_messages (
+    id          BIGSERIAL PRIMARY KEY,
+    session_id  TEXT NOT NULL,
+    message_id  INT NOT NULL,
+    ordinal     INT NOT NULL,
+    source_uuid TEXT NOT NULL DEFAULT '',
+    note        TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (session_id)
+        REFERENCES sessions(id) ON DELETE CASCADE,
+    UNIQUE (session_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pinned_session
+    ON pinned_messages (session_id);
+
+CREATE INDEX IF NOT EXISTS idx_pinned_created
+    ON pinned_messages (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_pinned_source_uuid
+    ON pinned_messages (session_id, source_uuid)
+    WHERE source_uuid <> '';
+
+CREATE TABLE IF NOT EXISTS model_pricing (
+    model_pattern TEXT PRIMARY KEY,
+    input_per_mtok DOUBLE PRECISION NOT NULL DEFAULT 0,
+    output_per_mtok DOUBLE PRECISION NOT NULL DEFAULT 0,
+    cache_creation_per_mtok DOUBLE PRECISION NOT NULL DEFAULT 0,
+    cache_read_per_mtok DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -119,6 +218,32 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_result_events_dedup
         session_id, tool_call_message_ordinal,
         call_index, event_index
     );
+
+CREATE TABLE IF NOT EXISTS secret_findings (
+    id               BIGINT GENERATED ALWAYS AS IDENTITY
+                         PRIMARY KEY,
+    session_id       TEXT NOT NULL
+                         REFERENCES sessions(id)
+                         ON DELETE CASCADE,
+    rule_name        TEXT NOT NULL,
+    confidence       TEXT NOT NULL,
+    location_kind    TEXT NOT NULL,
+    message_ordinal  INTEGER NOT NULL,
+    call_index       INTEGER,
+    event_index      INTEGER,
+    match_start      INTEGER NOT NULL,
+    match_end        INTEGER NOT NULL,
+    match_index      INTEGER NOT NULL,
+    redacted_match   TEXT NOT NULL,
+    rules_version    TEXT NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_secret_findings_session
+    ON secret_findings (session_id);
+
+CREATE INDEX IF NOT EXISTS idx_secret_findings_rule
+    ON secret_findings (rule_name);
 `
 
 // EnsureSchema creates the schema (if needed), then runs
@@ -130,152 +255,337 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_result_events_dedup
 func EnsureSchema(
 	ctx context.Context, db *sql.DB, schema string,
 ) error {
+	start := time.Now()
 	quoted, err := quoteIdentifier(schema)
 	if err != nil {
 		return fmt.Errorf("invalid schema name: %w", err)
 	}
+	step := time.Now()
 	if _, err := db.ExecContext(ctx,
 		"CREATE SCHEMA IF NOT EXISTS "+quoted,
 	); err != nil {
 		return fmt.Errorf("creating pg schema: %w", err)
 	}
+	log.Printf(
+		"pg schema: create schema step completed in %s",
+		time.Since(step).Round(time.Millisecond),
+	)
+	step = time.Now()
 	if _, err := db.ExecContext(ctx, coreDDL); err != nil {
 		return fmt.Errorf("creating pg tables: %w", err)
 	}
+	log.Printf(
+		"pg schema: core DDL step completed in %s",
+		time.Since(step).Round(time.Millisecond),
+	)
 
 	// Idempotent column additions for forward compatibility.
-	alters := []struct {
-		table  string
-		column string
-		stmt   string
-		desc   string
-	}{
+	alters := []columnMigration{
 		{
 			"sessions", "deleted_at",
-			`ALTER TABLE sessions
-			 ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`,
+			`deleted_at TIMESTAMPTZ`,
 			"adding sessions.deleted_at",
 		},
 		{
 			"sessions", "created_at",
-			`ALTER TABLE sessions
-			 ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ`,
+			`created_at TIMESTAMPTZ`,
 			"adding sessions.created_at",
 		},
 		{
 			"sessions", "total_output_tokens",
-			`ALTER TABLE sessions
-			 ADD COLUMN IF NOT EXISTS total_output_tokens
-			 INT NOT NULL DEFAULT 0`,
+			`total_output_tokens INT NOT NULL DEFAULT 0`,
 			"adding sessions.total_output_tokens",
 		},
 		{
 			"sessions", "peak_context_tokens",
-			`ALTER TABLE sessions
-			 ADD COLUMN IF NOT EXISTS peak_context_tokens
-			 INT NOT NULL DEFAULT 0`,
+			`peak_context_tokens INT NOT NULL DEFAULT 0`,
 			"adding sessions.peak_context_tokens",
 		},
 		{
 			"sessions", "has_total_output_tokens",
-			`ALTER TABLE sessions
-			 ADD COLUMN IF NOT EXISTS has_total_output_tokens
-			 BOOLEAN NOT NULL DEFAULT FALSE`,
+			`has_total_output_tokens BOOLEAN NOT NULL DEFAULT FALSE`,
 			"adding sessions.has_total_output_tokens",
 		},
 		{
 			"sessions", "has_peak_context_tokens",
-			`ALTER TABLE sessions
-			 ADD COLUMN IF NOT EXISTS has_peak_context_tokens
-			 BOOLEAN NOT NULL DEFAULT FALSE`,
+			`has_peak_context_tokens BOOLEAN NOT NULL DEFAULT FALSE`,
 			"adding sessions.has_peak_context_tokens",
 		},
 		{
 			"messages", "model",
-			`ALTER TABLE messages
-			 ADD COLUMN IF NOT EXISTS model
-			 TEXT NOT NULL DEFAULT ''`,
+			`model TEXT NOT NULL DEFAULT ''`,
 			"adding messages.model",
 		},
 		{
 			"messages", "token_usage",
-			`ALTER TABLE messages
-			 ADD COLUMN IF NOT EXISTS token_usage
-			 TEXT NOT NULL DEFAULT ''`,
+			`token_usage TEXT NOT NULL DEFAULT ''`,
 			"adding messages.token_usage",
 		},
 		{
 			"messages", "context_tokens",
-			`ALTER TABLE messages
-			 ADD COLUMN IF NOT EXISTS context_tokens
-			 INT NOT NULL DEFAULT 0`,
+			`context_tokens INT NOT NULL DEFAULT 0`,
 			"adding messages.context_tokens",
 		},
 		{
 			"messages", "output_tokens",
-			`ALTER TABLE messages
-			 ADD COLUMN IF NOT EXISTS output_tokens
-			 INT NOT NULL DEFAULT 0`,
+			`output_tokens INT NOT NULL DEFAULT 0`,
 			"adding messages.output_tokens",
 		},
 		{
 			"messages", "has_context_tokens",
-			`ALTER TABLE messages
-			 ADD COLUMN IF NOT EXISTS has_context_tokens
-			 BOOLEAN NOT NULL DEFAULT FALSE`,
+			`has_context_tokens BOOLEAN NOT NULL DEFAULT FALSE`,
 			"adding messages.has_context_tokens",
 		},
 		{
 			"messages", "has_output_tokens",
-			`ALTER TABLE messages
-			 ADD COLUMN IF NOT EXISTS has_output_tokens
-			 BOOLEAN NOT NULL DEFAULT FALSE`,
+			`has_output_tokens BOOLEAN NOT NULL DEFAULT FALSE`,
 			"adding messages.has_output_tokens",
 		},
 		{
 			"messages", "claude_message_id",
-			`ALTER TABLE messages
-			 ADD COLUMN IF NOT EXISTS claude_message_id
-			 TEXT NOT NULL DEFAULT ''`,
+			`claude_message_id TEXT NOT NULL DEFAULT ''`,
 			"adding messages.claude_message_id",
 		},
 		{
 			"messages", "claude_request_id",
-			`ALTER TABLE messages
-			 ADD COLUMN IF NOT EXISTS claude_request_id
-			 TEXT NOT NULL DEFAULT ''`,
+			`claude_request_id TEXT NOT NULL DEFAULT ''`,
 			"adding messages.claude_request_id",
 		},
 		{
 			"tool_calls", "call_index",
-			`ALTER TABLE tool_calls
-			 ADD COLUMN IF NOT EXISTS call_index
-			 INT NOT NULL DEFAULT 0`,
+			`call_index INT NOT NULL DEFAULT 0`,
 			"adding tool_calls.call_index",
 		},
 		{
 			"sessions", "is_automated",
-			`ALTER TABLE sessions
-			 ADD COLUMN IF NOT EXISTS is_automated
-			 BOOLEAN NOT NULL DEFAULT FALSE`,
+			`is_automated BOOLEAN NOT NULL DEFAULT FALSE`,
 			"adding sessions.is_automated",
 		},
+		{
+			"sessions", "tool_failure_signal_count",
+			`tool_failure_signal_count INT NOT NULL DEFAULT 0`,
+			"adding sessions.tool_failure_signal_count",
+		},
+		{
+			"sessions", "tool_retry_count",
+			`tool_retry_count INT NOT NULL DEFAULT 0`,
+			"adding sessions.tool_retry_count",
+		},
+		{
+			"sessions", "edit_churn_count",
+			`edit_churn_count INT NOT NULL DEFAULT 0`,
+			"adding sessions.edit_churn_count",
+		},
+		{
+			"sessions", "consecutive_failure_max",
+			`consecutive_failure_max INT NOT NULL DEFAULT 0`,
+			"adding sessions.consecutive_failure_max",
+		},
+		{
+			"sessions", "outcome",
+			`outcome TEXT NOT NULL DEFAULT 'unknown'`,
+			"adding sessions.outcome",
+		},
+		{
+			"sessions", "outcome_confidence",
+			`outcome_confidence TEXT NOT NULL DEFAULT 'low'`,
+			"adding sessions.outcome_confidence",
+		},
+		{
+			"sessions", "ended_with_role",
+			`ended_with_role TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.ended_with_role",
+		},
+		{
+			"sessions", "final_failure_streak",
+			`final_failure_streak INT NOT NULL DEFAULT 0`,
+			"adding sessions.final_failure_streak",
+		},
+		{
+			"sessions", "signals_pending_since",
+			`signals_pending_since TEXT`,
+			"adding sessions.signals_pending_since",
+		},
+		{
+			"sessions", "compaction_count",
+			`compaction_count INT NOT NULL DEFAULT 0`,
+			"adding sessions.compaction_count",
+		},
+		{
+			"sessions", "mid_task_compaction_count",
+			`mid_task_compaction_count INT NOT NULL DEFAULT 0`,
+			"adding sessions.mid_task_compaction_count",
+		},
+		{
+			"sessions", "context_pressure_max",
+			`context_pressure_max DOUBLE PRECISION`,
+			"adding sessions.context_pressure_max",
+		},
+		{
+			"sessions", "health_score",
+			`health_score INT`,
+			"adding sessions.health_score",
+		},
+		{
+			"sessions", "health_grade",
+			`health_grade TEXT`,
+			"adding sessions.health_grade",
+		},
+		{
+			"sessions", "has_tool_calls",
+			`has_tool_calls BOOLEAN NOT NULL DEFAULT FALSE`,
+			"adding sessions.has_tool_calls",
+		},
+		{
+			"sessions", "has_context_data",
+			`has_context_data BOOLEAN NOT NULL DEFAULT FALSE`,
+			"adding sessions.has_context_data",
+		},
+		{
+			"sessions", "data_version",
+			`data_version INT NOT NULL DEFAULT 0`,
+			"adding sessions.data_version",
+		},
+		{
+			"sessions", "cwd",
+			`cwd TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.cwd",
+		},
+		{
+			"sessions", "git_branch",
+			`git_branch TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.git_branch",
+		},
+		{
+			"sessions", "source_session_id",
+			`source_session_id TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.source_session_id",
+		},
+		{
+			"sessions", "source_version",
+			`source_version TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.source_version",
+		},
+		{
+			"sessions", "parser_malformed_lines",
+			`parser_malformed_lines INT NOT NULL DEFAULT 0`,
+			"adding sessions.parser_malformed_lines",
+		},
+		{
+			"sessions", "is_truncated",
+			`is_truncated BOOLEAN NOT NULL DEFAULT FALSE`,
+			"adding sessions.is_truncated",
+		},
+		{
+			"messages", "source_type",
+			`source_type TEXT NOT NULL DEFAULT ''`,
+			"adding messages.source_type",
+		},
+		{
+			"messages", "source_subtype",
+			`source_subtype TEXT NOT NULL DEFAULT ''`,
+			"adding messages.source_subtype",
+		},
+		{
+			"messages", "source_uuid",
+			`source_uuid TEXT NOT NULL DEFAULT ''`,
+			"adding messages.source_uuid",
+		},
+		{
+			"messages", "source_parent_uuid",
+			`source_parent_uuid TEXT NOT NULL DEFAULT ''`,
+			"adding messages.source_parent_uuid",
+		},
+		{
+			"messages", "is_sidechain",
+			`is_sidechain BOOLEAN NOT NULL DEFAULT FALSE`,
+			"adding messages.is_sidechain",
+		},
+		{
+			"messages", "is_compact_boundary",
+			`is_compact_boundary BOOLEAN NOT NULL DEFAULT FALSE`,
+			"adding messages.is_compact_boundary",
+		},
+		{
+			"messages", "thinking_text",
+			`thinking_text TEXT NOT NULL DEFAULT ''`,
+			"adding messages.thinking_text",
+		},
+		{
+			"sessions", "termination_status",
+			`termination_status TEXT`,
+			"adding sessions.termination_status",
+		},
+		{
+			"sessions", "secret_leak_count",
+			`secret_leak_count INTEGER NOT NULL DEFAULT 0`,
+			"adding sessions.secret_leak_count",
+		},
+		{
+			"sessions", "secrets_rules_version",
+			`secrets_rules_version TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.secrets_rules_version",
+		},
 	}
+	step = time.Now()
+	existingColumns, err := loadExistingColumns(ctx, db, alters)
+	if err != nil {
+		return err
+	}
+	log.Printf(
+		"pg schema: loaded existing columns in %s",
+		time.Since(step).Round(time.Millisecond),
+	)
+	step = time.Now()
 	tokenCoverageColumnsAdded := false
-	for _, a := range alters {
-		added, err := ensureColumn(ctx, db, a.table, a.column, a.stmt)
-		if err != nil {
-			return fmt.Errorf("%s: %w", a.desc, err)
-		}
-		switch a.column {
+	addedColumns, err := ensureColumns(ctx, db, existingColumns, alters)
+	if err != nil {
+		return err
+	}
+	for _, column := range addedColumns {
+		switch column {
 		case "has_total_output_tokens", "has_peak_context_tokens",
 			"has_context_tokens", "has_output_tokens":
-			tokenCoverageColumnsAdded = tokenCoverageColumnsAdded || added
+			tokenCoverageColumnsAdded = true
 		}
+	}
+	log.Printf(
+		"pg schema: column migration step completed in %s"+
+			" (%d column(s) added)",
+		time.Since(step).Round(time.Millisecond),
+		len(addedColumns),
+	)
+	step = time.Now()
+	if _, err := db.ExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_termination_status
+		 ON sessions(termination_status)`,
+	); err != nil {
+		return fmt.Errorf(
+			"creating idx_sessions_termination_status: %w", err,
+		)
 	}
 	if err := backfillIsAutomatedPG(ctx, db); err != nil {
 		return err
 	}
+	log.Printf(
+		"pg schema: automated-session backfill step completed in %s",
+		time.Since(step).Round(time.Millisecond),
+	)
+	step = time.Now()
+	if err := createPartialIndexesPG(ctx, db); err != nil {
+		return err
+	}
+	log.Printf(
+		"pg schema: partial indexes step completed in %s",
+		time.Since(step).Round(time.Millisecond),
+	)
+	step = time.Now()
+	createContentSearchIndexesPG(ctx, db)
+	log.Printf(
+		"pg schema: content search index step completed in %s",
+		time.Since(step).Round(time.Millisecond),
+	)
+	step = time.Now()
 	runRepair, err := shouldRunTokenCoverageRepair(
 		ctx, db, tokenCoverageColumnsAdded,
 	)
@@ -283,46 +593,139 @@ func EnsureSchema(
 		return err
 	}
 	if !runRepair {
+		log.Printf(
+			"pg schema: token coverage repair check completed"+
+				" in %s (repair skipped)",
+			time.Since(step).Round(time.Millisecond),
+		)
+		log.Printf(
+			"pg schema: EnsureSchema completed in %s",
+			time.Since(start).Round(time.Millisecond),
+		)
 		return nil
 	}
+	log.Printf(
+		"pg schema: token coverage repair check completed"+
+			" in %s (repair needed)",
+		time.Since(step).Round(time.Millisecond),
+	)
+	step = time.Now()
 	if err := backfillTokenCoverageFlags(ctx, db); err != nil {
 		return err
 	}
+	log.Printf(
+		"pg schema: token coverage backfill step completed in %s",
+		time.Since(step).Round(time.Millisecond),
+	)
+	step = time.Now()
 	if err := markTokenCoverageRepairDone(ctx, db); err != nil {
 		return err
+	}
+	log.Printf(
+		"pg schema: token coverage repair marker stored in %s",
+		time.Since(step).Round(time.Millisecond),
+	)
+	log.Printf(
+		"pg schema: EnsureSchema completed in %s",
+		time.Since(start).Round(time.Millisecond),
+	)
+	return nil
+}
+
+// createPartialIndexesPG creates partial indexes on the PG schema.
+// Idempotent via IF NOT EXISTS.
+func createPartialIndexesPG(ctx context.Context, db *sql.DB) error {
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_sessions_cwd
+		 ON sessions(cwd) WHERE cwd != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_compact_boundary
+		 ON messages(session_id, ordinal) WHERE is_compact_boundary = TRUE`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_sidechain
+		 ON messages(session_id) WHERE is_sidechain = TRUE`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_source_uuid
+		 ON messages(source_uuid) WHERE source_uuid != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_has_secret
+		 ON sessions(secret_leak_count) WHERE secret_leak_count > 0`,
+	}
+	for _, ddl := range indexes {
+		if _, err := db.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("creating PG index: %w", err)
+		}
 	}
 	return nil
 }
 
-const isAutomatedBackfillMetadataKey = "is_automated_backfill_v1"
+// createContentSearchIndexesPG adds a pg_trgm GIN index on messages.content so
+// the content search (ILIKE '%pattern%') is index-accelerated instead of
+// sequentially scanning the messages table as history grows.
+//
+// It is best-effort and never fails schema setup. pg_trgm is a trusted
+// extension on PostgreSQL 13+, but a role without CREATE privilege (or a
+// managed instance that blocks it) must still get a working — if slower —
+// store. Each statement runs in its own implicit transaction, so a failed
+// CREATE EXTENSION does not poison the rest of EnsureSchema. The gin_trgm_ops
+// operator class lives in whatever schema pg_trgm was installed in, which may
+// not be on the connection search_path (Open sets it to the target schema
+// only), so the opclass is schema-qualified to the extension's namespace.
+func createContentSearchIndexesPG(ctx context.Context, db *sql.DB) {
+	if _, err := db.ExecContext(ctx,
+		`CREATE EXTENSION IF NOT EXISTS pg_trgm`,
+	); err != nil {
+		log.Printf(
+			"pg schema: pg_trgm unavailable, content search will scan: %v", err,
+		)
+		return
+	}
+	var extSchema string
+	if err := db.QueryRowContext(ctx,
+		`SELECT n.nspname FROM pg_extension e
+		 JOIN pg_namespace n ON n.oid = e.extnamespace
+		 WHERE e.extname = 'pg_trgm'`,
+	).Scan(&extSchema); err != nil {
+		log.Printf("pg schema: locating pg_trgm schema failed: %v", err)
+		return
+	}
+	quotedExt, err := quoteIdentifier(extSchema)
+	if err != nil {
+		log.Printf("pg schema: invalid pg_trgm schema %q: %v", extSchema, err)
+		return
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		`CREATE INDEX IF NOT EXISTS idx_messages_content_trgm
+		 ON messages USING gin (content %s.gin_trgm_ops)`, quotedExt,
+	)); err != nil {
+		log.Printf(
+			"pg schema: creating messages.content trigram index failed: %v", err,
+		)
+	}
+}
 
-// backfillIsAutomatedPG recomputes is_automated for all PG
-// sessions, correcting both false negatives (new patterns) and
-// stale false positives (patterns tightened since last run).
-// Guarded by a sync_metadata marker so it only runs once per
-// pattern version.
+// backfillIsAutomatedPG verifies is_automated for all PG
+// sessions, correcting both false negatives (new patterns or
+// stale imported rows) and stale false positives (patterns
+// tightened since last run). The stored classifier hash records
+// which classifier wrote the current audit, but it is not a
+// complete integrity marker: rows can arrive from stale clients
+// after the hash was stamped.
 func backfillIsAutomatedPG(
 	ctx context.Context, pg *sql.DB,
 ) error {
-	var done int
-	if err := pg.QueryRowContext(ctx,
-		`SELECT count(*) FROM sync_metadata
-		 WHERE key = $1 AND value != ''`,
-		isAutomatedBackfillMetadataKey,
-	).Scan(&done); err != nil {
+	current := db.ClassifierHash()
+	var stored string
+	err := pg.QueryRowContext(ctx,
+		`SELECT value FROM sync_metadata WHERE key = $1`,
+		db.ClassifierHashKey,
+	).Scan(&stored)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf(
-			"probing PG automated backfill marker: %w", err,
+			"probing PG classifier hash: %w", err,
 		)
-	}
-	if done > 0 {
-		return nil
 	}
 
 	rows, err := pg.QueryContext(ctx,
 		`SELECT id, first_message, user_message_count,
 			is_automated
-		 FROM sessions
-		 WHERE first_message IS NOT NULL`)
+		 FROM sessions`)
 	if err != nil {
 		return fmt.Errorf(
 			"querying PG automated backfill candidates: %w",
@@ -333,20 +736,24 @@ func backfillIsAutomatedPG(
 
 	var setIDs, clearIDs []string
 	for rows.Next() {
-		var id, fm string
+		var id string
+		var fm sql.NullString
 		var umc int
-		var current bool
+		var rowAutomated bool
 		if err := rows.Scan(
-			&id, &fm, &umc, &current,
+			&id, &fm, &umc, &rowAutomated,
 		); err != nil {
 			return fmt.Errorf(
 				"scanning PG backfill candidate: %w", err,
 			)
 		}
-		want := umc <= 1 && db.IsAutomatedSession(fm)
-		if want && !current {
+		want := false
+		if fm.Valid {
+			want = umc <= 1 && db.IsAutomatedSession(fm.String)
+		}
+		if want && !rowAutomated {
 			setIDs = append(setIDs, id)
-		} else if !want && current {
+		} else if !want && rowAutomated {
 			clearIDs = append(clearIDs, id)
 		}
 	}
@@ -373,14 +780,18 @@ func backfillIsAutomatedPG(
 		)
 	}
 
-	_, err = pg.ExecContext(ctx,
+	if _, err := pg.ExecContext(ctx,
 		`INSERT INTO sync_metadata (key, value)
-		 VALUES ($1, '1')
+		 VALUES ($1, $2)
 		 ON CONFLICT (key) DO UPDATE
 		 SET value = EXCLUDED.value`,
-		isAutomatedBackfillMetadataKey,
-	)
-	return err
+		db.ClassifierHashKey, current,
+	); err != nil {
+		return fmt.Errorf(
+			"storing PG classifier hash: %w", err,
+		)
+	}
+	return nil
 }
 
 func batchUpdateAutomatedPG(
@@ -413,32 +824,125 @@ func batchUpdateAutomatedPG(
 	return nil
 }
 
-func ensureColumn(
-	ctx context.Context, db *sql.DB,
-	table, column, stmt string,
-) (bool, error) {
-	var exists bool
-	if err := db.QueryRowContext(ctx,
-		`SELECT EXISTS (
-			SELECT 1
-			FROM information_schema.columns
-			WHERE table_schema = current_schema()
-			  AND table_name = $1
-			  AND column_name = $2
-		)`,
-		table, column,
-	).Scan(&exists); err != nil {
-		return false, fmt.Errorf(
-			"probing %s.%s: %w", table, column, err,
+func loadExistingColumns(
+	ctx context.Context, db *sql.DB, alters []columnMigration,
+) (map[string]map[string]bool, error) {
+	tablesSeen := map[string]bool{}
+	var tables []string
+	for _, a := range alters {
+		if tablesSeen[a.table] {
+			continue
+		}
+		tablesSeen[a.table] = true
+		tables = append(tables, a.table)
+	}
+
+	existing := map[string]map[string]bool{}
+	if len(tables) == 0 {
+		return existing, nil
+	}
+
+	pb := &paramBuilder{}
+	phs := make([]string, len(tables))
+	for i, table := range tables {
+		phs[i] = pb.add(table)
+	}
+	rows, err := db.QueryContext(ctx,
+		`SELECT table_name, column_name
+		 FROM information_schema.columns
+		 WHERE table_schema = current_schema()
+		   AND table_name IN (`+strings.Join(phs, ",")+`)`,
+		pb.args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"loading existing PG columns: %w", err,
 		)
 	}
-	if exists {
-		return false, nil
+	defer rows.Close()
+
+	for rows.Next() {
+		var table, column string
+		if err := rows.Scan(&table, &column); err != nil {
+			return nil, fmt.Errorf(
+				"scanning existing PG columns: %w", err,
+			)
+		}
+		if existing[table] == nil {
+			existing[table] = map[string]bool{}
+		}
+		existing[table][column] = true
 	}
-	if _, err := db.ExecContext(ctx, stmt); err != nil {
-		return false, err
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterating existing PG columns: %w", err,
+		)
 	}
-	return true, nil
+	return existing, nil
+}
+
+func ensureColumns(
+	ctx context.Context, db *sql.DB,
+	existing map[string]map[string]bool,
+	migrations []columnMigration,
+) ([]string, error) {
+	type tableAdds struct {
+		table      string
+		migrations []columnMigration
+	}
+
+	byTable := map[string]*tableAdds{}
+	var tables []*tableAdds
+	for _, migration := range migrations {
+		if existing[migration.table][migration.column] {
+			continue
+		}
+		adds := byTable[migration.table]
+		if adds == nil {
+			adds = &tableAdds{table: migration.table}
+			byTable[migration.table] = adds
+			tables = append(tables, adds)
+		}
+		adds.migrations = append(adds.migrations, migration)
+	}
+
+	var added []string
+	for _, adds := range tables {
+		quotedTable, err := quoteIdentifier(adds.table)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"invalid PG migration table %q: %w",
+				adds.table, err,
+			)
+		}
+		clauses := make([]string, len(adds.migrations))
+		for i, migration := range adds.migrations {
+			clauses[i] = "ADD COLUMN IF NOT EXISTS " +
+				migration.def
+		}
+		stmt := "ALTER TABLE " + quotedTable + " " +
+			strings.Join(clauses, ", ")
+		step := time.Now()
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return nil, fmt.Errorf(
+				"adding %d column(s) to %s: %w",
+				len(adds.migrations), adds.table, err,
+			)
+		}
+		log.Printf(
+			"pg schema: added %d column(s) to %s in %s",
+			len(adds.migrations), adds.table,
+			time.Since(step).Round(time.Millisecond),
+		)
+		if existing[adds.table] == nil {
+			existing[adds.table] = map[string]bool{}
+		}
+		for _, migration := range adds.migrations {
+			existing[adds.table][migration.column] = true
+			added = append(added, migration.column)
+		}
+	}
+	return added, nil
 }
 
 func shouldRunTokenCoverageRepair(
@@ -777,7 +1281,8 @@ func CheckSchemaCompat(
 	ctx context.Context, db *sql.DB,
 ) error {
 	rows, err := db.QueryContext(ctx,
-		`SELECT id, created_at, deleted_at, updated_at
+		`SELECT id, created_at, deleted_at, updated_at,
+			termination_status, secret_leak_count, secrets_rules_version
 		 FROM sessions LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
@@ -809,6 +1314,27 @@ func CheckSchemaCompat(
 	}
 	rows.Close()
 	rows, err = db.QueryContext(ctx,
+		`SELECT session_id, created_at
+		 FROM starred_sessions LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"starred_sessions table missing required columns: %w",
+			err,
+		)
+	}
+	rows.Close()
+	rows, err = db.QueryContext(ctx,
+		`SELECT id, session_id, message_id, ordinal,
+			source_uuid, note, created_at
+		 FROM pinned_messages LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"pinned_messages table missing required columns: %w",
+			err,
+		)
+	}
+	rows.Close()
+	rows, err = db.QueryContext(ctx,
 		`SELECT total_output_tokens, peak_context_tokens,
 			has_total_output_tokens, has_peak_context_tokens
 		 FROM sessions LIMIT 0`)
@@ -827,6 +1353,27 @@ func CheckSchemaCompat(
 			"tool_result_events table missing required columns: %w",
 			err,
 		)
+	}
+	rows.Close()
+
+	rows, err = db.QueryContext(ctx,
+		`SELECT id FROM usage_events LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"usage_events table missing required columns: %w",
+			err,
+		)
+	}
+	rows.Close()
+
+	rows, err = db.QueryContext(ctx,
+		`SELECT id, session_id, rule_name, confidence, location_kind,
+			message_ordinal, call_index, event_index,
+			match_start, match_end, match_index,
+			redacted_match, rules_version
+		 FROM secret_findings LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf("secret_findings table missing required columns: %w", err)
 	}
 	rows.Close()
 	return nil

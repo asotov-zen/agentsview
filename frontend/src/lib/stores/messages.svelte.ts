@@ -4,7 +4,7 @@ import { clearContentCaches } from "../utils/content-parser.js";
 import { computeMainModel } from "../utils/model.js";
 
 const MESSAGE_PAGE_SIZE = 1000;
-const FULL_SESSION_MESSAGE_THRESHOLD = 20_000;
+const FULL_SESSION_MESSAGE_THRESHOLD = 3_000;
 
 interface FetchPageOptions {
   from: number;
@@ -243,7 +243,20 @@ class MessagesStore {
       signal,
     });
     if (pages.length > 0) {
-      this.messages.push(...pages);
+      const updates = new Map(
+        pages.map((m) => [m.ordinal, m]),
+      );
+      const existingOrdinals = new Set(
+        this.messages.map((m) => m.ordinal),
+      );
+      const appended = pages.filter(
+        (m) => !existingOrdinals.has(m.ordinal),
+      );
+      clearContentCaches();
+      this.messages = [
+        ...this.messages.map((m) => updates.get(m.ordinal) ?? m),
+        ...appended,
+      ];
     }
   }
 
@@ -408,12 +421,14 @@ class MessagesStore {
 
       const newCount = sess.message_count ?? 0;
       const oldCount = this.messageCount;
-      if (newCount === oldCount) return;
+      if (newCount === oldCount) {
+        await this.refreshLoadedWindow(id, signal);
+        return;
+      }
 
       if (newCount > oldCount && this.messages.length > 0) {
-        const lastOrdinal =
-          this.messages[this.messages.length - 1]!.ordinal;
-        await this.loadFrom(id, lastOrdinal + 1, signal);
+        const oldestOrdinal = this.messages[0]!.ordinal;
+        await this.loadFrom(id, oldestOrdinal, signal);
         if (this.sessionId !== id) return;
 
         const newest =
@@ -432,6 +447,39 @@ class MessagesStore {
       if (isAbortError(err)) return;
       console.warn("Reload failed:", err);
     }
+  }
+
+  private async refreshLoadedWindow(
+    id: string,
+    signal: AbortSignal,
+  ) {
+    const oldest = this.messages[0];
+    const newest = this.messages[this.messages.length - 1];
+    if (!oldest || !newest) return;
+
+    const refreshed = await this.fetchPages(id, {
+      from: oldest.ordinal,
+      limit: MESSAGE_PAGE_SIZE,
+      direction: "asc",
+      signal,
+    });
+    if (this.sessionId !== id || refreshed.length === 0) {
+      return;
+    }
+
+    const updates = new Map(
+      refreshed
+        .filter(
+          (m) =>
+            m.ordinal >= oldest.ordinal &&
+            m.ordinal <= newest.ordinal,
+        )
+        .map((m) => [m.ordinal, m]),
+    );
+    clearContentCaches();
+    this.messages = this.messages.map(
+      (m) => updates.get(m.ordinal) ?? m,
+    );
   }
 
   private async fullReload(

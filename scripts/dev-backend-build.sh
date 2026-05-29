@@ -7,11 +7,11 @@ set -eu
 
 mkdir -p tmp
 
-# Ensure the embed dir exists even if frontend hasn't been built,
-# so go:embed doesn't complain during backend-only dev.
 mkdir -p internal/web/dist
-[ -n "$(ls internal/web/dist/ 2>/dev/null)" ] \
-  || echo ok > internal/web/dist/stub.html
+[ -f internal/web/dist/.keep ] \
+  || printf '%s\n' \
+    'keep embed dir for generated frontend assets' \
+    > internal/web/dist/.keep
 
 VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"

@@ -7,8 +7,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,18 +27,40 @@ const PREFERRED_PORT: u16 = 8080;
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(125);
 const LOGIN_SHELL_ENV_TIMEOUT: Duration = Duration::from_secs(3);
+const UPDATE_SIDECAR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 type DynError = Box<dyn Error>;
 type CommandRx = Receiver<CommandEvent>;
 
 #[derive(Default)]
 struct SidecarState {
-    child: Mutex<Option<CommandChild>>,
+    child: Mutex<Option<SidecarProcess>>,
     backend_port: Mutex<Option<u16>>,
+    active_generation: Mutex<Option<u64>>,
+    stopping_generation: Mutex<Option<u64>>,
+    restart_after_stop_timeout_generation: Mutex<Option<u64>>,
+    active_update_stop_waiters: AtomicUsize,
+    terminated_generation: Mutex<u64>,
+    termination: Condvar,
+    next_generation: AtomicU64,
+}
+
+struct SidecarProcess {
+    child: CommandChild,
+    generation: u64,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebKitGTK 2.40+ DMABUF renderer aborts on some Linux EGL
+    // setups (NVIDIA, headless, certain Wayland sessions); fall
+    // back to the legacy compositing path unless the user opted
+    // out by setting the variable explicitly.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     let mut updater_builder = tauri_plugin_updater::Builder::new();
     // Override the placeholder pubkey from tauri.conf.json with
     // the real key when baked in at compile time via env var.
@@ -85,9 +107,10 @@ pub fn run() {
 
 fn launch_backend(app: &mut App) -> Result<(), DynError> {
     let window = main_window(app)?;
-    let (rx, child) = spawn_sidecar(app)?;
+    let handle = app.handle().clone();
+    let (rx, child) = spawn_sidecar(&handle)?;
 
-    save_sidecar(app, child)?;
+    let generation = save_sidecar(&handle, child)?;
 
     let focus_window = window.clone();
     let focus_handle = app.handle().clone();
@@ -105,12 +128,20 @@ fn launch_backend(app: &mut App) -> Result<(), DynError> {
         }
     });
 
-    forward_sidecar_logs(rx, window);
+    forward_sidecar_logs(rx, window, generation);
 
     Ok(())
 }
 
-fn spawn_sidecar(app: &App) -> Result<(CommandRx, CommandChild), DynError> {
+fn launch_backend_from_handle(handle: &AppHandle) -> Result<(), DynError> {
+    let window = main_window_from_handle(handle)?;
+    let (rx, child) = spawn_sidecar(handle)?;
+    let generation = save_sidecar(handle, child)?;
+    forward_sidecar_logs(rx, window, generation);
+    Ok(())
+}
+
+fn spawn_sidecar(app: &AppHandle) -> Result<(CommandRx, CommandChild), DynError> {
     let port_arg = PREFERRED_PORT.to_string();
     let mut command = app.shell().sidecar("agentsview")?;
     for (key, value) in sidecar_env() {
@@ -294,52 +325,133 @@ fn normalize_env_key(key: &std::ffi::OsStr, case_insensitive_keys: bool) -> OsSt
     key.to_os_string()
 }
 
-fn run_login_shell_env(shell: &str, timeout: Duration) -> Option<Vec<u8>> {
+/// LoginShellEnvError captures every way try_run_login_shell_env
+/// can fail so tests can print an actionable reason when the
+/// probe returns nothing. Production callers flatten this into
+/// `Option` via `.ok()` since they already fall back to parent
+/// env on any failure.
+#[derive(Debug)]
+enum LoginShellEnvError {
+    TempFile(io::Error),
+    Spawn(io::Error),
+    Wait(io::Error),
+    Timeout {
+        elapsed: Duration,
+    },
+    NonZero {
+        code: Option<i32>,
+        stdout_len: usize,
+        stderr: Vec<u8>,
+    },
+    ReadStdout(io::Error),
+}
+
+impl std::fmt::Display for LoginShellEnvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TempFile(e) => write!(f, "tempfile create/clone failed: {e}"),
+            Self::Spawn(e) => write!(f, "spawn failed: {e}"),
+            Self::Wait(e) => write!(f, "try_wait failed: {e}"),
+            Self::Timeout { elapsed } => write!(f, "timed out after {elapsed:?}"),
+            Self::NonZero {
+                code,
+                stdout_len,
+                stderr,
+            } => {
+                let stderr_str = String::from_utf8_lossy(stderr);
+                write!(
+                    f,
+                    "child exited non-zero code={code:?} stdout_len={stdout_len} \
+                     stderr={stderr_str:?}"
+                )
+            }
+            Self::ReadStdout(e) => write!(f, "reading stdout tempfile failed: {e}"),
+        }
+    }
+}
+
+/// try_run_login_shell_env spawns `shell -<login-flag> "env -0"` and
+/// returns the captured stdout, or a structured error explaining why
+/// it couldn't. stdout is captured to a tempfile (not a pipe) so a
+/// child that emits more than a pipe buffer's worth of bytes never
+/// deadlocks. stderr is captured the same way so test failures can
+/// surface the shell's error output.
+fn try_run_login_shell_env(shell: &str, timeout: Duration) -> Result<Vec<u8>, LoginShellEnvError> {
     let shell_arg = shell_login_env_flag(shell);
-    let mut stdout_capture = tempfile::tempfile().ok()?;
-    let stdout_writer = stdout_capture.try_clone().ok()?;
+    let mut stdout_capture = tempfile::tempfile().map_err(LoginShellEnvError::TempFile)?;
+    let stdout_writer = stdout_capture
+        .try_clone()
+        .map_err(LoginShellEnvError::TempFile)?;
+    let mut stderr_capture = tempfile::tempfile().map_err(LoginShellEnvError::TempFile)?;
+    let stderr_writer = stderr_capture
+        .try_clone()
+        .map_err(LoginShellEnvError::TempFile)?;
     let mut child = std::process::Command::new(shell)
         .args([shell_arg, "env -0"])
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(stderr_writer))
         .stdout(Stdio::from(stdout_writer))
         .spawn()
-        .ok()?;
+        .map_err(LoginShellEnvError::Spawn)?;
 
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                break status;
-            }
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    return Err(LoginShellEnvError::Timeout {
+                        elapsed: started.elapsed(),
+                    });
                 }
                 thread::sleep(Duration::from_millis(25));
             }
             Err(err) => {
-                eprintln!("[agentsview] login shell probe try_wait failed: {err}");
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return Err(LoginShellEnvError::Wait(err));
             }
         }
     };
-    if !status.success() {
-        return None;
+
+    let mut output = Vec::new();
+    if let Err(e) = stdout_capture.seek(SeekFrom::Start(0)) {
+        return Err(LoginShellEnvError::ReadStdout(e));
+    }
+    if let Err(e) = stdout_capture.read_to_end(&mut output) {
+        return Err(LoginShellEnvError::ReadStdout(e));
     }
 
-    if stdout_capture.seek(SeekFrom::Start(0)).is_err() {
-        return None;
+    if !status.success() {
+        let mut stderr_bytes = Vec::new();
+        let _ = stderr_capture.seek(SeekFrom::Start(0));
+        let _ = stderr_capture.read_to_end(&mut stderr_bytes);
+        return Err(LoginShellEnvError::NonZero {
+            code: status.code(),
+            stdout_len: output.len(),
+            stderr: stderr_bytes,
+        });
     }
-    let mut output = Vec::new();
-    if stdout_capture.read_to_end(&mut output).is_err() {
-        return None;
+
+    Ok(output)
+}
+
+/// run_login_shell_env is the Option-returning facade used by
+/// production code, which treats any probe failure as "no login
+/// shell env available" and falls back to the parent environment.
+/// Tests that need a failure reason should call
+/// try_run_login_shell_env directly.
+fn run_login_shell_env(shell: &str, timeout: Duration) -> Option<Vec<u8>> {
+    match try_run_login_shell_env(shell, timeout) {
+        Ok(bytes) => Some(bytes),
+        Err(err) => {
+            eprintln!("[agentsview] login shell env probe failed: {err}");
+            None
+        }
     }
-    Some(output)
 }
 
 fn shell_login_env_flag(shell: &str) -> &'static str {
@@ -433,14 +545,24 @@ where
     Some(PathBuf::from(combined))
 }
 
-fn save_sidecar(app: &App, child: CommandChild) -> Result<(), DynError> {
+fn save_sidecar(app: &AppHandle, child: CommandChild) -> Result<u64, DynError> {
     let state = app.state::<SidecarState>();
+    let generation = state.next_generation.fetch_add(1, Ordering::SeqCst) + 1;
     let mut guard = state
         .child
         .lock()
         .map_err(|_| io::Error::other("sidecar state lock poisoned"))?;
-    *guard = Some(child);
-    Ok(())
+    *guard = Some(SidecarProcess { child, generation });
+    if let Ok(mut active_generation) = state.active_generation.lock() {
+        *active_generation = Some(generation);
+    }
+    if let Ok(mut stopping_generation) = state.stopping_generation.lock() {
+        *stopping_generation = None;
+    }
+    if let Ok(mut restart_generation) = state.restart_after_stop_timeout_generation.lock() {
+        *restart_generation = None;
+    }
+    Ok(generation)
 }
 
 fn save_sidecar_port(app: &AppHandle, port: u16) {
@@ -459,12 +581,176 @@ fn set_sidecar_port(state: &SidecarState, port: Option<u16>) {
     }
 }
 
-fn handle_sidecar_terminated(state: &SidecarState, startup_handled: &AtomicBool) -> bool {
-    set_sidecar_port(state, None);
+fn handle_sidecar_terminated(
+    state: &SidecarState,
+    startup_handled: &AtomicBool,
+    generation: u64,
+) -> bool {
+    if mark_sidecar_inactive_if_current(state, generation) {
+        set_sidecar_port(state, None);
+    }
+    clear_sidecar_child_if_current(state, generation);
+    clear_stopping_generation_if_current(state, generation);
+    record_sidecar_terminated(state, generation);
     !startup_handled.swap(true, Ordering::SeqCst)
 }
 
-fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow) {
+fn mark_sidecar_inactive_if_current(state: &SidecarState, generation: u64) -> bool {
+    let Ok(mut guard) = state.active_generation.lock() else {
+        return false;
+    };
+    if *guard == Some(generation) {
+        *guard = None;
+        return true;
+    }
+    false
+}
+
+fn clear_sidecar_child_if_current(state: &SidecarState, generation: u64) {
+    let Ok(mut guard) = state.child.lock() else {
+        return;
+    };
+    if guard
+        .as_ref()
+        .map(|process| process.generation)
+        .is_some_and(|active_generation| active_generation == generation)
+    {
+        *guard = None;
+    }
+}
+
+fn mark_sidecar_stopping(state: &SidecarState, generation: u64) {
+    if let Ok(mut guard) = state.stopping_generation.lock() {
+        *guard = Some(generation);
+    }
+}
+
+fn current_stopping_generation(state: &SidecarState) -> Option<u64> {
+    state
+        .stopping_generation
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+}
+
+fn clear_stopping_generation_if_current(state: &SidecarState, generation: u64) {
+    let Ok(mut guard) = state.stopping_generation.lock() else {
+        return;
+    };
+    if *guard == Some(generation) {
+        *guard = None;
+    }
+}
+
+fn mark_restart_after_stop_timeout(state: &SidecarState, generation: u64) {
+    if let Ok(mut guard) = state.restart_after_stop_timeout_generation.lock() {
+        *guard = Some(generation);
+    }
+}
+
+fn clear_restart_after_stop_timeout_if_current(state: &SidecarState, generation: u64) {
+    if let Ok(mut guard) = state.restart_after_stop_timeout_generation.lock() {
+        if *guard == Some(generation) {
+            *guard = None;
+        }
+    }
+}
+
+fn take_restart_after_stop_timeout_if_current(state: &SidecarState, generation: u64) -> bool {
+    let Ok(mut guard) = state.restart_after_stop_timeout_generation.lock() else {
+        return false;
+    };
+    if *guard == Some(generation) {
+        *guard = None;
+        return true;
+    }
+    false
+}
+
+fn begin_update_stop_wait(state: &SidecarState) {
+    state
+        .active_update_stop_waiters
+        .fetch_add(1, Ordering::SeqCst);
+}
+
+fn end_update_stop_wait(state: &SidecarState) {
+    let previous = state
+        .active_update_stop_waiters
+        .fetch_sub(1, Ordering::SeqCst);
+    debug_assert!(previous > 0);
+}
+
+fn has_active_update_stop_waiter(state: &SidecarState) -> bool {
+    state.active_update_stop_waiters.load(Ordering::SeqCst) > 0
+}
+
+fn take_restart_after_stop_timeout_for_terminated_sidecar(
+    state: &SidecarState,
+    generation: u64,
+) -> bool {
+    if has_active_update_stop_waiter(state) {
+        return false;
+    }
+    take_restart_after_stop_timeout_if_current(state, generation)
+}
+
+fn restart_backend_after_stop_timeout_if_terminated(
+    app: &AppHandle,
+    state: &SidecarState,
+    generation: u64,
+) {
+    if !sidecar_generation_terminated(state, generation) {
+        return;
+    }
+    if take_restart_after_stop_timeout_for_terminated_sidecar(state, generation) {
+        restart_backend_after_update(app.clone());
+    }
+}
+
+fn record_sidecar_terminated(state: &SidecarState, generation: u64) {
+    if let Ok(mut guard) = state.terminated_generation.lock() {
+        if *guard < generation {
+            *guard = generation;
+        }
+        state.termination.notify_all();
+    }
+}
+
+fn sidecar_generation_terminated(state: &SidecarState, generation: u64) -> bool {
+    state
+        .terminated_generation
+        .lock()
+        .is_ok_and(|guard| *guard >= generation)
+}
+
+fn wait_for_sidecar_termination(state: &SidecarState, generation: u64, timeout: Duration) -> bool {
+    let Ok(mut guard) = state.terminated_generation.lock() else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        if *guard >= generation {
+            return true;
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        match state.termination.wait_timeout(guard, remaining) {
+            Ok((next_guard, result)) => {
+                guard = next_guard;
+                if result.timed_out() && *guard < generation {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u64) {
     let startup_handled = Arc::new(AtomicBool::new(false));
     let first_output = Arc::new(AtomicBool::new(false));
     let timeout_window = window.clone();
@@ -519,12 +805,18 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow) {
                         "[agentsview] sidecar terminated (code: {:?}, signal: {:?})",
                         payload.code, payload.signal
                     );
-                    let state = window.app_handle().state::<SidecarState>();
-                    if handle_sidecar_terminated(&state, startup_handled.as_ref()) {
+                    let handle = window.app_handle().clone();
+                    let state = handle.state::<SidecarState>();
+                    if handle_sidecar_terminated(&state, startup_handled.as_ref(), generation) {
                         let _ = window.eval(
                             "window.__setStatus(\
                              'AgentsView backend exited before startup completed.');",
                         );
+                    }
+                    let restart_after_stop_timeout =
+                        take_restart_after_stop_timeout_for_terminated_sidecar(&state, generation);
+                    if restart_after_stop_timeout {
+                        restart_backend_after_update(handle);
                     }
                     break;
                 }
@@ -539,6 +831,12 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow) {
 
 fn main_window(app: &App) -> Result<WebviewWindow, DynError> {
     app.get_webview_window("main")
+        .ok_or_else(|| io::Error::other("missing main window").into())
+}
+
+fn main_window_from_handle(handle: &AppHandle) -> Result<WebviewWindow, DynError> {
+    handle
+        .get_webview_window("main")
         .ok_or_else(|| io::Error::other("missing main window").into())
 }
 
@@ -816,7 +1114,37 @@ async fn check_for_updates(handle: &AppHandle, silent: bool) {
         return;
     }
 
-    if let Err(err) = update.download_and_install(|_, _| {}, || {}).await {
+    let update_bytes = match update.download(|_, _| {}, || {}).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("[agentsview] update download failed: {err}");
+            let h = handle.clone();
+            handle
+                .dialog()
+                .message(
+                    "Failed to download the update. \
+                     Please try downloading manually from the releases page.",
+                )
+                .title("Update Failed")
+                .show(move |_| restore_webview_focus(&h));
+            return;
+        }
+    };
+
+    let windows_backend_stopped = if cfg!(target_os = "windows") {
+        // Windows locks the bundled sidecar executable while it is running.
+        Some(stop_backend_and_wait(handle.clone(), UPDATE_SIDECAR_STOP_TIMEOUT).await)
+    } else {
+        None
+    };
+    let backend_stopped_for_update = windows_backend_stopped == Some(true);
+
+    if let Err(err) = install_downloaded_update(
+        update_bytes,
+        windows_backend_stopped,
+        || restart_backend_after_update(handle.clone()),
+        |bytes| update.install(bytes),
+    ) {
         eprintln!("[agentsview] update install failed: {err}");
         let h = handle.clone();
         handle
@@ -837,9 +1165,77 @@ async fn check_for_updates(handle: &AppHandle, silent: bool) {
     )
     .await;
 
-    if restart {
-        let _ = handle.emit("restart", ());
-        handle.restart();
+    let emit_handle = handle.clone();
+    let restart_handle = handle.clone();
+    let backend_handle = handle.clone();
+    finish_successful_update(
+        backend_stopped_for_update,
+        restart,
+        || {
+            let _ = emit_handle.emit("restart", ());
+        },
+        || restart_handle.restart(),
+        || restart_backend_after_update(backend_handle),
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InstallDownloadedUpdateError<E> {
+    BackendStopTimedOut,
+    Install(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for InstallDownloadedUpdateError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BackendStopTimedOut => write!(f, "backend did not stop before update install"),
+            Self::Install(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl<E: std::fmt::Debug + std::fmt::Display> Error for InstallDownloadedUpdateError<E> {}
+
+fn install_downloaded_update<R, I, E>(
+    update_bytes: Vec<u8>,
+    windows_backend_stopped: Option<bool>,
+    restart_backend: R,
+    install: I,
+) -> Result<(), InstallDownloadedUpdateError<E>>
+where
+    R: FnOnce(),
+    I: FnOnce(Vec<u8>) -> Result<(), E>,
+{
+    if windows_backend_stopped == Some(false) {
+        return Err(InstallDownloadedUpdateError::BackendStopTimedOut);
+    }
+    match install(update_bytes) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if windows_backend_stopped.is_some() {
+                restart_backend();
+            }
+            Err(InstallDownloadedUpdateError::Install(err))
+        }
+    }
+}
+
+fn finish_successful_update<E, A, B>(
+    backend_stopped_for_update: bool,
+    restart_confirmed: bool,
+    emit_restart: E,
+    restart_app: A,
+    restart_backend: B,
+) where
+    E: FnOnce(),
+    A: FnOnce(),
+    B: FnOnce(),
+{
+    if restart_confirmed {
+        emit_restart();
+        restart_app();
+    } else if backend_stopped_for_update {
+        restart_backend();
     }
 }
 
@@ -859,17 +1255,152 @@ async fn dialog_confirm(handle: &AppHandle, title: &str, message: &str) -> bool 
 }
 
 fn stop_backend(app: &AppHandle) {
-    let state = app.state::<SidecarState>();
-    let Ok(mut guard) = state.child.lock() else {
-        return;
-    };
+    let _ = stop_backend_inner(app, None);
+}
 
-    if let Some(child) = guard.take() {
-        if let Err(err) = child.kill() {
+async fn stop_backend_and_wait(app: AppHandle, timeout: Duration) -> bool {
+    tauri::async_runtime::spawn_blocking(move || stop_backend_inner(&app, Some(timeout)))
+        .await
+        .unwrap_or(false)
+}
+
+fn stop_backend_inner(app: &AppHandle, wait_timeout: Option<Duration>) -> bool {
+    let state = app.state::<SidecarState>();
+    if let Some(timeout) = wait_timeout {
+        begin_update_stop_wait(&state);
+        let mut waited_generation = None;
+        let active_generation = {
+            let Ok(guard) = state.child.lock() else {
+                end_update_stop_wait(&state);
+                return false;
+            };
+            guard.as_ref().map(|process| {
+                let generation = process.generation;
+                mark_sidecar_stopping(&state, generation);
+                if let Err(err) = request_sidecar_stop(process) {
+                    eprintln!("[agentsview] failed to stop sidecar: {err}");
+                }
+                generation
+            })
+        };
+        let stopped = if let Some(generation) = active_generation {
+            waited_generation = Some(generation);
+            finish_backend_stop_wait(
+                app,
+                &state,
+                generation,
+                wait_for_sidecar_termination(&state, generation, timeout),
+            )
+        } else if let Some(generation) = current_stopping_generation(&state) {
+            waited_generation = Some(generation);
+            finish_backend_stop_wait(
+                app,
+                &state,
+                generation,
+                wait_for_sidecar_termination(&state, generation, timeout),
+            )
+        } else {
+            clear_sidecar_port(app);
+            true
+        };
+        end_update_stop_wait(&state);
+        if let Some(generation) = waited_generation {
+            restart_backend_after_stop_timeout_if_terminated(app, &state, generation);
+        }
+        return stopped;
+    }
+
+    let process = {
+        let Ok(mut guard) = state.child.lock() else {
+            return false;
+        };
+        guard.take()
+    };
+    if let Some(process) = process.as_ref() {
+        let _ = mark_sidecar_inactive_if_current(&state, process.generation);
+        clear_restart_after_stop_timeout_if_current(&state, process.generation);
+        clear_stopping_generation_if_current(&state, process.generation);
+    }
+
+    if let Some(process) = process {
+        if let Err(err) = process.child.kill() {
             eprintln!("[agentsview] failed to stop sidecar: {err}");
         }
+        clear_sidecar_port(app);
+        return true;
     }
     clear_sidecar_port(app);
+    true
+}
+
+fn finish_backend_stop_wait(
+    app: &AppHandle,
+    state: &SidecarState,
+    generation: u64,
+    terminated: bool,
+) -> bool {
+    if terminated {
+        clear_restart_after_stop_timeout_if_current(state, generation);
+        let _ = mark_sidecar_inactive_if_current(state, generation);
+        clear_sidecar_child_if_current(state, generation);
+        clear_stopping_generation_if_current(state, generation);
+        clear_sidecar_port(app);
+    } else {
+        mark_restart_after_stop_timeout(state, generation);
+        eprintln!("[agentsview] timed out waiting for sidecar to stop before update install");
+    }
+    terminated
+}
+
+fn request_sidecar_stop(process: &SidecarProcess) -> io::Result<()> {
+    request_process_stop(process.child.pid())
+}
+
+#[cfg(windows)]
+fn request_process_stop(pid: u32) -> io::Result<()> {
+    let status = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "taskkill failed for pid {pid} with status {status}"
+        )))
+    }
+}
+
+#[cfg(unix)]
+fn request_process_stop(pid: u32) -> io::Result<()> {
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "kill failed for pid {pid} with status {status}"
+        )))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn request_process_stop(pid: u32) -> io::Result<()> {
+    Err(io::Error::other(format!(
+        "stopping pid {pid} is unsupported on this platform"
+    )))
+}
+
+fn restart_backend_after_update(handle: AppHandle) {
+    if let Err(err) = launch_backend_from_handle(&handle) {
+        eprintln!("[agentsview] failed to restart backend after update: {err}");
+    }
 }
 
 fn wait_for_server(port: u16, timeout: Duration) -> bool {
@@ -1103,9 +1634,17 @@ mod tests {
     fn handle_sidecar_terminated_clears_port_and_marks_startup() {
         let state = SidecarState::default();
         set_sidecar_port(&state, Some(18080));
+        *state
+            .active_generation
+            .lock()
+            .expect("lock active_generation") = Some(1);
+        *state
+            .stopping_generation
+            .lock()
+            .expect("lock stopping_generation") = Some(1);
         let startup_handled = AtomicBool::new(false);
 
-        assert!(handle_sidecar_terminated(&state, &startup_handled));
+        assert!(handle_sidecar_terminated(&state, &startup_handled, 1));
         assert_eq!(
             state
                 .backend_port
@@ -1115,10 +1654,149 @@ mod tests {
             None
         );
         assert!(startup_handled.load(Ordering::SeqCst));
+        assert_eq!(
+            state
+                .stopping_generation
+                .lock()
+                .expect("lock stopping_generation after terminated")
+                .to_owned(),
+            None
+        );
 
         // Termination handling is idempotent for state and should only
         // report first-time transition once.
-        assert!(!handle_sidecar_terminated(&state, &startup_handled));
+        assert!(!handle_sidecar_terminated(&state, &startup_handled, 1));
+    }
+
+    #[test]
+    fn restart_after_stop_timeout_is_consumed_for_matching_generation() {
+        let state = SidecarState::default();
+
+        mark_restart_after_stop_timeout(&state, 2);
+
+        assert!(!take_restart_after_stop_timeout_if_current(&state, 1));
+        assert!(take_restart_after_stop_timeout_if_current(&state, 2));
+        assert!(!take_restart_after_stop_timeout_if_current(&state, 2));
+    }
+
+    #[test]
+    fn restart_after_stop_timeout_waits_for_active_update_stop_waiter() {
+        let state = SidecarState::default();
+
+        mark_restart_after_stop_timeout(&state, 2);
+        begin_update_stop_wait(&state);
+
+        assert!(!take_restart_after_stop_timeout_for_terminated_sidecar(
+            &state, 2
+        ));
+
+        end_update_stop_wait(&state);
+
+        assert!(take_restart_after_stop_timeout_for_terminated_sidecar(
+            &state, 2
+        ));
+    }
+
+    #[test]
+    fn install_downloaded_update_installs_after_windows_backend_stop() {
+        let events = Mutex::new(Vec::new());
+
+        let result = install_downloaded_update(
+            b"update-bytes".to_vec(),
+            Some(true),
+            || events.lock().expect("lock events").push("restart"),
+            |bytes| {
+                assert_eq!(bytes, b"update-bytes");
+                events.lock().expect("lock events").push("install");
+                Ok::<(), ()>(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(events.lock().expect("lock events").as_slice(), ["install"]);
+    }
+
+    #[test]
+    fn install_downloaded_update_installs_without_backend_stop_on_non_windows() {
+        let events = Mutex::new(Vec::new());
+
+        let result = install_downloaded_update(
+            b"update-bytes".to_vec(),
+            None,
+            || events.lock().expect("lock events").push("restart"),
+            |bytes| {
+                assert_eq!(bytes, b"update-bytes");
+                events.lock().expect("lock events").push("install");
+                Ok::<(), ()>(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(events.lock().expect("lock events").as_slice(), ["install"]);
+    }
+
+    #[test]
+    fn install_downloaded_update_does_not_restart_after_windows_stop_timeout() {
+        let events = Mutex::new(Vec::new());
+
+        let result = install_downloaded_update(
+            b"update-bytes".to_vec(),
+            Some(false),
+            || events.lock().expect("lock events").push("restart"),
+            |_| {
+                events.lock().expect("lock events").push("install");
+                Ok::<(), ()>(())
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(InstallDownloadedUpdateError::BackendStopTimedOut)
+        );
+        assert!(events.lock().expect("lock events").is_empty());
+    }
+
+    #[test]
+    fn install_downloaded_update_restarts_backend_after_windows_install_failure() {
+        let events = Mutex::new(Vec::new());
+
+        let result = install_downloaded_update(
+            b"update-bytes".to_vec(),
+            Some(true),
+            || events.lock().expect("lock events").push("restart"),
+            |bytes| {
+                assert_eq!(bytes, b"update-bytes");
+                events.lock().expect("lock events").push("install");
+                Err::<(), &str>("install failed")
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(InstallDownloadedUpdateError::Install("install failed"))
+        );
+        assert_eq!(
+            events.lock().expect("lock events").as_slice(),
+            ["install", "restart"]
+        );
+    }
+
+    #[test]
+    fn finish_successful_update_restarts_backend_when_windows_restart_is_declined() {
+        let events = Mutex::new(Vec::new());
+
+        finish_successful_update(
+            true,
+            false,
+            || events.lock().expect("lock events").push("emit-restart"),
+            || events.lock().expect("lock events").push("restart-app"),
+            || events.lock().expect("lock events").push("restart-backend"),
+        );
+
+        assert_eq!(
+            events.lock().expect("lock events").as_slice(),
+            ["restart-backend"]
+        );
     }
 
     #[test]
@@ -1248,21 +1926,82 @@ mod tests {
             "agentsview-login-shell-{stamp}-{}.sh",
             std::process::id()
         ));
-        fs::write(&script_path, "#!/bin/sh\nhead -c 262144 /dev/zero\n")
-            .expect("write shell script");
+        // Probe absolute paths for the byte-emitting tool. Earlier
+        // versions called bare `head` which silently exited
+        // non-zero on CI runners with a stripped PATH (the
+        // function then returns None and the test panicked with
+        // the unhelpful "expected shell output" message). Fall
+        // back across known coreutils locations and finally to dd
+        // so the test does not depend on PATH or any single
+        // distro layout.
+        let head_candidates = ["/usr/bin/head", "/bin/head", "/usr/local/bin/head"];
+        let dd_candidates = ["/usr/bin/dd", "/bin/dd"];
+        let head = head_candidates
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .copied();
+        let dd = dd_candidates
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .copied();
+        let script_body = match (head, dd) {
+            (Some(h), _) => format!("#!/bin/sh\nexec {h} -c 262144 /dev/zero\n"),
+            (None, Some(d)) => format!(
+                "#!/bin/sh\nexec {d} if=/dev/zero bs=1024 count=256 \
+                 status=none\n"
+            ),
+            (None, None) => {
+                eprintln!(
+                    "skipping: neither head nor dd found in standard \
+                     paths"
+                );
+                return;
+            }
+        };
+        fs::write(&script_path, &script_body).expect("write shell script");
         let mut perms = fs::metadata(&script_path)
             .expect("read shell script metadata")
             .permissions();
         perms.set_mode(0o700);
         fs::set_permissions(&script_path, perms).expect("set executable permissions");
 
-        let output = run_login_shell_env(
-            script_path.to_str().expect("script path utf-8"),
-            Duration::from_secs(2),
-        );
-        let _ = fs::remove_file(&script_path);
+        // 10s gives slow ARM64 CI runners headroom; the script
+        // itself completes in milliseconds. Call the
+        // Result-returning variant so a CI flake prints the real
+        // reason (spawn error, non-zero exit + stderr, timeout,
+        // etc.) instead of an opaque "returned None".
+        //
+        // Linux can return ETXTBSY (OS error 26) on execve when a
+        // parallel test thread's fork briefly holds a writable fd
+        // for the script we just wrote. Retry a few times on that
+        // race so cargo test -j N doesn't flake.
+        let mut attempts_left = 5;
+        let result = loop {
+            let result = try_run_login_shell_env(
+                script_path.to_str().expect("script path utf-8"),
+                Duration::from_secs(10),
+            );
+            match &result {
+                Err(LoginShellEnvError::Spawn(e)) if e.raw_os_error() == Some(26) => {
+                    attempts_left -= 1;
+                    if attempts_left == 0 {
+                        break result;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                _ => break result,
+            }
+        };
+        let removed = fs::remove_file(&script_path);
 
-        let output = output.expect("expected shell output");
+        let output = result.unwrap_or_else(|err| {
+            panic!(
+                "try_run_login_shell_env failed: {err}\n\
+                 script_path={script_path:?} (removed={removed:?})\n\
+                 script_body={script_body:?}"
+            )
+        });
         assert!(
             output.len() >= 262_144,
             "expected at least 262144 bytes, got {}",
@@ -1288,15 +2027,36 @@ mod tests {
         perms.set_mode(0o700);
         fs::set_permissions(&script_path, perms).expect("set executable permissions");
 
-        let started = Instant::now();
-        let output = run_login_shell_env(
-            script_path.to_str().expect("script path utf-8"),
-            Duration::from_millis(120),
-        );
-        let elapsed = started.elapsed();
+        // Linux can return ETXTBSY (OS error 26) on execve when a
+        // parallel test thread's fork briefly holds a writable fd
+        // for the script we just wrote. Retry a few times on that
+        // race so cargo test -j N doesn't flake.
+        let mut attempts_left = 5;
+        let (result, elapsed) = loop {
+            let started = Instant::now();
+            let result = try_run_login_shell_env(
+                script_path.to_str().expect("script path utf-8"),
+                Duration::from_millis(120),
+            );
+            let elapsed = started.elapsed();
+            match &result {
+                Err(LoginShellEnvError::Spawn(e)) if e.raw_os_error() == Some(26) => {
+                    attempts_left -= 1;
+                    if attempts_left == 0 {
+                        break (result, elapsed);
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                _ => break (result, elapsed),
+            }
+        };
         let _ = fs::remove_file(&script_path);
 
-        assert!(output.is_none(), "timeout path should return None");
+        match result {
+            Err(LoginShellEnvError::Timeout { .. }) => {}
+            other => panic!("expected Timeout error; got {other:?}"),
+        }
         assert!(
             elapsed < Duration::from_secs(1),
             "timeout path took too long: {elapsed:?}"
@@ -1320,5 +2080,62 @@ mod tests {
             Duration::from_millis(100),
         );
         assert!(output.is_none(), "missing shell should return None");
+    }
+
+    #[test]
+    fn try_run_login_shell_env_reports_spawn_error_when_shell_missing() {
+        let result = try_run_login_shell_env(
+            "agentsview-missing-shell-binary",
+            Duration::from_millis(100),
+        );
+        match result {
+            Err(LoginShellEnvError::Spawn(_)) => {}
+            other => panic!("expected Spawn error; got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_run_login_shell_env_reports_non_zero_with_stderr() {
+        // Script that writes to stderr and exits non-zero, so we
+        // can confirm the NonZero variant carries both the code
+        // and the captured stderr. Future CI flakes in the large-
+        // stdout test will surface the same info.
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("valid clock")
+            .as_nanos();
+        let script_path = std::env::temp_dir().join(format!(
+            "agentsview-login-shell-fail-{stamp}-{}.sh",
+            std::process::id()
+        ));
+        fs::write(&script_path, "#!/bin/sh\necho diag-stderr >&2\nexit 42\n")
+            .expect("write shell script");
+        let mut perms = fs::metadata(&script_path)
+            .expect("read shell script metadata")
+            .permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&script_path, perms).expect("set executable permissions");
+
+        let result = try_run_login_shell_env(
+            script_path.to_str().expect("script path utf-8"),
+            Duration::from_secs(2),
+        );
+        let _ = fs::remove_file(&script_path);
+
+        match result {
+            Err(LoginShellEnvError::NonZero {
+                code: Some(42),
+                stderr,
+                ..
+            }) => {
+                let s = String::from_utf8_lossy(&stderr);
+                assert!(
+                    s.contains("diag-stderr"),
+                    "stderr should be captured; got {s:?}"
+                );
+            }
+            other => panic!("expected NonZero{{code=42}}; got {other:?}"),
+        }
     }
 }

@@ -11,10 +11,11 @@ const DEPTH_ERROR_RE =
 const KNOWN_SVELTE_WARNINGS_RE = /each_key_duplicate/;
 
 // Test-fixture assumptions: project-alpha has sessions with 2
-// and 5+ messages, totalling 8 sessions across all projects.
+// and 5+ messages, totalling 9 sessions across all projects
+// (including the project-duration showcase added by Task 24).
 const TEST_PROJECT = "project-alpha";
 const FILTERED_SESSION_COUNT = 2;
-const TOTAL_SESSION_COUNT = 8;
+const TOTAL_SESSION_COUNT = 9;
 
 // Session deep in the list to exercise virtualizer scroll.
 const TARGET_SESSION_INDEX = 6;

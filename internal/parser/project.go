@@ -2,11 +2,22 @@ package parser
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
+
+	"golang.org/x/sync/singleflight"
 )
+
+// osStat is indirected through a var so tests can intercept stat
+// calls from the git-root walker. Production code always uses
+// os.Stat via this binding.
+var osStat = os.Stat
 
 var projectMarkers = []string{
 	"code", "projects", "repos", "src", "work", "dev",
@@ -50,8 +61,8 @@ func GetProjectName(dirName string) string {
 	}
 
 	// Strategy 2: use last non-system-directory component
-	for i := len(parts) - 1; i >= 0; i-- {
-		if p := parts[i]; p != "" && !ignoredSystemDirs[strings.ToLower(p)] {
+	for _, v := range slices.Backward(parts) {
+		if p := v; p != "" && !ignoredSystemDirs[strings.ToLower(p)] {
 			return NormalizeName(p)
 		}
 	}
@@ -84,14 +95,19 @@ func ExtractProjectFromCwdWithBranch(
 	}
 	cleaned := filepath.Clean(norm)
 
-	// On non-Windows, a converted Windows path like "C:/Users/..."
-	// is treated as relative by filepath and would cause
-	// findGitRepoRoot to walk up from the process CWD. Skip git
-	// root detection only for foreign Windows paths on POSIX;
-	// on actual Windows hosts, drive-letter paths are native and
-	// git root detection must still run.
-	foreignWinPath := winPath && runtime.GOOS != "windows"
-	if !foreignWinPath {
+	// Recognize worktree manager layouts before walking git roots.
+	// These layouts encode the owning project in the path even when
+	// the git root basename is a branch or generated worktree id.
+	if p := projectFromWorktreeLayout(cleaned); p != "" {
+		return NormalizeName(p)
+	}
+
+	// Skip the git-root walk when the cwd cannot resolve to a
+	// real local filesystem location. On macOS a bulk walk under
+	// an unbacked autofs prefix cascades through automountd into
+	// opendirectoryd (/usr/libexec/od_user_homes), so we probe
+	// the prefix once before walking.
+	if !isForeignOSPath(cwd, cleaned, winPath) {
 		if root := findGitRepoRoot(cleaned); root != "" {
 			name := filepath.Base(root)
 			if isInvalidPathBase(name) {
@@ -99,13 +115,6 @@ func ExtractProjectFromCwdWithBranch(
 			}
 			return NormalizeName(name)
 		}
-	}
-
-	// Recognize worktree manager layouts:
-	// .superset/worktrees/$PROJECT/$BRANCH[/...]
-	// conductor/workspaces/$PROJECT/$BRANCH[/...]
-	if p := projectFromWorktreeLayout(cleaned); p != "" {
-		return NormalizeName(p)
 	}
 
 	name := filepath.Base(cleaned)
@@ -119,16 +128,28 @@ func ExtractProjectFromCwdWithBranch(
 	return NormalizeName(name)
 }
 
-// worktreeLayoutMarkers are path fragments that identify
-// worktree manager directory conventions. Each encodes
-// .../$MARKER/$PROJECT/$BRANCH[/...].
-var worktreeLayoutMarkers []string
+// worktreeLayout describes path fragments that identify worktree
+// manager directory conventions. projectPart is the zero-based
+// component after marker that contains the owning project name.
+type worktreeLayout struct {
+	marker      string
+	projectPart int
+	minParts    int
+}
+
+var worktreeLayouts []worktreeLayout
 
 func init() {
 	sep := string(filepath.Separator)
-	worktreeLayoutMarkers = []string{
-		sep + ".superset" + sep + "worktrees" + sep,
-		sep + "conductor" + sep + "workspaces" + sep,
+	worktreeLayouts = []worktreeLayout{
+		// .superset/worktrees/$PROJECT/$BRANCH[/...]
+		{marker: sep + ".superset" + sep + "worktrees" + sep, projectPart: 0, minParts: 2},
+		// conductor/workspaces/$PROJECT/$BRANCH[/...]
+		{marker: sep + "conductor" + sep + "workspaces" + sep, projectPart: 0, minParts: 2},
+		// ~/.config/middleman/worktrees/github.com/$OWNER/$REPO/$WORKTREE[/...]
+		{marker: sep + ".config" + sep + "middleman" + sep + "worktrees" + sep + "github.com" + sep, projectPart: 1, minParts: 3},
+		// ~/.codex/worktrees/$WORKTREE_ID/$REPO[/...]
+		{marker: sep + ".codex" + sep + "worktrees" + sep, projectPart: 1, minParts: 2},
 	}
 }
 
@@ -136,20 +157,211 @@ func init() {
 // directory layouts and extracts the project name component.
 // Returns "" if the path does not match any known layout.
 func projectFromWorktreeLayout(path string) string {
-	for _, marker := range worktreeLayoutMarkers {
-		_, rest, found := strings.Cut(path, marker)
+	for _, layout := range worktreeLayouts {
+		_, rest, found := strings.Cut(path, layout.marker)
 		if !found {
 			continue
 		}
-		// Require at least project/branch to distinguish
-		// from the container directory itself.
-		projEnd := strings.IndexByte(rest, filepath.Separator)
-		if projEnd <= 0 {
+		parts := strings.Split(rest, string(filepath.Separator))
+		if len(parts) < layout.minParts {
 			continue
 		}
-		return rest[:projEnd]
+		project := parts[layout.projectPart]
+		if isInvalidPathBase(project) {
+			continue
+		}
+		return project
 	}
 	return ""
+}
+
+// autofsMountSource is indirected so tests can supply fixture
+// output in lieu of running mount(8).
+var autofsMountSource = runMountCommand
+
+func runMountCommand() ([]byte, error) {
+	return exec.Command("/sbin/mount").Output()
+}
+
+// autofsPrefixes holds path prefixes that autofs is actively
+// managing on this host, each with a trailing separator so
+// strings.HasPrefix gives component-boundary matches. Populated
+// at package init on darwin from the live mount table; other
+// platforms leave it empty.
+//
+// Why we care: os.Stat into an autofs-managed prefix triggers
+// automountd. For the default /home entry macOS resolves the map
+// via /usr/libexec/od_user_homes, which asks opendirectoryd to
+// enumerate every user record. Bulk remote-sync runs whose
+// session cwds all share a /home/<user>/... prefix therefore peg
+// opendirectoryd and automountd at hundreds of percent CPU.
+//
+// Sourcing the prefix set from mount(8) (rather than parsing
+// /etc/auto_master directly) captures prefixes pulled in via
+// +auto_master directory-service includes, which never appear
+// in the local config file.
+var autofsPrefixes = detectAutofsPrefixes()
+
+// detectAutofsPrefixes returns the autofs-managed path prefixes
+// reported by the running mount table. Non-darwin hosts and
+// exec failures both return nil.
+func detectAutofsPrefixes() []string {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	data, err := autofsMountSource()
+	if err != nil {
+		return nil
+	}
+	return parseMountOutputForAutofs(data)
+}
+
+// parseMountOutputForAutofs extracts the mount points of autofs
+// filesystems from mount(8) output. Typical macOS lines look
+// like:
+//
+//	map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)
+//	server.example:/export on /corp/home (autofs, nobrowse)
+//
+// macOS presents the Data volume at / via an APFS firmlink, so
+// /System/Volumes/Data is stripped to match the path form that
+// client code observes.
+func parseMountOutputForAutofs(data []byte) []string {
+	var out []string
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if !strings.Contains(line, "(autofs") {
+			continue
+		}
+		_, after, ok := strings.Cut(line, " on ")
+		if !ok {
+			continue
+		}
+		rest := after
+		parenIdx := strings.LastIndex(rest, " (")
+		if parenIdx < 0 {
+			continue
+		}
+		mount := strings.TrimSpace(rest[:parenIdx])
+		mount = strings.TrimPrefix(mount, "/System/Volumes/Data")
+		if mount == "" || mount == "/" {
+			continue
+		}
+		out = append(out, strings.TrimRight(mount, "/")+"/")
+	}
+	return out
+}
+
+// isForeignOSPath reports whether cwd should bypass the local
+// git-root walk.
+//
+//   - Windows-convention paths on POSIX hosts (drive letters, UNC
+//     prefixes) cannot exist as real filesystem locations.
+//   - Paths under a local autofs prefix whose first component does
+//     not resolve: walking them on macOS triggers automountd per
+//     ancestor, and auto_home's resolver asks opendirectoryd to
+//     enumerate every user record — a hundred-percent-CPU storm
+//     under bulk remote sync.
+//
+// An autofs prefix that does resolve (e.g. an enterprise NFS-backed
+// /home) falls through to the walk so repository roots are still
+// found.
+func isForeignOSPath(cwd, cleaned string, winPath bool) bool {
+	if winPath {
+		return runtime.GOOS != "windows"
+	}
+	for _, prefix := range autofsPrefixes {
+		if !strings.HasPrefix(cleaned, prefix) {
+			continue
+		}
+		return !autofsFirstLevelResolves(prefix, cleaned)
+	}
+	return false
+}
+
+// autofsProbeTTL bounds how long a probe result (positive or
+// negative) is trusted. Long enough that a bulk sync pays for
+// one probe per unique prefix user; short enough that a long-
+// running server rediscovers a mount that came up after startup.
+const autofsProbeTTL = 60 * time.Second
+
+// nowFn is indirected so TTL-expiry tests can advance the clock.
+var nowFn = time.Now
+
+type autofsProbeEntry struct {
+	resolves bool
+	expires  time.Time
+}
+
+// autofsProbes memoises whether the first path component under an
+// autofs prefix resolves locally. Keyed by the probed path
+// (e.g. "/home/wes"), so a bulk sync whose cwds all share a
+// single <prefix>/<user> pays one probe rather than one per
+// session.
+//
+// Writes go through autofsProbeSF to collapse concurrent misses
+// for the same key into a single osStat call — critical because
+// sync workers probe in parallel.
+var (
+	autofsProbesMu sync.Mutex
+	autofsProbes   = map[string]autofsProbeEntry{}
+	autofsProbeSF  singleflight.Group
+)
+
+// resetAutofsProbes clears the cache and in-flight probes.
+// Intended for tests that need deterministic probe counts.
+func resetAutofsProbes() {
+	autofsProbesMu.Lock()
+	autofsProbes = map[string]autofsProbeEntry{}
+	autofsProbesMu.Unlock()
+	autofsProbeSF = singleflight.Group{}
+}
+
+// autofsFirstLevelResolves probes whether <prefix>/<first-comp>
+// exists as a real filesystem entry. Results are cached for
+// autofsProbeTTL and concurrent misses share a single probe.
+func autofsFirstLevelResolves(prefix, cleaned string) bool {
+	rest := cleaned[len(prefix):]
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		rest = rest[:i]
+	}
+	key := prefix + rest
+
+	if resolves, ok := lookupAutofsProbe(key); ok {
+		return resolves
+	}
+
+	v, _, _ := autofsProbeSF.Do(key, func() (any, error) {
+		// Re-check inside the singleflight slot: a prior
+		// caller for the same key may have just populated
+		// the cache while we were waiting for the slot.
+		if resolves, ok := lookupAutofsProbe(key); ok {
+			return resolves, nil
+		}
+		_, err := osStat(key)
+		resolves := err == nil
+		storeAutofsProbe(key, resolves)
+		return resolves, nil
+	})
+	return v.(bool)
+}
+
+func lookupAutofsProbe(key string) (bool, bool) {
+	autofsProbesMu.Lock()
+	defer autofsProbesMu.Unlock()
+	entry, ok := autofsProbes[key]
+	if !ok || !nowFn().Before(entry.expires) {
+		return false, false
+	}
+	return entry.resolves, true
+}
+
+func storeAutofsProbe(key string, resolves bool) {
+	autofsProbesMu.Lock()
+	autofsProbes[key] = autofsProbeEntry{
+		resolves: resolves,
+		expires:  nowFn().Add(autofsProbeTTL),
+	}
+	autofsProbesMu.Unlock()
 }
 
 // looksLikeWindowsPath returns true when cwd appears to use
@@ -191,7 +403,7 @@ func findGitRepoRoot(cwd string) string {
 
 	dir := cwd
 	cwdMissing := false
-	if info, err := os.Stat(dir); err == nil {
+	if info, err := osStat(dir); err == nil {
 		if !info.IsDir() {
 			dir = filepath.Dir(dir)
 		}
@@ -212,7 +424,7 @@ func findGitRepoRoot(cwd string) string {
 	if cwdMissing {
 		sibDir := dir
 		for {
-			if _, err := os.Stat(sibDir); err == nil {
+			if _, err := osStat(sibDir); err == nil {
 				break
 			}
 			parent := filepath.Dir(sibDir)
@@ -228,7 +440,7 @@ func findGitRepoRoot(cwd string) string {
 
 	for {
 		gitPath := filepath.Join(dir, ".git")
-		info, err := os.Stat(gitPath)
+		info, err := osStat(gitPath)
 		if err == nil {
 			if info.IsDir() {
 				return dir
@@ -259,7 +471,7 @@ func findGitRepoRoot(cwd string) string {
 func repoRootFromSiblings(dir, cwd string) string {
 	// If dir is itself a repo or worktree, let the normal
 	// upward walk handle it.
-	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+	if _, err := osStat(filepath.Join(dir, ".git")); err == nil {
 		return ""
 	}
 	entries, err := os.ReadDir(dir)
@@ -282,7 +494,7 @@ func repoRootFromSiblings(dir, cwd string) string {
 			continue
 		}
 		gitPath := filepath.Join(dir, entry.Name(), ".git")
-		info, err := os.Stat(gitPath)
+		info, err := osStat(gitPath)
 		if err != nil {
 			continue
 		}

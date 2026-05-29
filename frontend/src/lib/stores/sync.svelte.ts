@@ -6,6 +6,7 @@ import type {
   VersionInfo,
   UpdateCheck,
 } from "../api/types.js";
+import type { SessionTiming } from "../api/types/timing.js";
 
 type SyncCompleteListener = () => void;
 
@@ -37,6 +38,10 @@ class SyncStore {
   stats: Stats | null = $state(null);
   serverVersion: VersionInfo | null = $state(null);
   versionMismatch: boolean = $state(false);
+  // True when connected to a remote server that the browser cannot
+  // reach (network error, CSP block, or the server being down).
+  // Surfaced in the status bar so the failure is not silent.
+  remoteUnreachable: boolean = $state(false);
   updateAvailable: boolean = $state(false);
   latestVersion: string | null = $state(null);
   readonly buildCommit: string =
@@ -68,9 +73,21 @@ class SyncStore {
     }
   }
 
+  /** Record whether the backend responded. Only flags a failure
+   * when a remote server is configured — local failures are handled
+   * by the visibility health check, which reloads the page. */
+  private markRemoteReachable(reachable: boolean) {
+    if (reachable) {
+      this.remoteUnreachable = false;
+    } else if (api.isRemoteConnection()) {
+      this.remoteUnreachable = true;
+    }
+  }
+
   async loadStatus() {
     try {
       const status = await api.getSyncStatus();
+      this.markRemoteReachable(true);
       const newLastSync = status.last_sync || null;
       const isInitial = !this.statusHydrated;
       this.statusHydrated = true;
@@ -87,6 +104,7 @@ class SyncStore {
         this.notifySyncComplete();
       }
     } catch (error) {
+      this.markRemoteReachable(false);
       this.pendingHydration = false;
       console.warn("Failed to load sync status:", error);
     }
@@ -132,11 +150,13 @@ class SyncStore {
   async loadVersion() {
     try {
       this.serverVersion = await api.getVersion();
+      this.markRemoteReachable(true);
       this.versionMismatch = commitsDisagree(
         this.buildCommit,
         this.serverVersion.commit,
       );
     } catch (error) {
+      this.markRemoteReachable(false);
       console.warn("Failed to load version info:", error);
     }
   }
@@ -222,11 +242,16 @@ class SyncStore {
     return true;
   }
 
-  watchSession(sessionId: string, onUpdate: () => void) {
+  watchSession(
+    sessionId: string,
+    onUpdate: () => void,
+    onTiming?: (t: SessionTiming) => void,
+  ) {
     this.unwatchSession();
     this.watchEventSource = api.watchSession(
       sessionId,
       onUpdate,
+      onTiming,
     );
   }
 

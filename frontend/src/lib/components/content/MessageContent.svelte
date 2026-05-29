@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Message } from "../../api/types.js";
+  import type { CallTiming, TurnTiming } from "../../api/types/timing.js";
   import {
     parseContent,
     enrichSegments,
@@ -8,18 +9,24 @@
     formatTimestamp,
     formatTokenUsage,
   } from "../../utils/format.js";
+  import { formatDuration } from "../../utils/duration.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { formatMessageForCopy } from "../../utils/copy-message.js";
   import { messages as messagesStore } from "../../stores/messages.svelte.js";
+  import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
+  import { liveTick } from "../../stores/liveTick.svelte.js";
   import ThinkingBlock from "./ThinkingBlock.svelte";
   import ToolBlock from "./ToolBlock.svelte";
-  import SkillBlock from "./SkillBlock.svelte";
+  import ParallelGroup from "./ParallelGroup.svelte";
   import CodeBlock from "./CodeBlock.svelte";
+  import SkillBlock from "./SkillBlock.svelte";
+  import CopyButton from "../shared/CopyButton.svelte";
   import { ui } from "../../stores/ui.svelte.js";
   import { pins } from "../../stores/pins.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { applyHighlight } from "../../utils/highlight.js";
   import { renderMarkdown } from "../../utils/markdown.js";
+  import { displayToolName } from "../../utils/toolDisplay.js";
   import type { Session } from "../../api/types.js";
 
   interface Props {
@@ -168,6 +175,88 @@
   let pinned = $derived(pins.isPinned(message.id));
   let pinFeedback = $state("");
 
+  /** Index turn timings by message id for O(1) lookup. */
+  let turnByMessage = $derived.by(() => {
+    const m = new Map<number, TurnTiming>();
+    for (const t of sessionTiming.timing?.turns ?? []) {
+      m.set(t.message_id, t);
+    }
+    return m;
+  });
+
+  /** Index call timings by tool_use_id for O(1) lookup. */
+  let callByToolUseID = $derived.by(() => {
+    const m = new Map<string, CallTiming>();
+    for (const t of sessionTiming.timing?.turns ?? []) {
+      for (const c of t.calls) m.set(c.tool_use_id, c);
+    }
+    return m;
+  });
+
+  /** Resolve the duration badge for a solo (non-grouped) tool call.
+   *  Sub-agent calls show their exact duration; non-sub-agent solo
+   *  calls inherit the turn's wall-clock duration since per-call
+   *  timing isn't available without tool_result deltas. Running
+   *  turns synthesize a live `running …+` label from the turn's
+   *  `started_at`, ticked once per second by `liveTick`. */
+  function soloDurationLabel(
+    ct: CallTiming | undefined,
+    turn: TurnTiming | undefined,
+    msg: Message,
+  ): string | undefined {
+    if (ct?.subagent_session_id && ct.duration_ms != null) {
+      return formatDuration(ct.duration_ms);
+    }
+    if (turn?.duration_ms != null) {
+      return formatDuration(turn.duration_ms);
+    }
+    if (sessionTiming.timing?.running && turn != null) {
+      const startSrc = turn.started_at ?? msg.timestamp;
+      const startMs = new Date(startSrc).getTime();
+      const elapsed = Number.isNaN(startMs)
+        ? 0
+        : Math.max(0, liveTick.now - startMs);
+      return `running ${formatDuration(elapsed)}+`;
+    }
+    return undefined;
+  }
+
+  /** A turn is running iff the session is active AND its
+   *  duration isn't yet known. */
+  function isRunningTurn(msg: Message): boolean {
+    if (!sessionTiming.timing?.running) return false;
+    const turn = turnByMessage.get(msg.id);
+    return turn != null && turn.duration_ms == null;
+  }
+
+  /** Build the chip payload for an assistant turn. Returns null
+   *  when the message has no tool calls or timing isn't loaded. */
+  let turnSummary = $derived.by(() => {
+    if (isUser || !message.has_tool_use) return null;
+    const calls = message.tool_calls?.length ?? 0;
+    const turn = turnByMessage.get(message.id);
+    if (turn?.duration_ms != null) {
+      return {
+        text: `turn ${formatDuration(turn.duration_ms)} · ${calls} call${calls === 1 ? "" : "s"}`,
+        slow: false,
+        running: false,
+      };
+    }
+    if (sessionTiming.timing?.running && turn != null) {
+      const startSrc = turn.started_at ?? message.timestamp;
+      const startMs = new Date(startSrc).getTime();
+      const elapsed = Number.isNaN(startMs)
+        ? 0
+        : Math.max(0, liveTick.now - startMs);
+      return {
+        text: `running ${formatDuration(elapsed)}+ · ${calls} call${calls === 1 ? "" : "s"}`,
+        slow: false,
+        running: true,
+      };
+    }
+    return null;
+  });
+
   let copyTimer: ReturnType<typeof setTimeout>;
   let pinTimer: ReturnType<typeof setTimeout>;
 
@@ -223,23 +312,14 @@
     {#if message.model_id}
       <span class="model-badge">{message.model_id}</span>
     {/if}
-    <button
-      type="button"
-      class="copy-btn"
-      title={copied ? "Copied!" : "Copy message"}
+    <CopyButton
+      {copied}
+      ariaLabel="Copy message"
+      copiedAriaLabel="Copied message"
+      title="Copy message"
+      copiedTitle="Copied!"
       onclick={handleCopy}
-    >
-      {#if copied}
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-          <path d="M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z"/>
-        </svg>
-      {:else}
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-          <path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 010 1.5h-1.5a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 019.25 16h-7.5A1.75 1.75 0 010 14.25v-7.5z"/>
-          <path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0114.25 11h-7.5A1.75 1.75 0 015 9.25v-7.5zm1.75-.25a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-7.5a.25.25 0 00-.25-.25h-7.5z"/>
-        </svg>
-      {/if}
-    </button>
+    />
     <button
       type="button"
       class="pin-btn"
@@ -258,6 +338,15 @@
       {#if tokenSummary}
         <span class="message-tokens">
           {tokenSummary}
+        </span>
+      {/if}
+      {#if turnSummary}
+        <span
+          class="turn-summary"
+          class:slow={turnSummary.slow}
+          class:running={turnSummary.running}
+        >
+          {turnSummary.text}
         </span>
       {/if}
       <span class="timestamp">
@@ -282,17 +371,13 @@
           />
         {/if}
       {:else if segment.type === "tool"}
-        {#if hasSearchQuery || ui.isBlockVisible("tool")}
-          <ToolBlock
-            content={segment.content}
-            label={segment.label}
-            toolCall={segment.toolCall}
-            highlightQuery={highlightQuery}
-            isCurrentHighlight={isCurrentHighlight}
-          />
-        {/if}
+        <!-- Tool segments are rendered after the loop so contiguous
+             tool_calls can be grouped into a single ParallelGroup
+             (v1 simplification: text first, then all tools). -->
       {:else if segment.type === "skill"}
-        <SkillBlock content={segment.content} name={segment.label} />
+        {#if showText}
+          <SkillBlock content={segment.content} name={segment.label} />
+        {/if}
       {:else if segment.type === "code"}
         {#if hasSearchQuery || ui.isBlockVisible("code")}
           <CodeBlock
@@ -317,6 +402,51 @@
         {/if}
       {/if}
     {/each}
+
+    {#if (hasSearchQuery || ui.isBlockVisible("tool"))}
+      {@const turn = turnByMessage.get(message.id)}
+      {@const structuredCalls = message.tool_calls ?? []}
+      {#if structuredCalls.length === 1}
+        {@const soloCall = structuredCalls[0]!}
+        <ToolBlock
+          toolCall={soloCall}
+          content=""
+          label={displayToolName(soloCall)}
+          durationLabel={soloDurationLabel(
+            callByToolUseID.get(soloCall.tool_use_id ?? ""),
+            turn,
+            message,
+          )}
+          isRunning={isRunningTurn(message)}
+          highlightQuery={highlightQuery}
+          isCurrentHighlight={isCurrentHighlight}
+        />
+      {:else if structuredCalls.length >= 2}
+        <ParallelGroup
+          toolCalls={structuredCalls}
+          callTimingByID={callByToolUseID}
+          turnDurationMs={turn?.duration_ms ?? null}
+          isRunning={isRunningTurn(message)}
+          highlightQuery={highlightQuery}
+          isCurrentHighlight={isCurrentHighlight}
+        />
+      {:else}
+        <!-- Fallback for messages with `has_tool_use` but no
+             structured tool_calls — render parsed tool segments
+             so legacy/synthetic transcripts (e.g. `[Bash]...`
+             markers) keep their tool blocks. Mirrors
+             ToolCallGroup.svelte's fallback path. -->
+        {#each segments.filter((s) => s.type === "tool") as seg, segIdx (`${message.id}-${segIdx}`)}
+          <ToolBlock
+            content={seg.content}
+            label={seg.label}
+            toolCall={seg.toolCall}
+            highlightQuery={highlightQuery}
+            isCurrentHighlight={isCurrentHighlight}
+          />
+        {/each}
+      {/if}
+    {/if}
   </div>
 </div>
 
@@ -406,40 +536,33 @@
     opacity: 0.8;
   }
 
-  .copy-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 26px;
-    height: 26px;
-    border: none;
-    border-radius: var(--radius-sm, 4px);
-    background: transparent;
+  .turn-summary {
+    font-family: var(--font-mono);
+    font-size: 10px;
     color: var(--text-muted);
-    cursor: pointer;
-    opacity: 0;
-    transition: opacity 0.15s, background 0.15s, color 0.15s;
+    background: rgba(255, 255, 255, 0.04);
+    padding: 2px 8px;
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(255, 255, 255, 0.04);
+    white-space: nowrap;
     flex-shrink: 0;
   }
 
-  .message:hover .copy-btn,
-  .copy-btn:focus-visible {
+  .turn-summary.slow {
+    color: var(--slow-fg);
+    background: var(--slow-bg);
+    border-color: var(--slow-ring);
+  }
+
+  .turn-summary.running {
+    color: var(--running-fg);
+    background: var(--running-bg);
+    border-color: var(--running-ring);
+    animation: duration-pulse 1.6s ease-in-out infinite;
+  }
+
+  .message:hover :global(.copy-btn) {
     opacity: 1;
-  }
-
-  @media (hover: none) {
-    .copy-btn {
-      opacity: 1;
-    }
-  }
-
-  .copy-btn:hover {
-    background: var(--bg-surface-hover);
-    color: var(--text-secondary);
-  }
-
-  .copy-btn:active {
-    transform: scale(0.92);
   }
 
   .pin-btn {

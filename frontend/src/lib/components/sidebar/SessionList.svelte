@@ -3,12 +3,11 @@
   import { sessions } from "../../stores/sessions.svelte.js";
   import { starred } from "../../stores/starred.svelte.js";
   import SessionItem from "./SessionItem.svelte";
+  import SessionFilterControl from "../filters/SessionFilterControl.svelte";
   import { formatNumber } from "../../utils/format.js";
+  import { agentColor } from "../../utils/agents.js";
   import {
-    agentColor,
-    agentLabel,
-  } from "../../utils/agents.js";
-  import {
+    type DisplayItem,
     type GroupMode,
     ITEM_HEIGHT,
     OVERSCAN,
@@ -26,42 +25,10 @@
   let scrollTop = $state(0);
   let viewportHeight = $state(0);
   let scrollRaf: number | null = $state(null);
-  let showFilterDropdown = $state(false);
-  let filterBtnRef: HTMLButtonElement | undefined =
-    $state(undefined);
-  let dropdownRef: HTMLDivElement | undefined =
-    $state(undefined);
-  let agentSearch = $state("");
-
-  // Agents sorted by frequency, filtered by search.
-  let sortedAgents = $derived.by(() => {
-    const agents = [...sessions.agents].sort(
-      (a, b) => b.session_count - a.session_count,
-    );
-    if (!agentSearch) return agents;
-    const q = agentSearch.toLowerCase();
-    return agents.filter((a) =>
-      agentLabel(a.name).toLowerCase().includes(q),
-    );
-  });
-
-  let machineSearch = $state("");
-  let sortedMachines = $derived.by(() => {
-    const machines = [...sessions.machines].sort();
-    if (!machineSearch) return machines;
-    const q = machineSearch.toLowerCase();
-    return machines.filter((m) => m.toLowerCase().includes(q));
-  });
-
-  // Ensure agents and machines are loaded when dropdown opens.
-  $effect(() => {
-    if (showFilterDropdown) {
-      sessions.loadAgents();
-      sessions.loadMachines();
-      agentSearch = "";
-      machineSearch = "";
-    }
-  });
+  let initialHydratedVersion: number | null = $state(null);
+  let initialHydratingVersion: number | null = $state(null);
+  let paintedDisplayItems: DisplayItem[] = $state([]);
+  let paintedTotalSize = $state(0);
 
   let groupMode: GroupMode = $state(getInitialGroupMode());
   let manualExpanded: Set<string> = $state(new Set());
@@ -75,22 +42,6 @@
       localStorage.setItem(STORAGE_KEY_GROUP, groupMode);
     }
   });
-
-  let hasFilters = $derived(
-    sessions.hasActiveFilters || starred.filterOnly,
-  );
-  let isRecentlyActiveOn = $derived(
-    sessions.filters.recentlyActive,
-  );
-  let isHideUnknownOn = $derived(
-    sessions.filters.hideUnknownProject,
-  );
-  let isHideSingleTurnOn = $derived(
-    !sessions.filters.includeOneShot,
-  );
-  let isIncludeAutomatedOn = $derived(
-    sessions.filters.includeAutomated,
-  );
 
   let groups = $derived.by(() => {
     const all = sessions.groupedSessions;
@@ -152,14 +103,24 @@
       : groups.length,
   );
   let totalSize = $derived(computeTotalSize(displayItems));
+  let renderDisplayItems = $derived(
+    initialHydratedVersion === sessions.sidebarIndexVersion
+      ? displayItems
+      : paintedDisplayItems,
+  );
+  let renderTotalSize = $derived(
+    initialHydratedVersion === sessions.sidebarIndexVersion
+      ? totalSize
+      : paintedTotalSize,
+  );
 
   let visibleItems = $derived.by(() => {
-    if (displayItems.length === 0) return [];
-    const start = findStart(displayItems, scrollTop);
+    if (renderDisplayItems.length === 0) return [];
+    const start = findStart(renderDisplayItems, scrollTop);
     const end = scrollTop + viewportHeight + OVERSCAN * ITEM_HEIGHT;
-    const result: typeof displayItems = [];
-    for (let i = start; i < displayItems.length; i++) {
-      const item = displayItems[i]!;
+    const result: typeof renderDisplayItems = [];
+    for (let i = start; i < renderDisplayItems.length; i++) {
+      const item = renderDisplayItems[i]!;
       if (item.top > end) break;
       result.push(item);
     }
@@ -215,6 +176,53 @@
     expandedGroups = next;
   }
 
+  function effectiveViewportHeight(): number {
+    // ResizeObserver/clientHeight normally reports before hydration starts.
+    // If jsdom or a hidden container reports 0, use a fixed conservative
+    // viewport so hydration remains deliberate instead of accidental.
+    return viewportHeight > 0 ? viewportHeight : ITEM_HEIGHT * 8;
+  }
+
+  function sessionForItem(item: DisplayItem) {
+    if (item.type !== "session") return undefined;
+    if (item.isChild) return item.session;
+    return item.group?.sessions.find(
+      (s) => s.id === item.group!.primarySessionId,
+    ) ?? item.group?.sessions[0];
+  }
+
+  function needsVisibleHydration(item: DisplayItem): boolean {
+    const session = sessionForItem(item);
+    return !!session?.is_index_only && !session.display_name;
+  }
+
+  function hydrationIdsForItems(items: DisplayItem[]): string[] {
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    for (const item of items) {
+      if (!needsVisibleHydration(item)) continue;
+      const id = sessionForItem(item)?.id;
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+    }
+    return ids;
+  }
+
+  function initialHydrationIds(items: DisplayItem[]): string[] {
+    const target =
+      Math.ceil(effectiveViewportHeight() / ITEM_HEIGHT) + OVERSCAN;
+    const sessionItems = items
+      .filter((item) => item.type === "session")
+      .slice(0, target);
+    return hydrationIdsForItems(sessionItems);
+  }
+
+  function requestHydration(ids: string[], version: number) {
+    if (ids.length === 0) return;
+    void sessions.hydrateVisibleSessions(ids, version);
+  }
+
   $effect(() => {
     if (!containerRef) return;
     viewportHeight = containerRef.clientHeight;
@@ -226,38 +234,52 @@
     return () => ro.disconnect();
   });
 
+  $effect(() => {
+    const version = sessions.sidebarIndexVersion;
+    const ids = initialHydrationIds(displayItems);
+
+    if (initialHydratedVersion === version) {
+      paintedDisplayItems = displayItems;
+      paintedTotalSize = totalSize;
+      return;
+    }
+    if (initialHydratingVersion === version) return;
+
+    if (ids.length === 0) {
+      initialHydratedVersion = version;
+      paintedDisplayItems = displayItems;
+      paintedTotalSize = totalSize;
+      return;
+    }
+
+    initialHydratingVersion = version;
+    void (async () => {
+      await sessions.hydrateVisibleSessions(ids, version);
+      if (sessions.sidebarIndexVersion !== version) return;
+      initialHydratedVersion = version;
+      initialHydratingVersion = null;
+      paintedDisplayItems = displayItems;
+      paintedTotalSize = totalSize;
+    })();
+  });
+
+  $effect(() => {
+    const version = sessions.sidebarIndexVersion;
+    if (initialHydratedVersion !== version) return;
+    requestHydration(hydrationIdsForItems(visibleItems), version);
+  });
+
   // Clamp stale scrollTop when count shrinks.
   $effect(() => {
     if (!containerRef) return;
     const maxTop = Math.max(
       0,
-      totalSize - containerRef.clientHeight,
+      renderTotalSize - containerRef.clientHeight,
     );
     if (scrollTop > maxTop) {
       scrollTop = maxTop;
       containerRef.scrollTop = maxTop;
     }
-  });
-
-  // Close filter dropdown on outside click.
-  $effect(() => {
-    if (!showFilterDropdown) return;
-    function onClickOutside(e: MouseEvent) {
-      const target = e.target as Node;
-      if (
-        filterBtnRef?.contains(target) ||
-        dropdownRef?.contains(target)
-      )
-        return;
-      showFilterDropdown = false;
-    }
-    document.addEventListener("click", onClickOutside, true);
-    return () =>
-      document.removeEventListener(
-        "click",
-        onClickOutside,
-        true,
-      );
   });
 
   function handleScroll() {
@@ -286,7 +308,7 @@
     if (!containerRef) return;
     // Read displayItems inside the effect so Svelte tracks
     // it — needed to re-run after a group expansion.
-    const items = displayItems;
+    const items = renderDisplayItems;
     // Try to find the exact child row first (when expanded).
     let item = items.find(
       (it) =>
@@ -367,269 +389,46 @@
     {#if sessions.loading}
       <span class="loading-indicator">loading</span>
     {/if}
-    <button
-      class="filter-btn"
-      bind:this={filterBtnRef}
-      onclick={() =>
-        (showFilterDropdown = !showFilterDropdown)}
-    >
-      <svg
-        width="14"
-        height="14"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="2"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-      >
-        <polygon
-          points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"
-        />
-      </svg>
-      {#if hasFilters || groupMode !== "none"}
-        <span class="filter-indicator"></span>
-      {/if}
-    </button>
-    {#if showFilterDropdown}
-      <div class="filter-dropdown" bind:this={dropdownRef}>
-        <div class="filter-section">
-          <div class="filter-section-label">Display</div>
+    <SessionFilterControl
+      {groupMode}
+      onToggleGroupByAgent={toggleGroupByAgent}
+      onToggleGroupByProject={toggleGroupByProject}
+      onClearGroupMode={() => setGroupMode("none")}
+      extraActive={sessions.filters.termination !== ""}
+      onClearExtra={() => sessions.setTerminationFilter("")}
+      extraSections={statusFilterSection}
+    />
+    {#snippet statusFilterSection()}
+      <div class="filter-section">
+        <div class="filter-section-label">Status</div>
+        <div class="pill-buttons">
           <button
-            class="filter-toggle"
-            class:active={groupMode === "agent"}
-            onclick={toggleGroupByAgent}
+            class="pill-btn pill-btn--status-active"
+            class:active={sessions.hasTerminationStatus("active")}
+            onclick={() => sessions.toggleTerminationStatus("active")}
+            title="Last activity within 10 minutes"
           >
-            <span
-              class="toggle-check"
-              class:on={groupMode === "agent"}
-            ></span>
-            Group by agent
+            Active
           </button>
           <button
-            class="filter-toggle"
-            class:active={groupMode === "project"}
-            onclick={toggleGroupByProject}
+            class="pill-btn pill-btn--status-stale"
+            class:active={sessions.hasTerminationStatus("stale")}
+            onclick={() => sessions.toggleTerminationStatus("stale")}
+            title="Flagged session, idle 10 minutes to 1 hour"
           >
-            <span
-              class="toggle-check"
-              class:on={groupMode === "project"}
-            ></span>
-            Group by project
+            Stale
+          </button>
+          <button
+            class="pill-btn pill-btn--status-unclean"
+            class:active={sessions.hasTerminationStatus("unclean")}
+            onclick={() => sessions.toggleTerminationStatus("unclean")}
+            title="Terminated mid tool call (over 1 hour idle)"
+          >
+            Unclean
           </button>
         </div>
-        <div class="filter-section">
-          <div class="filter-section-label">Starred</div>
-          <button
-            class="filter-toggle"
-            class:active={starred.filterOnly}
-            onclick={() => (starred.filterOnly = !starred.filterOnly)}
-          >
-            <span
-              class="toggle-check"
-              class:on={starred.filterOnly}
-            ></span>
-            Starred only
-            {#if starred.count > 0}
-              <span class="starred-count">{starred.count}</span>
-            {/if}
-          </button>
-        </div>
-        <div class="filter-section">
-          <div class="filter-section-label">Activity</div>
-          <button
-            class="filter-toggle"
-            class:active={isRecentlyActiveOn}
-            onclick={() =>
-              sessions.setRecentlyActiveFilter(
-                !isRecentlyActiveOn,
-              )}
-          >
-            <span
-              class="toggle-check"
-              class:on={isRecentlyActiveOn}
-            ></span>
-            Recently Active
-          </button>
-        </div>
-        <div class="filter-section">
-          <div class="filter-section-label">
-            Session Type
-          </div>
-          <button
-            class="filter-toggle"
-            class:active={isHideSingleTurnOn}
-            onclick={() =>
-              sessions.setIncludeOneShotFilter(
-                isHideSingleTurnOn,
-              )}
-          >
-            <span
-              class="toggle-check"
-              class:on={isHideSingleTurnOn}
-            ></span>
-            Hide single-turn
-          </button>
-          <button
-            class="filter-toggle"
-            class:active={isIncludeAutomatedOn}
-            onclick={() =>
-              sessions.setIncludeAutomatedFilter(
-                !isIncludeAutomatedOn,
-              )}
-          >
-            <span
-              class="toggle-check"
-              class:on={isIncludeAutomatedOn}
-            ></span>
-            Include automated reviews
-          </button>
-        </div>
-        <div class="filter-section">
-          <div class="filter-section-label">Project</div>
-          <button
-            class="filter-toggle"
-            class:active={isHideUnknownOn}
-            onclick={() =>
-              sessions.setHideUnknownProjectFilter(
-                !isHideUnknownOn,
-              )}
-          >
-            <span
-              class="toggle-check"
-              class:on={isHideUnknownOn}
-            ></span>
-            Hide unknown
-          </button>
-        </div>
-        <div class="filter-section">
-          <div class="filter-section-label">Agent</div>
-          {#if sessions.agents.length > 5}
-            <input
-              class="agent-search"
-              type="text"
-              placeholder="Search agents..."
-              bind:value={agentSearch}
-            />
-          {/if}
-          <div class="agent-select-list">
-            {#each sortedAgents as agent (agent.name)}
-              {@const selected =
-                sessions.isAgentSelected(agent.name)}
-                <button
-                  class="agent-select-row"
-                  class:selected
-                  style:--agent-color={agentColor(agent.name)}
-                  onclick={() =>
-                    sessions.toggleAgentFilter(agent.name)}
-                >
-                  <span
-                    class="agent-check"
-                    class:on={selected}
-                  >
-                    {#if selected}
-                      <svg width="8" height="8" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                        <path d="M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z"/>
-                      </svg>
-                    {/if}
-                  </span>
-                <span
-                  class="agent-dot-mini"
-                  style:background={agentColor(agent.name)}
-                ></span>
-                <span class="agent-select-name">
-                  {agentLabel(agent.name)}
-                </span>
-                <span class="agent-select-count">
-                  {agent.session_count}
-                </span>
-              </button>
-            {:else}
-              <span class="agent-select-empty">
-                {agentSearch ? "No match" : "No agents"}
-              </span>
-            {/each}
-          </div>
-        </div>
-        {#if sessions.machines.length > 0}
-          <div class="filter-section">
-            <div class="filter-section-label">Machine</div>
-            {#if sessions.machines.length > 5}
-              <input
-                class="agent-search"
-                type="text"
-                placeholder="Search machines..."
-                bind:value={machineSearch}
-              />
-            {/if}
-            <div class="agent-select-list">
-              {#each sortedMachines as machine (machine)}
-                {@const selected =
-                  sessions.isMachineSelected(machine)}
-                <button
-                  class="agent-select-row"
-                  class:selected
-                  style:--agent-color={"var(--accent-blue)"}
-                  onclick={() =>
-                    sessions.toggleMachineFilter(machine)}
-                >
-                  <span
-                    class="agent-check"
-                    class:on={selected}
-                  >
-                    {#if selected}
-                      <svg width="8" height="8" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                        <path d="M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z"/>
-                      </svg>
-                    {/if}
-                  </span>
-                  <span class="agent-select-name">
-                    {machine}
-                  </span>
-                </button>
-              {:else}
-                <span class="agent-select-empty">
-                  {machineSearch ? "No match" : "No machines"}
-                </span>
-              {/each}
-            </div>
-          </div>
-        {/if}
-        <div class="filter-section">
-          <div class="filter-section-label">Min Prompts</div>
-          <div class="pill-buttons">
-            {#each [2, 3, 5, 10] as n}
-              <button
-                class="pill-btn"
-                class:active={sessions.filters.minUserMessages === n}
-                onclick={() =>
-                  sessions.setMinUserMessagesFilter(n)}
-              >
-                {n}
-              </button>
-            {/each}
-          </div>
-        </div>
-        {#if hasFilters || groupMode !== "none"}
-          <button
-            class="clear-filters-btn"
-            onclick={() => {
-              if (groupMode !== "none") setGroupMode("none");
-              if (sessions.hasActiveFilters && starred.filterOnly) {
-                starred.filterOnly = false;
-                sessions.clearSessionFilters();
-              } else if (sessions.hasActiveFilters) {
-                sessions.clearSessionFilters();
-              } else if (starred.filterOnly) {
-                starred.filterOnly = false;
-              }
-            }}
-          >
-            Clear filters
-          </button>
-        {/if}
       </div>
-    {/if}
+    {/snippet}
   </div>
 </div>
 
@@ -639,7 +438,7 @@
   onscroll={handleScroll}
 >
   <div
-    style="height: {totalSize}px; width: 100%; position: relative;"
+    style="height: {renderTotalSize}px; width: 100%; position: relative;"
   >
     {#each visibleItems as item (item.id)}
       <div
@@ -649,6 +448,8 @@
           <button
             class="group-header"
             onclick={() => toggleGroup(item.label)}
+            title="{collapsed.has(item.label) ? 'Expand' : 'Collapse'} {item.label} group"
+            aria-label="{collapsed.has(item.label) ? 'Expand' : 'Collapse'} {item.label} group"
           >
             <svg
               class="chevron"
@@ -686,6 +487,8 @@
             class="sub-group-header"
             style:padding-left="{8 + (item.depth ?? 1) * 16}px"
             onclick={() => toggleChainExpand(subKey)}
+            title="{subExpanded ? 'Collapse' : 'Expand'} Subagents group"
+            aria-label="{subExpanded ? 'Collapse' : 'Expand'} Subagents group"
           >
             <svg class="sub-group-arrow" class:expanded={subExpanded} width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M6.22 3.22a.75.75 0 011.06 0l4.25 4.25a.75.75 0 010 1.06l-4.25 4.25a.75.75 0 01-1.06-1.06L9.94 8 6.22 4.28a.75.75 0 010-1.06z"/></svg>
             <svg class="sub-group-icon" width="10" height="10" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
@@ -701,6 +504,8 @@
             class="sub-group-header"
             style:padding-left="{8 + (item.depth ?? 1) * 16}px"
             onclick={() => toggleChainExpand(teamKey)}
+            title="{teamExpanded ? 'Collapse' : 'Expand'} Team group"
+            aria-label="{teamExpanded ? 'Collapse' : 'Expand'} Team group"
           >
             <svg class="sub-group-arrow" class:expanded={teamExpanded} width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M6.22 3.22a.75.75 0 011.06 0l4.25 4.25a.75.75 0 010 1.06l-4.25 4.25a.75.75 0 01-1.06-1.06L9.94 8 6.22 4.28a.75.75 0 010-1.06z"/></svg>
             <svg class="sub-group-icon" width="12" height="10" viewBox="0 0 20 16" fill="currentColor" aria-hidden="true">
@@ -726,13 +531,16 @@
           ) ?? item.group.sessions[0]}
           {@const children = item.group.sessions.filter((s) => s.id !== item.group!.primarySessionId)}
           {@const groupHasSubagents = children.some((s) => isSubagentDescendant(s, item.group!.sessions))}
-          {@const groupHasTeammates = children.some((s) => s.first_message?.includes("<teammate-message") ?? false)}
+          {@const groupHasTeammates = children.some((s) => s.is_teammate ?? s.first_message?.includes("<teammate-message") ?? false)}
           {#if primary}
             <SessionItem
               session={primary}
               continuationCount={item.group.sessions.length}
               groupSessionIds={item.group.sessions.length > 1
                 ? item.group.sessions.map((s) => s.id)
+                : undefined}
+              groupSessions={item.group.sessions.length > 1
+                ? item.group.sessions
                 : undefined}
               hideAgent={groupMode === "agent"}
               hideProject={groupMode === "project"}
@@ -780,67 +588,13 @@
     color: var(--accent-green);
   }
 
-  .filter-btn {
-    position: relative;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
-    border-radius: 4px;
-    color: var(--text-muted);
-    transition: color 0.1s, background 0.1s;
-  }
-
-  .filter-btn:hover {
-    color: var(--text-primary);
-    background: var(--bg-surface-hover);
-  }
-
-  .filter-indicator {
-    position: absolute;
-    top: 2px;
-    right: 2px;
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--accent-green);
-  }
-
-  .filter-dropdown {
-    position: absolute;
-    top: 100%;
-    right: 0;
-    margin-top: 4px;
-    width: 220px;
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-lg);
-    padding: 8px;
-    z-index: 100;
-    text-transform: none;
-    letter-spacing: normal;
-    animation: dropdown-in 0.12s ease-out;
-    transform-origin: top right;
-  }
-
-  @keyframes dropdown-in {
-    from {
-      opacity: 0;
-      transform: scale(0.95) translateY(-2px);
-    }
-    to {
-      opacity: 1;
-      transform: scale(1) translateY(0);
-    }
-  }
-
+  /* Snippet rendered inside SessionFilterControl carries this
+     component's CSS scope, so it doesn't see SessionFilterControl's
+     own .filter-section / .pill-* base styles. Re-declare them
+     here so the Status section's buttons render as pills with
+     proper section spacing. */
   .filter-section {
     padding: 4px 0;
-  }
-
-  .filter-section + .filter-section {
     border-top: 1px solid var(--border-muted);
     margin-top: 4px;
     padding-top: 8px;
@@ -853,153 +607,6 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
     margin-bottom: 6px;
-  }
-
-  .filter-toggle {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    width: 100%;
-    padding: 4px 8px;
-    font-size: 11px;
-    color: var(--text-secondary);
-    text-align: left;
-    border-radius: 4px;
-    transition: background 0.1s, color 0.1s;
-  }
-
-  .filter-toggle:hover {
-    background: var(--bg-surface-hover);
-  }
-
-  .filter-toggle.active {
-    background: var(--bg-surface-hover);
-    color: var(--accent-green);
-    font-weight: 500;
-  }
-
-  .toggle-check {
-    width: 10px;
-    height: 10px;
-    border-radius: 2px;
-    border: 1.5px solid var(--border-default);
-    flex-shrink: 0;
-    transition: background 0.1s, border-color 0.1s;
-  }
-
-  .toggle-check.on {
-    background: var(--accent-green);
-    border-color: var(--accent-green);
-  }
-
-  .agent-search {
-    width: 100%;
-    height: 24px;
-    padding: 0 8px;
-    margin-bottom: 4px;
-    font-size: 10px;
-    color: var(--text-primary);
-    background: var(--bg-inset);
-    border: 1px solid var(--border-muted);
-    border-radius: 4px;
-    outline: none;
-    transition: border-color 0.1s;
-  }
-
-  .agent-search::placeholder {
-    color: var(--text-muted);
-  }
-
-  .agent-search:focus {
-    border-color: var(--accent-blue);
-  }
-
-  .agent-select-list {
-    display: flex;
-    flex-direction: column;
-    max-height: 180px;
-    overflow-y: auto;
-    overflow-x: hidden;
-    gap: 1px;
-  }
-
-  .agent-select-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    width: 100%;
-    padding: 3px 8px;
-    font-size: 11px;
-    color: var(--text-secondary);
-    text-align: left;
-    border-radius: 3px;
-    transition: background 0.08s, color 0.08s;
-    flex-shrink: 0;
-  }
-
-  .agent-select-row:hover {
-    background: var(--bg-surface-hover);
-  }
-
-  .agent-select-row.selected {
-    color: var(--agent-color, var(--accent-blue));
-    font-weight: 500;
-    background: color-mix(
-      in srgb,
-      var(--agent-color, var(--accent-blue)) 10%,
-      transparent
-    );
-  }
-
-  .agent-check {
-    width: 10px;
-    height: 10px;
-    border-radius: 2px;
-    border: 1.5px solid var(--border-default);
-    flex-shrink: 0;
-    transition: background 0.1s, border-color 0.1s;
-    color: white;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .agent-check.on {
-    background: var(--agent-color, var(--accent-blue));
-    border-color: var(--agent-color, var(--accent-blue));
-  }
-
-  .agent-dot-mini {
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    flex-shrink: 0;
-  }
-
-  .agent-select-name {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .agent-select-count {
-    flex-shrink: 0;
-    font-size: 9px;
-    font-weight: 500;
-    color: var(--text-muted);
-    min-width: 14px;
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .agent-select-empty {
-    display: block;
-    padding: 6px 8px;
-    font-size: 10px;
-    color: var(--text-muted);
-    text-align: center;
   }
 
   .pill-buttons {
@@ -1028,37 +635,46 @@
     border-color: var(--border-default);
   }
 
-  .pill-btn.active {
-    background: var(--bg-surface-hover);
+  /* Status filter pills mirror the dot indicators: green = active,
+     amber = stale, red = unclean. Inactive state shows a faint
+     colored border so the colors are recognizable without selection. */
+  .pill-btn--status-active {
+    color: color-mix(in srgb, var(--accent-green) 75%, var(--text-secondary));
+    border-color: color-mix(in srgb, var(--accent-green) 35%, transparent);
+  }
+  .pill-btn--status-active:hover {
+    border-color: color-mix(in srgb, var(--accent-green) 65%, transparent);
+  }
+  .pill-btn--status-active.active {
+    background: color-mix(in srgb, var(--accent-green) 12%, transparent);
     border-color: var(--accent-green);
     color: var(--accent-green);
-    font-weight: 500;
   }
 
-  .clear-filters-btn {
-    display: block;
-    width: 100%;
-    padding: 4px 8px;
-    margin-top: 8px;
-    font-size: 10px;
-    color: var(--text-muted);
-    text-align: center;
-    border-top: 1px solid var(--border-muted);
-    padding-top: 8px;
-    transition: color 0.1s;
+  .pill-btn--status-stale {
+    color: color-mix(in srgb, var(--accent-amber) 75%, var(--text-secondary));
+    border-color: color-mix(in srgb, var(--accent-amber) 35%, transparent);
   }
-
-  .starred-count {
-    margin-left: auto;
-    font-size: 9px;
-    font-weight: 600;
+  .pill-btn--status-stale:hover {
+    border-color: color-mix(in srgb, var(--accent-amber) 65%, transparent);
+  }
+  .pill-btn--status-stale.active {
+    background: color-mix(in srgb, var(--accent-amber) 12%, transparent);
+    border-color: var(--accent-amber);
     color: var(--accent-amber);
-    min-width: 14px;
-    text-align: center;
   }
 
-  .clear-filters-btn:hover {
-    color: var(--text-primary);
+  .pill-btn--status-unclean {
+    color: color-mix(in srgb, var(--accent-red) 75%, var(--text-secondary));
+    border-color: color-mix(in srgb, var(--accent-red) 35%, transparent);
+  }
+  .pill-btn--status-unclean:hover {
+    border-color: color-mix(in srgb, var(--accent-red) 65%, transparent);
+  }
+  .pill-btn--status-unclean.active {
+    background: color-mix(in srgb, var(--accent-red) 12%, transparent);
+    border-color: var(--accent-red);
+    color: var(--accent-red);
   }
 
   .session-list-scroll {

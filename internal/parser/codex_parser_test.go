@@ -6,7 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/wesm/agentsview/internal/testjsonl"
+	"go.kenn.io/agentsview/internal/testjsonl"
 )
 
 func runCodexParserTest(t *testing.T, fileName, content string, includeExec bool) (*ParsedSession, []ParsedMessage) {
@@ -45,6 +45,22 @@ func TestParseCodexSession_Basic(t *testing.T) {
 	assert.Equal(t, "codex:abc-123", sess.ID)
 	assert.Equal(t, 2, len(msgs))
 	assertSessionMeta(t, sess, "codex:abc-123", "my_api", AgentCodex)
+}
+
+func TestParseCodexSession_PreservesAssistantBlockquotes(t *testing.T) {
+	content := loadFixture(t, "codex/blockquotes_session.jsonl")
+	sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+	require.NotNil(t, sess)
+	assert.Equal(t, "codex:quote-123", sess.ID)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, RoleUser, msgs[0].Role)
+	assert.Equal(t, "blablabla?", msgs[0].Content)
+	assert.Equal(t, RoleAssistant, msgs[1].Role)
+	assert.Equal(t,
+		"blabla1\n\n> blabla2\n\nblabla3\n\n> blabla4\n\nblabla5",
+		msgs[1].Content,
+	)
 }
 
 func TestParseCodexSession_ExecOriginator(t *testing.T) {
@@ -201,9 +217,10 @@ func TestParseCodexSession_FunctionCalls(t *testing.T) {
 		assert.Equal(t, 4, len(msgs))
 		assert.Equal(t, RoleAssistant, msgs[1].Role)
 		assertToolCalls(t, msgs[1].ToolCalls, []ParsedToolCall{{
-			ToolUseID: "call_spawn",
-			ToolName:  "spawn_agent",
-			Category:  "Task",
+			ToolUseID:         "call_spawn",
+			ToolName:          "spawn_agent",
+			Category:          "Task",
+			SubagentSessionID: "codex:" + childID,
 		}})
 		assert.Equal(t, RoleAssistant, msgs[2].Role)
 		assertToolCalls(t, msgs[2].ToolCalls, []ParsedToolCall{{
@@ -244,9 +261,10 @@ func TestParseCodexSession_FunctionCalls(t *testing.T) {
 		require.NotNil(t, sess)
 		assert.Equal(t, 2, len(msgs))
 		assertToolCalls(t, msgs[1].ToolCalls, []ParsedToolCall{{
-			ToolUseID: "call_spawn",
-			ToolName:  "spawn_agent",
-			Category:  "Task",
+			ToolUseID:         "call_spawn",
+			ToolName:          "spawn_agent",
+			Category:          "Task",
+			SubagentSessionID: "codex:" + childID,
 		}})
 		assertToolResultEvents(t, msgs[1].ToolCalls[0].ResultEvents, []ParsedToolResultEvent{{
 			ToolUseID:         "call_spawn",
@@ -289,6 +307,101 @@ func TestParseCodexSession_FunctionCalls(t *testing.T) {
 		}})
 		assert.Equal(t, RoleAssistant, msgs[2].Role)
 		assert.Equal(t, "continuing", msgs[2].Content)
+	})
+
+	t.Run("codex app wait_agent and agent_path notifications link child session", func(t *testing.T) {
+		childID := "019df406-3bd3-7343-b3d8-f8d5996c428b"
+		summary := "Inspected only. I did not modify files."
+		notification := "<subagent_notification>\n" +
+			"{\"agent_path\":\"" + childID + "\",\"status\":{\"completed\":\"" + summary + "\"}}\n" +
+			"</subagent_notification>"
+		spawnEnd := "{\"timestamp\":\"2024-01-01T10:01:05Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"collab_agent_spawn_end\",\"call_id\":\"call_spawn\",\"sender_thread_id\":\"parent-thread\",\"new_thread_id\":\"" + childID + "\",\"new_agent_nickname\":\"Einstein\",\"new_agent_role\":\"explorer\",\"status\":\"pending_init\"}}"
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("fc-codex-app-subagent", "/tmp", "user", tsEarly),
+			testjsonl.CodexMsgJSON("user", "run a child agent", tsEarlyS1),
+			testjsonl.CodexFunctionCallWithCallIDJSON("spawn_agent", "call_spawn", map[string]any{
+				"agent_type": "explorer",
+				"message":    "Inspect the code",
+			}, tsEarlyS5),
+			spawnEnd,
+			testjsonl.CodexFunctionCallOutputJSON("call_spawn", `{"agent_id":"`+childID+`","nickname":"Einstein"}`, tsLate),
+			testjsonl.CodexFunctionCallWithCallIDJSON("wait_agent", "call_wait", map[string]any{
+				"targets":    []string{childID},
+				"timeout_ms": 10000,
+			}, tsLateS5),
+			testjsonl.CodexMsgJSON("user", notification, "2024-01-01T10:01:07Z"),
+		)
+		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+		require.NotNil(t, sess)
+		assert.Equal(t, 3, len(msgs))
+		assertToolCalls(t, msgs[1].ToolCalls, []ParsedToolCall{{
+			ToolUseID:         "call_spawn",
+			ToolName:          "spawn_agent",
+			Category:          "Task",
+			SubagentSessionID: "codex:" + childID,
+		}})
+		assertToolCalls(t, msgs[2].ToolCalls, []ParsedToolCall{{
+			ToolUseID: "call_wait",
+			ToolName:  "wait_agent",
+			Category:  "Other",
+		}})
+		assertToolResultEvents(t, msgs[2].ToolCalls[0].ResultEvents, []ParsedToolResultEvent{{
+			ToolUseID:         "call_wait",
+			AgentID:           childID,
+			SubagentSessionID: "codex:" + childID,
+			Source:            "subagent_notification",
+			Status:            "completed",
+			Content:           summary,
+		}})
+	})
+
+	t.Run("codex app pending notification waits for later wait_agent binding", func(t *testing.T) {
+		childID := "019df406-3bd3-7343-b3d8-f8d5996c428b"
+		summary := "Inspected before wait_agent existed."
+		notification := "<subagent_notification>\n" +
+			"{\"agent_path\":\"" + childID + "\",\"status\":{\"completed\":\"" + summary + "\"}}\n" +
+			"</subagent_notification>"
+		spawnEnd := "{\"timestamp\":\"2024-01-01T10:01:05Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"collab_agent_spawn_end\",\"call_id\":\"call_spawn\",\"sender_thread_id\":\"parent-thread\",\"new_thread_id\":\"" + childID + "\",\"new_agent_nickname\":\"Einstein\",\"new_agent_role\":\"explorer\",\"status\":\"pending_init\"}}"
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("fc-codex-app-subagent-pending", "/tmp", "user", tsEarly),
+			testjsonl.CodexMsgJSON("user", "run a child agent", tsEarlyS1),
+			testjsonl.CodexFunctionCallWithCallIDJSON("spawn_agent", "call_spawn", map[string]any{
+				"agent_type": "explorer",
+				"message":    "Inspect the code",
+			}, tsEarlyS5),
+			spawnEnd,
+			testjsonl.CodexFunctionCallOutputJSON("call_spawn", `{"agent_id":"`+childID+`","nickname":"Einstein"}`, tsLate),
+			testjsonl.CodexMsgJSON("user", notification, "2024-01-01T10:01:07Z"),
+			testjsonl.CodexFunctionCallWithCallIDJSON("wait_agent", "call_wait", map[string]any{
+				"targets":    []string{childID},
+				"timeout_ms": 10000,
+			}, "2024-01-01T10:01:08Z"),
+		)
+		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+		require.NotNil(t, sess)
+		assert.Equal(t, 3, len(msgs))
+		assertToolCalls(t, msgs[1].ToolCalls, []ParsedToolCall{{
+			ToolUseID:         "call_spawn",
+			ToolName:          "spawn_agent",
+			Category:          "Task",
+			SubagentSessionID: "codex:" + childID,
+		}})
+		assert.Empty(t, msgs[1].ToolCalls[0].ResultEvents)
+		assertToolCalls(t, msgs[2].ToolCalls, []ParsedToolCall{{
+			ToolUseID: "call_wait",
+			ToolName:  "wait_agent",
+			Category:  "Other",
+		}})
+		assertToolResultEvents(t, msgs[2].ToolCalls[0].ResultEvents, []ParsedToolResultEvent{{
+			ToolUseID:         "call_wait",
+			AgentID:           childID,
+			SubagentSessionID: "codex:" + childID,
+			Source:            "subagent_notification",
+			Status:            "completed",
+			Content:           summary,
+		}})
 	})
 
 	t.Run("duplicate pending notification preserves earliest chronology", func(t *testing.T) {
@@ -868,13 +981,16 @@ func TestParseCodexSession_TokenUsage(t *testing.T) {
 		// User message has no usage.
 		assert.Empty(t, msgs[0].TokenUsage)
 
-		// Assistant message has normalized usage.
+		// Assistant message has normalized usage. Codex reports
+		// input_tokens=10000 as the full input (cached included);
+		// after normalization the stored input_tokens is the
+		// uncached remainder (10000-6000=4000).
 		assert.NotEmpty(t, msgs[1].TokenUsage)
-		assert.Contains(t, string(msgs[1].TokenUsage), `"input_tokens":10000`)
+		assert.Contains(t, string(msgs[1].TokenUsage), `"input_tokens":4000`)
 		assert.Contains(t, string(msgs[1].TokenUsage), `"output_tokens":500`)
 		assert.Contains(t, string(msgs[1].TokenUsage), `"cache_read_input_tokens":6000`)
 		assert.Equal(t, 500, msgs[1].OutputTokens)
-		assert.Equal(t, 16000, msgs[1].ContextTokens) // 10000+6000
+		assert.Equal(t, 10000, msgs[1].ContextTokens) // 4000+6000
 		assert.True(t, msgs[1].HasOutputTokens)
 		assert.True(t, msgs[1].HasContextTokens)
 
@@ -882,7 +998,7 @@ func TestParseCodexSession_TokenUsage(t *testing.T) {
 		assert.True(t, sess.HasTotalOutputTokens)
 		assert.Equal(t, 500, sess.TotalOutputTokens)
 		assert.True(t, sess.HasPeakContextTokens)
-		assert.Equal(t, 16000, sess.PeakContextTokens)
+		assert.Equal(t, 10000, sess.PeakContextTokens)
 	})
 
 	t.Run("duplicate token_count events deduplicated", func(t *testing.T) {
@@ -916,17 +1032,17 @@ func TestParseCodexSession_TokenUsage(t *testing.T) {
 		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
 		require.Len(t, msgs, 4)
 
-		// First assistant msg.
+		// First assistant msg (10000 total, 6000 cached).
 		assert.Equal(t, 500, msgs[1].OutputTokens)
-		assert.Equal(t, 16000, msgs[1].ContextTokens)
+		assert.Equal(t, 10000, msgs[1].ContextTokens)
 
-		// Second assistant msg.
+		// Second assistant msg (20000 total, 12000 cached).
 		assert.Equal(t, 800, msgs[3].OutputTokens)
-		assert.Equal(t, 32000, msgs[3].ContextTokens)
+		assert.Equal(t, 20000, msgs[3].ContextTokens)
 
 		// Session totals.
 		assert.Equal(t, 1300, sess.TotalOutputTokens)
-		assert.Equal(t, 32000, sess.PeakContextTokens)
+		assert.Equal(t, 20000, sess.PeakContextTokens)
 	})
 
 	t.Run("multiple API calls in one turn", func(t *testing.T) {
@@ -967,7 +1083,7 @@ func TestParseCodexSession_TokenUsage(t *testing.T) {
 }
 
 func TestParseCodexSession_EdgeCases(t *testing.T) {
-	t.Run("marks system messages", func(t *testing.T) {
+	t.Run("skips system messages", func(t *testing.T) {
 		content := testjsonl.JoinJSONL(
 			testjsonl.CodexSessionMetaJSON("abc", "/tmp", "user", tsEarly),
 			testjsonl.CodexMsgJSON("user", "# AGENTS.md\nsome instructions", tsEarlyS1),
@@ -977,14 +1093,35 @@ func TestParseCodexSession_EdgeCases(t *testing.T) {
 		)
 		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
 		require.NotNil(t, sess)
-		assert.Equal(t, 4, len(msgs))
-		assert.True(t, msgs[0].IsSystem)
-		assert.True(t, msgs[1].IsSystem)
-		assert.True(t, msgs[2].IsSystem)
-		assert.False(t, msgs[3].IsSystem)
-		assert.Equal(t, "Actual user message", msgs[3].Content)
-		assert.Equal(t, 1, sess.UserMessageCount)
-		assert.Equal(t, "Actual user message", sess.FirstMessage)
+		assert.Equal(t, 1, len(msgs))
+		assert.Equal(t, "Actual user message", msgs[0].Content)
+	})
+
+	// Codex injects skill template content as role=user JSONL
+	// entries when the model invokes a skill. These look like
+	// follow-up user turns to a naive count, which inflates
+	// user_message_count past the single-turn classifier gate
+	// and prevents automated sessions from being recognized.
+	// Treat them as system content and drop from the message
+	// list, the same way <environment_context> and similar
+	// envelopes are handled.
+	t.Run("skips skill template injections", func(t *testing.T) {
+		skill := "<skill>\n  <name>roborev:fix</name>\n  <path>" +
+			"/Users/wesm/.codex/skills/roborev-fix/SKILL.md</path>\n" +
+			"---\nname: roborev:fix\n..."
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("abc", "/tmp", "user", tsEarly),
+			testjsonl.CodexMsgJSON("user", "You are a code reviewer.", tsEarlyS1),
+			testjsonl.CodexMsgJSON("user", skill, "2024-01-01T10:00:02Z"),
+			testjsonl.CodexMsgJSON("assistant", "OK", "2024-01-01T10:00:03Z"),
+		)
+		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+		require.NotNil(t, sess)
+		require.Len(t, msgs, 2)
+		assert.Equal(t, "You are a code reviewer.", msgs[0].Content)
+		assert.Equal(t, "OK", msgs[1].Content)
+		assert.Equal(t, 1, sess.UserMessageCount,
+			"skill injection must not count as a user turn")
 	})
 
 	t.Run("fallback ID from filename", func(t *testing.T) {
@@ -1073,6 +1210,93 @@ func TestParseCodexSession_ModelDetailsAbsent(t *testing.T) {
 	// No turn_context -- empty model fields.
 	assert.Empty(t, msgs[1].ModelID)
 	assert.Empty(t, msgs[1].ProviderID)
+}
+
+// codexEventMsgJSON builds a Codex event_msg line for lifecycle
+// events like task_complete / task_started / turn_aborted. The
+// shape mirrors what the Codex CLI emits in real session files.
+func codexEventMsgJSON(
+	eventType, timestamp string,
+) string {
+	return `{"type":"event_msg","timestamp":"` + timestamp +
+		`","payload":{"type":"` + eventType + `"}}`
+}
+
+// TestParseCodexSession_TerminationStatus exercises the lifecycle
+// event tracking that drives termination_status for Codex sessions.
+// Codex doesn't go through Classify() — it sets the status from the
+// most recent task_started / task_complete / turn_aborted event
+// seen on the file, so a regression in handleEventMsg or the
+// session-builder wiring would silently leave Codex sessions as
+// NULL or misclassified.
+func TestParseCodexSession_TerminationStatus(t *testing.T) {
+	t.Run("task_complete -> awaiting_user", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON(
+				"sess-tc", "/Users/me/proj", "user", tsEarly),
+			testjsonl.CodexMsgJSON(
+				"user", "build it", tsEarlyS1),
+			codexEventMsgJSON(
+				"task_started", "2024-01-01T10:00:02Z"),
+			testjsonl.CodexMsgJSON(
+				"assistant", "done", "2024-01-01T10:00:03Z"),
+			codexEventMsgJSON(
+				"task_complete", "2024-01-01T10:00:04Z"),
+		)
+		sess, _ := runCodexParserTest(
+			t, "test.jsonl", content, false)
+		require.NotNil(t, sess)
+		assert.Equal(
+			t, TerminationAwaitingUser, sess.TerminationStatus)
+	})
+
+	t.Run("task_started in flight -> tool_call_pending", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON(
+				"sess-ts", "/Users/me/proj", "user", tsEarly),
+			testjsonl.CodexMsgJSON(
+				"user", "long task", tsEarlyS1),
+			codexEventMsgJSON(
+				"task_started", "2024-01-01T10:00:02Z"),
+		)
+		sess, _ := runCodexParserTest(
+			t, "test.jsonl", content, false)
+		require.NotNil(t, sess)
+		assert.Equal(
+			t, TerminationToolCallPending, sess.TerminationStatus)
+	})
+
+	t.Run("turn_aborted -> tool_call_pending", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON(
+				"sess-ta", "/Users/me/proj", "user", tsEarly),
+			testjsonl.CodexMsgJSON(
+				"user", "interrupt me", tsEarlyS1),
+			codexEventMsgJSON(
+				"task_started", "2024-01-01T10:00:02Z"),
+			codexEventMsgJSON(
+				"turn_aborted", "2024-01-01T10:00:03Z"),
+		)
+		sess, _ := runCodexParserTest(
+			t, "test.jsonl", content, false)
+		require.NotNil(t, sess)
+		assert.Equal(
+			t, TerminationToolCallPending, sess.TerminationStatus)
+	})
+
+	t.Run("no lifecycle events -> empty (unknown)", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON(
+				"sess-empty", "/Users/me/proj", "user", tsEarly),
+			testjsonl.CodexMsgJSON(
+				"user", "hi", tsEarlyS1),
+		)
+		sess, _ := runCodexParserTest(
+			t, "test.jsonl", content, false)
+		require.NotNil(t, sess)
+		assert.Equal(
+			t, TerminationStatus(""), sess.TerminationStatus)
+	})
 }
 
 func TestParseCodexSessionFrom_Incremental(t *testing.T) {
@@ -1231,6 +1455,37 @@ func TestParseCodexSessionFrom_SubagentOutputRequiresFullParse(t *testing.T) {
 	assert.Contains(t, err.Error(), "full parse")
 }
 
+func TestParseCodexSessionFrom_CollabAgentSpawnEndRequiresFullParse(t *testing.T) {
+	t.Parallel()
+
+	childID := "019c9c96-6ee7-77c0-ba4c-380f844289d5"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON("inc-sub-event", "/tmp", "codex_cli_rs", tsEarly),
+		testjsonl.CodexMsgJSON("user", "run child", tsEarlyS1),
+		testjsonl.CodexFunctionCallWithCallIDJSON("spawn_agent", "call_spawn", map[string]any{
+			"agent_type": "awaiter",
+			"message":    "run it",
+		}, tsEarlyS5),
+	)
+	path := createTestFile(t, "codex-subagent-event-inc.jsonl", initial)
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	offset := info.Size()
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(testjsonl.JoinJSONL(
+		"{\"timestamp\":\"2024-01-01T10:01:05Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"collab_agent_spawn_end\",\"call_id\":\"call_spawn\",\"new_thread_id\":\"" + childID + "\",\"status\":\"pending_init\"}}",
+	))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, _, _, err = ParseCodexSessionFrom(path, offset, 2, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "full parse")
+}
+
 func TestParseCodexSessionFrom_WaitCallRequiresFullParse(t *testing.T) {
 	t.Parallel()
 
@@ -1269,6 +1524,44 @@ func TestParseCodexSessionFrom_WaitCallRequiresFullParse(t *testing.T) {
 	assert.Contains(t, err.Error(), "full parse")
 }
 
+func TestParseCodexSessionFrom_WaitAgentCallRequiresFullParse(t *testing.T) {
+	t.Parallel()
+
+	childID := "019c9c96-6ee7-77c0-ba4c-380f844289d5"
+	notification := "<subagent_notification>\n" +
+		"{\"agent_path\":\"" + childID + "\",\"status\":{\"completed\":\"Finished successfully\"}}\n" +
+		"</subagent_notification>"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON("inc-wait-agent", "/tmp", "codex_cli_rs", tsEarly),
+		testjsonl.CodexMsgJSON("user", "run child", tsEarlyS1),
+		testjsonl.CodexFunctionCallWithCallIDJSON("spawn_agent", "call_spawn", map[string]any{
+			"agent_type": "awaiter",
+			"message":    "run it",
+		}, tsEarlyS5),
+		testjsonl.CodexFunctionCallOutputJSON("call_spawn", `{"agent_id":"`+childID+`","nickname":"Fennel"}`, tsLate),
+		testjsonl.CodexMsgJSON("user", notification, tsLateS5),
+	)
+	path := createTestFile(t, "codex-wait-agent-inc.jsonl", initial)
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	offset := info.Size()
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(testjsonl.JoinJSONL(
+		testjsonl.CodexFunctionCallWithCallIDJSON("wait_agent", "call_wait", map[string]any{
+			"targets": []string{childID},
+		}, "2024-01-01T10:01:06Z"),
+	))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, _, _, err = ParseCodexSessionFrom(path, offset, 4, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "full parse")
+}
+
 func TestParseCodexSessionFrom_SystemMessageDoesNotRequireFullParse(t *testing.T) {
 	t.Parallel()
 
@@ -1292,8 +1585,7 @@ func TestParseCodexSessionFrom_SystemMessageDoesNotRequireFullParse(t *testing.T
 
 	newMsgs, endedAt, _, err := ParseCodexSessionFrom(path, offset, 1, false)
 	require.NoError(t, err)
-	assert.Equal(t, 1, len(newMsgs))
-	assert.True(t, newMsgs[0].IsSystem)
+	assert.Equal(t, 0, len(newMsgs))
 	assert.False(t, endedAt.IsZero())
 }
 
@@ -1561,4 +1853,31 @@ func TestReadCodexModelAtOffset(t *testing.T) {
 		got := readCodexModelAtOffset("/no/such/file", 100)
 		assert.Equal(t, "", got)
 	})
+}
+
+// TestParseCodexSession_TurnAbortedNotCountedAsUser pins the
+// behavior that Codex's synthetic <turn_aborted> "user" message
+// (emitted when codex exec is interrupted) is filtered like other
+// system messages and does not inflate UserMessageCount. Without
+// this, a single-turn roborev review session whose codex process
+// was killed during shutdown gets UserMessageCount=2 and falls
+// through the IsAutomatedSession single-turn gate.
+func TestParseCodexSession_TurnAbortedNotCountedAsUser(t *testing.T) {
+	turnAborted := "<turn_aborted>\nThe user interrupted the previous turn on purpose. " +
+		"Any running unified exec processes may still be running in the background. " +
+		"If any tools/commands were aborted, they may have partially executed.\n</turn_aborted>"
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON("abc", "/tmp", "codex_exec", tsEarly),
+		testjsonl.CodexMsgJSON("user", "You are a code reviewer. Review the diff.", tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", turnAborted, tsEarlyS5),
+	)
+	sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+	require.NotNil(t, sess)
+	assert.Equal(t, 1, sess.UserMessageCount,
+		"<turn_aborted> synthetic must not be counted as a user message")
+	for _, m := range msgs {
+		assert.NotContains(t, m.Content, "<turn_aborted>",
+			"<turn_aborted> synthetic must be filtered from message list")
+	}
 }

@@ -7,7 +7,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/wesm/agentsview/internal/testjsonl"
+	"github.com/tidwall/gjson"
+	"go.kenn.io/agentsview/internal/testjsonl"
 )
 
 func runGeminiParserTest(t *testing.T, content string) (*ParsedSession, []ParsedMessage) {
@@ -32,6 +33,89 @@ func TestParseGeminiSession_Basic(t *testing.T) {
 	assertMessage(t, msgs[1], RoleAssistant, "Looking at")
 	assert.Equal(t, 0, msgs[0].Ordinal)
 	assert.Equal(t, 1, msgs[1].Ordinal)
+}
+
+func TestParseGeminiSession_JSONLStream(t *testing.T) {
+	content := strings.Join([]string{
+		`{"sessionId":"sess-jsonl-1","projectHash":"hash","startTime":"2026-04-23T16:12:42.783Z","lastUpdated":"2026-04-23T16:12:42.783Z","kind":"main"}`,
+		`{"id":"u1","timestamp":"2026-04-23T16:12:43.085Z","type":"user","content":[{"text":"Fix the import path"}]}`,
+		`{"$set":{"lastUpdated":"2026-04-23T16:12:43.085Z"}}`,
+		`{"id":"a1","timestamp":"2026-04-23T16:12:50.158Z","type":"gemini","content":"","thoughts":[{"subject":"Planning","description":"Looking for the failure.","timestamp":"2026-04-23T16:12:46.795Z"}],"tokens":{"input":9184,"output":26,"cached":0},"model":"gemini-3.1-pro-preview"}`,
+		`{"id":"a1","timestamp":"2026-04-23T16:12:50.158Z","type":"gemini","content":"I found the issue.","thoughts":[{"subject":"Planning","description":"Looking for the failure.","timestamp":"2026-04-23T16:12:46.795Z"}],"tokens":{"input":9184,"output":26,"cached":0},"model":"gemini-3.1-pro-preview","toolCalls":[{"id":"read_file_1","name":"read_file","args":{"file_path":"main.go"},"result":[{"functionResponse":{"id":"read_file_1","name":"read_file","response":{"output":"package main"}}}],"displayName":"ReadFile"}]}`,
+		`{"$set":{"lastUpdated":"2026-04-23T16:12:50.158Z"}}`,
+	}, "\n")
+	path := createTestFile(t, "session.jsonl", content)
+	sess, msgs, err := ParseGeminiSession(path, "my_project", "local")
+	require.NoError(t, err)
+
+	require.NotNil(t, sess)
+	require.Equal(t, 2, len(msgs))
+	assertSessionMeta(t, sess, "gemini:sess-jsonl-1", "my_project", AgentGemini)
+	assert.Equal(t, "Fix the import path", sess.FirstMessage)
+	assertMessage(t, msgs[0], RoleUser, "Fix the import path")
+	assertMessage(t, msgs[1], RoleAssistant, "I found the issue.")
+	assert.True(t, msgs[1].HasThinking)
+	assert.True(t, msgs[1].HasToolUse)
+	require.Len(t, msgs[1].ToolCalls, 1)
+	assert.Equal(t, "read_file_1", msgs[1].ToolCalls[0].ToolUseID)
+	require.Len(t, msgs[1].ToolResults, 1)
+	assert.Equal(t, "package main", DecodeContent(msgs[1].ToolResults[0].ContentRaw))
+	assert.Equal(
+		t,
+		parseTimestamp("2026-04-23T16:12:50.158Z"),
+		sess.EndedAt,
+	)
+}
+
+func TestParseGeminiSession_JSONLStreamLargeRecord(t *testing.T) {
+	largeContent := strings.Repeat("x", 16*1024*1024+1)
+	content := strings.Join([]string{
+		`{"sessionId":"sess-jsonl-large","projectHash":"hash","startTime":"2026-04-23T16:12:42.783Z","lastUpdated":"2026-04-23T16:12:42.783Z","kind":"main"}`,
+		`{"id":"u1","timestamp":"2026-04-23T16:12:43.085Z","type":"user","content":[{"text":"` + largeContent + `"}]}`,
+	}, "\n")
+	path := createTestFile(t, "large-session.jsonl", content)
+	sess, msgs, err := ParseGeminiSession(path, "my_project", "local")
+	require.NoError(t, err)
+
+	require.NotNil(t, sess)
+	require.Len(t, msgs, 1)
+	assertSessionMeta(t, sess, "gemini:sess-jsonl-large", "my_project", AgentGemini)
+	assert.Equal(t, len(largeContent), len(msgs[0].Content))
+}
+
+func TestParseGeminiSession_JSONLStreamTolerantOfPartialLines(t *testing.T) {
+	t.Run("partial trailing write", func(t *testing.T) {
+		content := strings.Join([]string{
+			`{"sessionId":"sess-jsonl-partial","projectHash":"hash","startTime":"2026-04-23T16:12:42.783Z","lastUpdated":"2026-04-23T16:12:42.783Z","kind":"main"}`,
+			`{"id":"u1","timestamp":"2026-04-23T16:12:43.085Z","type":"user","content":[{"text":"first"}]}`,
+			`{"id":"a1","timestamp":"2026-04-23T16:12:50.158Z","type":"gemini","content":"reply"`,
+		}, "\n")
+		path := createTestFile(t, "session.jsonl", content)
+		sess, msgs, err := ParseGeminiSession(path, "my_project", "local")
+		require.NoError(t, err)
+
+		require.NotNil(t, sess)
+		require.Equal(t, 1, len(msgs))
+		assertMessage(t, msgs[0], RoleUser, "first")
+	})
+
+	t.Run("malformed line mid-stream", func(t *testing.T) {
+		content := strings.Join([]string{
+			`{"sessionId":"sess-jsonl-mid","projectHash":"hash","startTime":"2026-04-23T16:12:42.783Z","lastUpdated":"2026-04-23T16:12:42.783Z","kind":"main"}`,
+			`{"id":"u1","timestamp":"2026-04-23T16:12:43.085Z","type":"user","content":[{"text":"first"}]}`,
+			`{not valid json`,
+			`{"id":"a1","timestamp":"2026-04-23T16:12:50.158Z","type":"gemini","content":"reply"}`,
+			"",
+		}, "\n")
+		path := createTestFile(t, "session.jsonl", content)
+		sess, msgs, err := ParseGeminiSession(path, "my_project", "local")
+		require.NoError(t, err)
+
+		require.NotNil(t, sess)
+		require.Equal(t, 2, len(msgs))
+		assertMessage(t, msgs[0], RoleUser, "first")
+		assertMessage(t, msgs[1], RoleAssistant, "reply")
+	})
 }
 
 func TestParseGeminiSession_ToolCalls(t *testing.T) {
@@ -196,9 +280,10 @@ func TestParseGeminiSession_TokenUsage(t *testing.T) {
 		assert.False(t, msgs[0].HasOutputTokens)
 		assert.Empty(t, msgs[0].TokenUsage)
 
-		// First assistant message (a1): input=1500, cached=100, output=200
+		// First assistant message (a1): input=1500, cached=100,
+		// output=200, thoughts=50
 		assert.Equal(t, 1600, msgs[1].ContextTokens)
-		assert.Equal(t, 200, msgs[1].OutputTokens)
+		assert.Equal(t, 250, msgs[1].OutputTokens)
 		assert.True(t, msgs[1].HasContextTokens)
 		assert.True(t, msgs[1].HasOutputTokens)
 		assert.NotEmpty(t, msgs[1].TokenUsage)
@@ -209,15 +294,16 @@ func TestParseGeminiSession_TokenUsage(t *testing.T) {
 		assert.False(t, msgs[2].HasContextTokens)
 		assert.False(t, msgs[2].HasOutputTokens)
 
-		// Second assistant message (a2): input=2000, cached=50, output=300
+		// Second assistant message (a2): input=2000, cached=50,
+		// output=300, thoughts=100
 		assert.Equal(t, 2050, msgs[3].ContextTokens)
-		assert.Equal(t, 300, msgs[3].OutputTokens)
+		assert.Equal(t, 400, msgs[3].OutputTokens)
 		assert.True(t, msgs[3].HasContextTokens)
 		assert.True(t, msgs[3].HasOutputTokens)
 		assert.NotEmpty(t, msgs[3].TokenUsage)
 
 		// Session totals
-		assert.Equal(t, 500, sess.TotalOutputTokens)
+		assert.Equal(t, 650, sess.TotalOutputTokens)
 		assert.Equal(t, 2050, sess.PeakContextTokens)
 		assert.True(t, sess.HasTotalOutputTokens)
 		assert.True(t, sess.HasPeakContextTokens)
@@ -272,11 +358,18 @@ func TestParseGeminiSession_TokenUsage(t *testing.T) {
 
 		require.Equal(t, 2, len(msgs))
 		assert.Equal(t, 5200, msgs[1].ContextTokens)
-		assert.Equal(t, 800, msgs[1].OutputTokens)
+		assert.Equal(t, 900, msgs[1].OutputTokens)
 		assert.True(t, msgs[1].HasContextTokens)
 		assert.True(t, msgs[1].HasOutputTokens)
 		assert.NotEmpty(t, msgs[1].TokenUsage)
-		assert.Equal(t, 800, sess.TotalOutputTokens)
+		assert.Equal(t, int64(5000),
+			gjson.GetBytes(msgs[1].TokenUsage, "input_tokens").Int())
+		assert.Equal(t, int64(900),
+			gjson.GetBytes(msgs[1].TokenUsage, "output_tokens").Int())
+		assert.Equal(t, int64(200),
+			gjson.GetBytes(msgs[1].TokenUsage,
+				"cache_read_input_tokens").Int())
+		assert.Equal(t, 900, sess.TotalOutputTokens)
 		assert.Equal(t, 5200, sess.PeakContextTokens)
 		assert.True(t, sess.HasTotalOutputTokens)
 		assert.True(t, sess.HasPeakContextTokens)

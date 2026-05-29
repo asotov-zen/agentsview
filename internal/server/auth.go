@@ -11,9 +11,9 @@ import (
 type contextKey int
 
 const (
-	// ctxKeyRemoteAuth indicates the request is from an authenticated
-	// remote client. When set to true, host-check and CORS middleware
-	// skip their restrictions.
+	// ctxKeyRemoteAuth indicates the request passed token auth.
+	// When set to true, host-check and CORS middleware skip
+	// their restrictions.
 	ctxKeyRemoteAuth contextKey = iota
 )
 
@@ -24,10 +24,22 @@ func isRemoteAuth(r *http.Request) bool {
 	return v
 }
 
-// isLocalhostRequest returns true when the request originates from
-// a loopback address (127.0.0.0/8, ::1). It checks RemoteAddr,
-// which is set by net/http to the client's IP.
+// isLocalhostRequest returns true only for a request that arrived as a
+// direct loopback connection (127.0.0.0/8, ::1) and was not relayed by a
+// reverse proxy. Callers use it to gate exposure of secrets (the auth token,
+// unredacted search snippets) to "local only" clients.
+//
+// RemoteAddr alone is insufficient: a managed Caddy proxy reverse-proxies to
+// the loopback backend, so every proxied request — including ones from remote
+// LAN clients allowed through the proxy — would carry a loopback RemoteAddr.
+// Proxies add X-Forwarded-For/X-Real-IP/Forwarded, so any of those headers
+// means the connection is not a direct local one and must not be trusted. A
+// genuinely local attacker spoofing these headers only denies themselves, so
+// the check fails closed.
 func isLocalhostRequest(r *http.Request) bool {
+	if hasForwardingHeader(r) {
+		return false
+	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
@@ -39,9 +51,18 @@ func isLocalhostRequest(r *http.Request) bool {
 	return ip.IsLoopback()
 }
 
-// authMiddleware enforces Bearer token authentication for remote
-// API requests. Localhost connections always bypass auth for backward
-// compatibility. Non-API routes (static assets) are never gated.
+// hasForwardingHeader reports whether the request carries any header a reverse
+// proxy adds when relaying a client, which indicates the connection reached
+// the server through a proxy rather than directly.
+func hasForwardingHeader(r *http.Request) bool {
+	return r.Header.Get("X-Forwarded-For") != "" ||
+		r.Header.Get("X-Real-IP") != "" ||
+		r.Header.Get("Forwarded") != ""
+}
+
+// authMiddleware enforces Bearer token authentication when
+// require_auth is enabled. Non-API routes (static assets) are
+// never gated.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Only gate /api/ routes — static assets are always served.
@@ -53,17 +74,16 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		// Read config once for all checks below.
 		s.mu.RLock()
 		token := s.cfg.AuthToken
-		remoteEnabled := s.cfg.RemoteAccess
+		authRequired := s.cfg.RequireAuth
 		s.mu.RUnlock()
 
 		// CORS preflight requests (OPTIONS) never include credentials.
 		// Let them through so the browser can negotiate CORS before
-		// sending the authenticated request. When remote access is
-		// enabled with a token, mark OPTIONS as remote-auth so the
-		// CORS middleware allows the preflight for cross-origin
-		// remote clients.
+		// sending the authenticated request. When auth is required,
+		// mark OPTIONS as authenticated so the CORS middleware
+		// allows the preflight for cross-origin clients.
 		if r.Method == http.MethodOptions {
-			if remoteEnabled && token != "" {
+			if authRequired && token != "" {
 				ctx := context.WithValue(r.Context(), ctxKeyRemoteAuth, true)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
@@ -72,45 +92,29 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Localhost bypass: when remote access is disabled, local
-		// connections skip auth for backward compatibility. When
-		// remote access is enabled with a token, localhost must also
-		// authenticate — this prevents bypass via reverse proxy or
-		// SSH port-forward where remote clients appear as 127.0.0.1.
-		if isLocalhostRequest(r) {
-			if !remoteEnabled || token == "" {
-				next.ServeHTTP(w, r)
-				return
-			}
-			// Fall through to token check below.
-		}
-
-		// When remote access is not enabled, reject non-loopback
-		// requests outright. This prevents unauthenticated LAN
-		// access when the server is bound to 0.0.0.0. No CORS
-		// headers — cross-origin requests are not expected when
-		// remote access is off.
-		if !remoteEnabled {
-			http.Error(w, "Forbidden", http.StatusForbidden)
+		// When auth is not required, skip token checks entirely.
+		if !authRequired {
+			next.ServeHTTP(w, r)
 			return
 		}
-		// Remote access enabled but no token configured yet — reject.
-		// No CORS headers — this is a server misconfiguration, not
-		// an auth challenge the client can resolve with a token.
+		// Auth required but no token configured — fail closed.
 		if token == "" {
-			http.Error(w, "Forbidden", http.StatusForbidden)
+			http.Error(w,
+				"server misconfiguration: auth required but no token set",
+				http.StatusInternalServerError)
 			return
 		}
 
 		// Check Bearer token in Authorization header. The ?token=
-		// query param fallback is restricted to the SSE watch
-		// endpoint because EventSource cannot set custom headers.
-		// All other endpoints must use the Authorization header.
+		// query param fallback is restricted to SSE endpoints
+		// (see isSSEPath) because EventSource cannot set custom
+		// headers. All other endpoints must use the Authorization
+		// header.
 		var provided string
 		auth := r.Header.Get("Authorization")
 		if t, ok := strings.CutPrefix(auth, "Bearer "); ok {
 			provided = t
-		} else if qt := r.URL.Query().Get("token"); qt != "" && strings.HasSuffix(r.URL.Path, "/watch") {
+		} else if qt := r.URL.Query().Get("token"); qt != "" && isSSEPath(r.URL.Path) {
 			provided = qt
 		} else {
 			setCORSOnAuthError(w, r)
@@ -128,6 +132,14 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), ctxKeyRemoteAuth, true)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// isSSEPath reports whether the given path is a server-sent events
+// endpoint that accepts a ?token= query parameter in place of the
+// Authorization header. The query-param fallback exists because
+// browser EventSource cannot set headers.
+func isSSEPath(path string) bool {
+	return strings.HasSuffix(path, "/watch") || path == "/api/v1/events"
 }
 
 // setCORSOnAuthError adds CORS headers to 401 responses so

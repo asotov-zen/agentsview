@@ -95,113 +95,8 @@ func (d *DB) CopyOrphanedDataFrom(
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Copy session rows. Build column list dynamically so
-	// older source DBs missing display_name/deleted_at don't
-	// abort the migration.
-	orphanCols := orphanSessionCols(ctx, tx)
-
-	if _, err := tx.ExecContext(ctx,
-		"INSERT OR IGNORE INTO sessions ("+orphanCols+") "+
-			"SELECT "+orphanCols+" FROM old_db.sessions "+
-			"WHERE id IN (SELECT id FROM _orphaned_ids)",
-	); err != nil {
-		return 0, fmt.Errorf(
-			"copying orphaned sessions: %w", err,
-		)
-	}
-
-	// Copy messages. Omit id to let auto-increment assign
-	// new IDs (old IDs may collide with freshly synced
-	// messages). Probe is_system so older source DBs that
-	// lack the column don't abort the migration.
-	var msgCols strings.Builder
-	msgCols.WriteString("session_id, ordinal, role, content, " +
-		"timestamp, has_thinking, has_tool_use, " +
-		"content_length")
-	if oldDBHasColumn(ctx, tx, "messages", "is_system") {
-		msgCols.WriteString(", is_system")
-	}
-	for _, c := range []string{
-		"model", "token_usage", "context_tokens",
-		"output_tokens", "has_context_tokens",
-		"has_output_tokens",
-		"claude_message_id", "claude_request_id",
-	} {
-		if oldDBHasColumn(ctx, tx, "messages", c) {
-			msgCols.WriteString(", " + c)
-		}
-	}
-	if _, err := tx.ExecContext(ctx,
-		"INSERT INTO messages ("+msgCols.String()+") "+
-			"SELECT "+msgCols.String()+" FROM old_db.messages "+
-			"WHERE session_id IN (SELECT id FROM _orphaned_ids)",
-	); err != nil {
-		return 0, fmt.Errorf(
-			"copying orphaned messages: %w", err,
-		)
-	}
-
-	// Copy tool_calls. Map old message_id to new
-	// message_id via the (session_id, ordinal) natural key.
-	toolCallCols := []string{
-		"message_id", "session_id", "tool_name", "category",
-		"tool_use_id", "input_json", "skill_name",
-		"result_content_length",
-	}
-	toolCallSelect := []string{
-		"new_m.id", "otc.session_id", "otc.tool_name",
-		"otc.category", "otc.tool_use_id", "otc.input_json",
-		"otc.skill_name", "otc.result_content_length",
-	}
-	if oldDBHasColumn(ctx, tx, "tool_calls", "result_content") {
-		toolCallCols = append(toolCallCols, "result_content")
-		toolCallSelect = append(toolCallSelect, "otc.result_content")
-	}
-	toolCallCols = append(toolCallCols, "subagent_session_id")
-	toolCallSelect = append(toolCallSelect, "otc.subagent_session_id")
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO tool_calls
-			(`+strings.Join(toolCallCols, ", ")+`)
-		SELECT
-			`+strings.Join(toolCallSelect, ", ")+`
-		FROM old_db.tool_calls otc
-		JOIN old_db.messages old_m
-			ON old_m.id = otc.message_id
-		JOIN main.messages new_m
-			ON new_m.session_id = old_m.session_id
-			AND new_m.ordinal = old_m.ordinal
-		WHERE otc.session_id IN (
-			SELECT id FROM _orphaned_ids
-		)`,
-	); err != nil {
-		return 0, fmt.Errorf(
-			"copying orphaned tool_calls: %w", err,
-		)
-	}
-
-	if oldDBHasTable(ctx, tx, "tool_result_events") {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO tool_result_events
-				(session_id, tool_call_message_ordinal,
-				 call_index, tool_use_id, agent_id,
-				 subagent_session_id, source, status,
-				 content, content_length, timestamp,
-				 event_index)
-			SELECT
-				session_id, tool_call_message_ordinal,
-				call_index, tool_use_id, agent_id,
-				subagent_session_id, source, status,
-				content, content_length, timestamp,
-				event_index
-			FROM old_db.tool_result_events
-			WHERE session_id IN (
-				SELECT id FROM _orphaned_ids
-			)`,
-		); err != nil {
-			return 0, fmt.Errorf(
-				"copying orphaned tool_result_events: %w", err,
-			)
-		}
+	if err := copySessionDataForIDs(ctx, tx, "_orphaned_ids"); err != nil {
+		return 0, fmt.Errorf("copying orphaned data: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -215,6 +110,85 @@ func (d *DB) CopyOrphanedDataFrom(
 		count, time.Since(t).Round(time.Millisecond),
 	)
 
+	return count, nil
+}
+
+// CopyTrashedDataFrom copies soft-deleted sessions and their
+// messages from the source database. ResyncAll calls this before
+// parsing into a fresh DB so UpsertSession can see trashed rows
+// and reject source-file writes that would otherwise overwrite
+// the user's trash.
+func (d *DB) CopyTrashedDataFrom(sourcePath string) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	ctx := context.Background()
+	conn, err := d.getWriter().Conn(ctx)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"acquiring connection: %w", err,
+		)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(
+		ctx, "ATTACH DATABASE ? AS old_db", sourcePath,
+	); err != nil {
+		return 0, fmt.Errorf(
+			"attaching source db: %w", err,
+		)
+	}
+	defer func() {
+		_, _ = conn.ExecContext(
+			ctx, "DETACH DATABASE old_db",
+		)
+	}()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin trashed copy tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if !oldDBHasColumn(ctx, tx, "sessions", "deleted_at") {
+		return 0, nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TEMP TABLE _trashed_ids AS
+		SELECT id FROM old_db.sessions
+		WHERE deleted_at IS NOT NULL
+		  AND id NOT IN (SELECT id FROM main.excluded_sessions)`); err != nil {
+		return 0, fmt.Errorf(
+			"identifying trashed sessions: %w", err,
+		)
+	}
+	defer func() {
+		_, _ = tx.ExecContext(
+			ctx,
+			"DROP TABLE IF EXISTS _trashed_ids",
+		)
+	}()
+
+	var count int
+	if err := tx.QueryRowContext(ctx,
+		"SELECT count(*) FROM _trashed_ids",
+	).Scan(&count); err != nil {
+		return 0, fmt.Errorf(
+			"counting trashed sessions: %w", err,
+		)
+	}
+	if count == 0 {
+		return 0, nil
+	}
+
+	if err := copySessionDataForIDs(ctx, tx, "_trashed_ids"); err != nil {
+		return 0, fmt.Errorf("copying trashed data: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("committing trashed copy: %w", err)
+	}
 	return count, nil
 }
 
@@ -274,7 +248,7 @@ func (d *DB) CopyExcludedSessionsFrom(
 // CopySessionMetadataFrom merges user-managed data from the
 // source DB into sessions that were re-synced into this DB.
 // This preserves display_name, deleted_at, starred_sessions,
-// and pinned_messages across full DB rebuilds.
+// pinned_messages, and worktree_project_mappings across full DB rebuilds.
 func (d *DB) CopySessionMetadataFrom(
 	sourcePath string,
 ) error {
@@ -380,6 +354,37 @@ func (d *DB) CopySessionMetadataFrom(
 		}
 	}
 
+	// Copy persistent worktree project mappings. Omit id so
+	// primary-key values from old_db cannot shadow existing
+	// destination rows. ResyncAll may pre-copy mappings into
+	// the temp DB before parsing, so the final metadata copy
+	// reconciles the table to the quiesced source state.
+	if oldDBHasTable(ctx, tx, "worktree_project_mappings") {
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM main.worktree_project_mappings
+			WHERE NOT EXISTS (
+				SELECT 1
+				FROM old_db.worktree_project_mappings old_m
+				WHERE old_m.machine = main.worktree_project_mappings.machine
+				  AND old_m.path_prefix = main.worktree_project_mappings.path_prefix
+			)`); err != nil {
+			return fmt.Errorf("reconciling worktree project mappings: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO main.worktree_project_mappings
+				(machine, path_prefix, project, enabled, created_at, updated_at)
+			SELECT machine, path_prefix, project, enabled, created_at, updated_at
+			FROM old_db.worktree_project_mappings
+			WHERE true
+			ON CONFLICT(machine, path_prefix) DO UPDATE SET
+				project = excluded.project,
+				enabled = excluded.enabled,
+				created_at = excluded.created_at,
+				updated_at = excluded.updated_at`); err != nil {
+			return fmt.Errorf("copying worktree project mappings: %w", err)
+		}
+	}
+
 	return tx.Commit()
 }
 
@@ -419,12 +424,225 @@ func orphanSessionCols(ctx context.Context, tx *sql.Tx) string {
 	for _, c := range []string{
 		"total_output_tokens", "peak_context_tokens",
 		"has_total_output_tokens", "has_peak_context_tokens",
+		"is_automated",
+		"tool_failure_signal_count", "tool_retry_count",
+		"edit_churn_count", "consecutive_failure_max",
+		"outcome", "outcome_confidence",
+		"ended_with_role", "final_failure_streak",
+		"signals_pending_since", "compaction_count",
+		"mid_task_compaction_count",
+		"context_pressure_max", "health_score",
+		"health_grade", "has_tool_calls",
+		"has_context_data", "data_version",
+		"cwd", "git_branch", "source_session_id",
+		"source_version", "parser_malformed_lines",
+		"is_truncated",
+		"secret_leak_count", "secrets_rules_version",
 	} {
 		if oldDBHasColumn(ctx, tx, "sessions", c) {
 			cols = append(cols, c)
 		}
 	}
 	return strings.Join(cols, ", ")
+}
+
+func copySessionDataForIDs(
+	ctx context.Context,
+	tx *sql.Tx,
+	tempIDsTable string,
+) error {
+	// Copy session rows. Build column list dynamically so
+	// older source DBs missing display_name/deleted_at don't
+	// abort the migration.
+	orphanCols := orphanSessionCols(ctx, tx)
+
+	if _, err := tx.ExecContext(ctx,
+		"INSERT OR IGNORE INTO sessions ("+orphanCols+") "+
+			"SELECT "+orphanCols+" FROM old_db.sessions "+
+			"WHERE id IN (SELECT id FROM "+tempIDsTable+")",
+	); err != nil {
+		return fmt.Errorf("copying sessions: %w", err)
+	}
+
+	// Copy messages. Omit id to let auto-increment assign
+	// new IDs (old IDs may collide with freshly synced
+	// messages). Probe is_system so older source DBs that
+	// lack the column don't abort the migration.
+	var msgCols strings.Builder
+	msgCols.WriteString("session_id, ordinal, role, content, " +
+		"timestamp, has_thinking, has_tool_use, " +
+		"content_length")
+	if oldDBHasColumn(ctx, tx, "messages", "is_system") {
+		msgCols.WriteString(", is_system")
+	}
+	for _, c := range []string{
+		"model", "token_usage", "context_tokens",
+		"output_tokens", "has_context_tokens",
+		"has_output_tokens",
+		"claude_message_id", "claude_request_id",
+		"source_type", "source_subtype",
+		"source_uuid", "source_parent_uuid",
+		"is_sidechain", "is_compact_boundary",
+		"thinking_text",
+	} {
+		if oldDBHasColumn(ctx, tx, "messages", c) {
+			msgCols.WriteString(", " + c)
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO messages ("+msgCols.String()+") "+
+			"SELECT "+msgCols.String()+" FROM old_db.messages "+
+			"WHERE session_id IN (SELECT id FROM "+tempIDsTable+")",
+	); err != nil {
+		return fmt.Errorf("copying messages: %w", err)
+	}
+
+	// Copy tool_calls. Map old message_id to new
+	// message_id via the (session_id, ordinal) natural key.
+	toolCallCols := []string{
+		"message_id", "session_id", "tool_name", "category",
+		"tool_use_id", "input_json", "skill_name",
+		"result_content_length",
+	}
+	toolCallSelect := []string{
+		"new_m.id", "otc.session_id", "otc.tool_name",
+		"otc.category", "otc.tool_use_id", "otc.input_json",
+		"otc.skill_name", "otc.result_content_length",
+	}
+	if oldDBHasColumn(ctx, tx, "tool_calls", "result_content") {
+		toolCallCols = append(toolCallCols, "result_content")
+		toolCallSelect = append(toolCallSelect, "otc.result_content")
+	}
+	toolCallCols = append(toolCallCols, "subagent_session_id")
+	toolCallSelect = append(toolCallSelect, "otc.subagent_session_id")
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO tool_calls
+			(`+strings.Join(toolCallCols, ", ")+`)
+		SELECT
+			`+strings.Join(toolCallSelect, ", ")+`
+		FROM old_db.tool_calls otc
+		JOIN old_db.messages old_m
+			ON old_m.id = otc.message_id
+		JOIN main.messages new_m
+			ON new_m.session_id = old_m.session_id
+			AND new_m.ordinal = old_m.ordinal
+		WHERE otc.session_id IN (
+			SELECT id FROM `+tempIDsTable+`
+		)
+		ORDER BY otc.id`,
+	); err != nil {
+		return fmt.Errorf("copying tool_calls: %w", err)
+	}
+
+	if oldDBHasTable(ctx, tx, "tool_result_events") {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO tool_result_events
+				(session_id, tool_call_message_ordinal,
+				 call_index, tool_use_id, agent_id,
+				 subagent_session_id, source, status,
+				 content, content_length, timestamp,
+				 event_index)
+			SELECT
+				session_id, tool_call_message_ordinal,
+				call_index, tool_use_id, agent_id,
+				subagent_session_id, source, status,
+				content, content_length, timestamp,
+				event_index
+			FROM old_db.tool_result_events
+			WHERE session_id IN (
+				SELECT id FROM `+tempIDsTable+`
+			)`,
+		); err != nil {
+			return fmt.Errorf(
+				"copying tool_result_events: %w", err,
+			)
+		}
+	}
+
+	if oldDBHasTable(ctx, tx, "secret_findings") {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO secret_findings
+				(session_id, rule_name, confidence, location_kind,
+				 message_ordinal, call_index, event_index,
+				 match_start, match_end, match_index,
+				 redacted_match, rules_version, created_at)
+			SELECT
+				session_id, rule_name, confidence, location_kind,
+				message_ordinal, call_index, event_index,
+				match_start, match_end, match_index,
+				redacted_match, rules_version, created_at
+			FROM old_db.secret_findings
+			WHERE session_id IN (
+				SELECT id FROM `+tempIDsTable+`
+			)`,
+		); err != nil {
+			return fmt.Errorf("copying secret_findings: %w", err)
+		}
+	}
+
+	if err := copyPinnedMessagesForIDs(ctx, tx, tempIDsTable); err != nil {
+		return err
+	}
+	return nil
+}
+
+func copyPinnedMessagesForIDs(
+	ctx context.Context,
+	tx *sql.Tx,
+	tempIDsTable string,
+) error {
+	if !oldDBHasTable(ctx, tx, "pinned_messages") {
+		return nil
+	}
+
+	// Re-map old message IDs to the newly inserted message rows.
+	// Prefer source_uuid when available because it survives ordinal
+	// shifts, then fall back to the same (session_id, ordinal)
+	// natural key used by tool call copying.
+	if oldDBHasColumn(ctx, tx, "messages", "source_uuid") {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT OR IGNORE INTO main.pinned_messages
+				(session_id, message_id, ordinal, note, created_at)
+			SELECT
+				op.session_id, new_m.id, new_m.ordinal,
+				op.note, op.created_at
+			FROM old_db.pinned_messages op
+			JOIN old_db.messages old_m
+				ON old_m.id = op.message_id
+			JOIN main.messages new_m
+				ON new_m.session_id = old_m.session_id
+				AND new_m.source_uuid = old_m.source_uuid
+			WHERE op.session_id IN (
+				SELECT id FROM `+tempIDsTable+`
+			)
+			  AND old_m.source_uuid IS NOT NULL
+			  AND old_m.source_uuid <> ''`,
+		); err != nil {
+			return fmt.Errorf(
+				"copying pinned messages by source_uuid: %w", err,
+			)
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO main.pinned_messages
+			(session_id, message_id, ordinal, note, created_at)
+		SELECT
+			op.session_id, new_m.id, new_m.ordinal,
+			op.note, op.created_at
+		FROM old_db.pinned_messages op
+		JOIN old_db.messages old_m
+			ON old_m.id = op.message_id
+		JOIN main.messages new_m
+			ON new_m.session_id = old_m.session_id
+			AND new_m.ordinal = old_m.ordinal
+		WHERE op.session_id IN (
+			SELECT id FROM `+tempIDsTable+`
+		)`,
+	); err != nil {
+		return fmt.Errorf("copying pinned messages by ordinal: %w", err)
+	}
+	return nil
 }
 
 // oldDBHasColumn checks if a column exists in an old_db table

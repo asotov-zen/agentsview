@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/wesm/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/db"
 )
 
 type searchResponse struct {
@@ -53,7 +53,7 @@ func (s *Server) handleSearch(
 	}
 	limit = clampLimit(limit, db.DefaultSearchLimit, db.MaxSearchLimit)
 
-	cursor, ok := parseIntParam(w, r, "cursor")
+	cursor, ok := parseNonNegativeIntParam(w, r, "cursor")
 	if !ok {
 		return
 	}

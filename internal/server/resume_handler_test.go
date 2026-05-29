@@ -9,7 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wesm/agentsview/internal/db"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/db"
 )
 
 func canonicalTestPath(path string) string {
@@ -33,9 +36,15 @@ func assertSamePath(t *testing.T, label, got, want string) {
 	t.Helper()
 	got = canonicalTestPath(got)
 	want = canonicalTestPath(want)
-	if got != want {
-		t.Errorf("%s = %q, want %q", label, got, want)
+	if got == want {
+		return
 	}
+	gotInfo, gotErr := os.Stat(got)
+	wantInfo, wantErr := os.Stat(want)
+	if gotErr == nil && wantErr == nil && os.SameFile(gotInfo, wantInfo) {
+		return
+	}
+	assert.Fail(t, "path mismatch", "%s = %q, want %q", label, got, want)
 }
 
 func TestResumeSession(t *testing.T) {
@@ -58,15 +67,9 @@ func TestResumeSession(t *testing.T) {
 			Command  string `json:"command"`
 			Cwd      string `json:"cwd"`
 		}
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if resp.Launched {
-			t.Error("expected launched=false for command_only")
-		}
-		if resp.Command == "" {
-			t.Error("expected non-empty command")
-		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.False(t, resp.Launched, "expected launched=false for command_only")
+		assert.NotEmpty(t, resp.Command)
 		assertSamePath(t, "cwd", resp.Cwd, projectDir)
 	})
 
@@ -94,16 +97,43 @@ func TestResumeSession(t *testing.T) {
 			Launched bool   `json:"launched"`
 			Command  string `json:"command"`
 		}
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("decode: %v", err)
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.False(t, resp.Launched, "expected launched=false for command_only")
+		assert.Equal(t, "copilot --resume=abc123", resp.Command)
+	})
+
+	t.Run("kiro current-store command only", func(t *testing.T) {
+		projectDir := t.TempDir()
+		te.seedSession(t, "kiro:sqlite-chat", "kiro_app", 3, func(s *db.Session) {
+			s.Agent = "kiro"
+			s.Cwd = projectDir
+		})
+		w := te.post(t,
+			"/api/v1/sessions/kiro:sqlite-chat/resume",
+			`{"command_only":true}`,
+		)
+		assertStatus(t, w, http.StatusOK)
+		var resp struct {
+			Launched bool   `json:"launched"`
+			Command  string `json:"command"`
+			Cwd      string `json:"cwd"`
 		}
-		if resp.Launched {
-			t.Error("expected launched=false for command_only")
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.False(t, resp.Launched, "expected launched=false for command_only")
+		const cmdSuffix = "' && kiro-cli chat --resume-id sqlite-chat"
+		if !strings.HasPrefix(resp.Command, "cd '") ||
+			!strings.HasSuffix(resp.Command, cmdSuffix) {
+			assert.Fail(t, "command shape mismatch",
+				"command = %q, want cd command ending with %q",
+				resp.Command, cmdSuffix)
+		} else {
+			commandCwd := strings.TrimSuffix(
+				strings.TrimPrefix(resp.Command, "cd '"),
+				cmdSuffix,
+			)
+			assertSamePath(t, "command cwd", commandCwd, projectDir)
 		}
-		wantCmd := "copilot --resume=abc123"
-		if resp.Command != wantCmd {
-			t.Errorf("command = %q, want %q", resp.Command, wantCmd)
-		}
+		assertSamePath(t, "cwd", resp.Cwd, projectDir)
 	})
 
 	t.Run("claude desktop rejects non-claude agent", func(t *testing.T) {
@@ -120,16 +150,12 @@ func TestResumeSession(t *testing.T) {
 	t.Run("cursor command only", func(t *testing.T) {
 		projectDir := t.TempDir()
 		runDir := filepath.Join(projectDir, "frontend")
-		if err := os.MkdirAll(runDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.MkdirAll(runDir, 0o755))
 		runDirJSON, _ := json.Marshal(runDir)
 		sessionFile := filepath.Join(t.TempDir(), "cursor.jsonl")
 		content := `{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Shell","input":{"command":"pwd","working_directory":` +
 			string(runDirJSON) + `}}]}}` + "\n"
-		if err := os.WriteFile(sessionFile, []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.WriteFile(sessionFile, []byte(content), 0o644))
 		te.seedSession(t, "cursor:chat-1", projectDir, 3, func(s *db.Session) {
 			s.Agent = "cursor"
 			s.FilePath = &sessionFile
@@ -144,32 +170,23 @@ func TestResumeSession(t *testing.T) {
 			Command  string `json:"command"`
 			Cwd      string `json:"cwd"`
 		}
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if resp.Launched {
-			t.Error("expected launched=false for command_only")
-		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.False(t, resp.Launched, "expected launched=false for command_only")
 		wantProjectDir := canonicalTestPath(projectDir)
-		wantCmd := "cursor agent --resume chat-1 --workspace '" + wantProjectDir + "'"
-		if resp.Command != wantCmd {
-			t.Errorf("command = %q, want %q", resp.Command, wantCmd)
-		}
+		assert.Equal(t,
+			"cursor agent --resume chat-1 --workspace '"+wantProjectDir+"'",
+			resp.Command)
 		assertSamePath(t, "cwd", resp.Cwd, runDir)
 	})
 
 	t.Run("cursor command only falls back workspace to cwd", func(t *testing.T) {
 		runDir := filepath.Join(t.TempDir(), "frontend")
-		if err := os.MkdirAll(runDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.MkdirAll(runDir, 0o755))
 		runDirJSON, _ := json.Marshal(runDir)
 		sessionFile := filepath.Join(t.TempDir(), "cursor.jsonl")
 		content := `{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Shell","input":{"command":"pwd","working_directory":` +
 			string(runDirJSON) + `}}]}}` + "\n"
-		if err := os.WriteFile(sessionFile, []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.WriteFile(sessionFile, []byte(content), 0o644))
 		te.seedSession(t, "cursor:chat-2", "li_tools", 3, func(s *db.Session) {
 			s.Agent = "cursor"
 			s.FilePath = &sessionFile
@@ -184,17 +201,12 @@ func TestResumeSession(t *testing.T) {
 			Command  string `json:"command"`
 			Cwd      string `json:"cwd"`
 		}
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if resp.Launched {
-			t.Error("expected launched=false for command_only")
-		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.False(t, resp.Launched, "expected launched=false for command_only")
 		wantRunDir := canonicalTestPath(runDir)
-		wantCmd := "cursor agent --resume chat-2 --workspace '" + wantRunDir + "'"
-		if resp.Command != wantCmd {
-			t.Errorf("command = %q, want %q", resp.Command, wantCmd)
-		}
+		assert.Equal(t,
+			"cursor agent --resume chat-2 --workspace '"+wantRunDir+"'",
+			resp.Command)
 		assertSamePath(t, "cwd", resp.Cwd, runDir)
 	})
 
@@ -213,9 +225,7 @@ func TestResumeSession(t *testing.T) {
 		te.seedSession(t, "del-1", "/tmp", 3, func(s *db.Session) {
 			s.Agent = "claude"
 		})
-		if err := te.db.SoftDeleteSession("del-1"); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, te.db.SoftDeleteSession("del-1"))
 		w := te.post(t,
 			"/api/v1/sessions/del-1/resume",
 			`{"command_only":true}`,
@@ -236,9 +246,7 @@ func TestGetSessionDirectory(t *testing.T) {
 		var resp struct {
 			Path string `json:"path"`
 		}
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 		assertSamePath(t, "path", resp.Path, projectDir)
 	})
 
@@ -249,12 +257,8 @@ func TestGetSessionDirectory(t *testing.T) {
 		var resp struct {
 			Path string `json:"path"`
 		}
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if resp.Path != "" {
-			t.Errorf("path = %q, want empty", resp.Path)
-		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Empty(t, resp.Path)
 	})
 
 	t.Run("not found", func(t *testing.T) {
@@ -264,15 +268,11 @@ func TestGetSessionDirectory(t *testing.T) {
 
 	t.Run("prefers session file cwd", func(t *testing.T) {
 		cwdDir := filepath.Join(t.TempDir(), "nested")
-		if err := os.Mkdir(cwdDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.Mkdir(cwdDir, 0o755))
 		sessionFile := filepath.Join(t.TempDir(), "session.jsonl")
 		cwdJSON, _ := json.Marshal(cwdDir)
 		content := `{"cwd":` + string(cwdJSON) + "}\n"
-		if err := os.WriteFile(sessionFile, []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.WriteFile(sessionFile, []byte(content), 0o644))
 		te.seedSession(t, "dir-3", projectDir, 3, func(s *db.Session) {
 			s.FilePath = &sessionFile
 		})
@@ -281,25 +281,19 @@ func TestGetSessionDirectory(t *testing.T) {
 		var resp struct {
 			Path string `json:"path"`
 		}
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 		assertSamePath(t, "path", resp.Path, cwdDir)
 	})
 
 	t.Run("cursor directory returns workspace root", func(t *testing.T) {
 		projectDir := t.TempDir()
 		runDir := filepath.Join(projectDir, "frontend")
-		if err := os.MkdirAll(runDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.MkdirAll(runDir, 0o755))
 		runDirJSON, _ := json.Marshal(runDir)
 		sessionFile := filepath.Join(t.TempDir(), "cursor.jsonl")
 		content := `{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Shell","input":{"command":"pwd","working_directory":` +
 			string(runDirJSON) + `}}]}}` + "\n"
-		if err := os.WriteFile(sessionFile, []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.WriteFile(sessionFile, []byte(content), 0o644))
 		te.seedSession(t, "dir-cursor", projectDir, 3, func(s *db.Session) {
 			s.Agent = "cursor"
 			s.FilePath = &sessionFile
@@ -310,9 +304,7 @@ func TestGetSessionDirectory(t *testing.T) {
 		var resp struct {
 			Path string `json:"path"`
 		}
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 		assertSamePath(t, "path", resp.Path, projectDir)
 	})
 }
@@ -331,14 +323,10 @@ func TestListOpeners(t *testing.T) {
 			Bin  string `json:"bin"`
 		} `json:"openers"`
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	// The response should always be an array (possibly empty),
 	// never null.
-	if resp.Openers == nil {
-		t.Error("openers should be [] not null")
-	}
+	assert.NotNil(t, resp.Openers, "openers should be [] not null")
 }
 
 func TestGetTerminalConfig(t *testing.T) {
@@ -350,12 +338,8 @@ func TestGetTerminalConfig(t *testing.T) {
 		var resp struct {
 			Mode string `json:"mode"`
 		}
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if resp.Mode != "auto" {
-			t.Errorf("mode = %q, want %q", resp.Mode, "auto")
-		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, "auto", resp.Mode)
 	})
 
 	t.Run("set and get", func(t *testing.T) {
@@ -370,12 +354,8 @@ func TestGetTerminalConfig(t *testing.T) {
 		var resp struct {
 			Mode string `json:"mode"`
 		}
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if resp.Mode != "clipboard" {
-			t.Errorf("mode = %q, want %q", resp.Mode, "clipboard")
-		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, "clipboard", resp.Mode)
 	})
 
 	t.Run("invalid mode", func(t *testing.T) {

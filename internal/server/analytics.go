@@ -6,24 +6,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/wesm/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/timeutil"
 )
-
-// isValidDate checks that s is a well-formed YYYY-MM-DD string.
-func isValidDate(s string) bool {
-	_, err := time.Parse("2006-01-02", s)
-	return err == nil
-}
-
-// isValidTimestamp checks RFC3339 or RFC3339Nano format.
-func isValidTimestamp(s string) bool {
-	_, err := time.Parse(time.RFC3339, s)
-	if err == nil {
-		return true
-	}
-	_, err = time.Parse(time.RFC3339Nano, s)
-	return err == nil
-}
 
 // defaultDateRange returns (from, to) defaulting to the last
 // 30 days if not provided.
@@ -62,7 +47,7 @@ func parseAnalyticsFilter(
 
 	from, to := defaultDateRange(q.Get("from"), q.Get("to"))
 
-	if !isValidDate(from) || !isValidDate(to) {
+	if !timeutil.IsValidDate(from) || !timeutil.IsValidDate(to) {
 		writeError(w, http.StatusBadRequest,
 			"invalid date format: use YYYY-MM-DD")
 		return db.AnalyticsFilter{}, false
@@ -101,7 +86,7 @@ func parseAnalyticsFilter(
 	}
 
 	activeSince := q.Get("active_since")
-	if activeSince != "" && !isValidTimestamp(activeSince) {
+	if activeSince != "" && !timeutil.IsValidTimestamp(activeSince) {
 		writeError(w, http.StatusBadRequest,
 			"invalid active_since: use RFC3339 timestamp")
 		return db.AnalyticsFilter{}, false
@@ -123,6 +108,7 @@ func parseAnalyticsFilter(
 		ExcludeOneShot:   !includeOneShot,
 		ExcludeAutomated: !includeAutomated,
 		ActiveSince:      activeSince,
+		Termination:      q.Get("termination"),
 	}, true
 }
 
@@ -330,6 +316,28 @@ func (s *Server) handleAnalyticsVelocity(
 			return
 		}
 		log.Printf("analytics error: %v", err)
+		writeError(w, http.StatusInternalServerError,
+			"internal server error")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleAnalyticsSignals(
+	w http.ResponseWriter, r *http.Request,
+) {
+	f, ok := parseAnalyticsFilter(w, r)
+	if !ok {
+		return
+	}
+
+	result, err := s.db.GetAnalyticsSignals(r.Context(), f)
+	if err != nil {
+		if handleContextError(w, err) {
+			return
+		}
+		log.Printf("analytics signals error: %v", err)
 		writeError(w, http.StatusInternalServerError,
 			"internal server error")
 		return

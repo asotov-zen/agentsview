@@ -10,6 +10,8 @@ LDFLAGS := -X main.version=$(VERSION) \
 
 LDFLAGS_RELEASE := $(LDFLAGS) -s -w
 DESKTOP_DIST_DIR := dist/desktop
+GOLANGCI_LINT_VERSION ?= v2.11.4
+CUSTOM_GCL := ./custom-gcl
 
 GOPATH_FIRST := $(shell go env GOPATH | cut -d: -f1)
 AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
@@ -17,13 +19,15 @@ AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
 	elif [ -x "$(GOPATH_FIRST)/bin/air" ]; then printf "%s" "$(GOPATH_FIRST)/bin/air"; \
 	fi)
 
-.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app test test-short test-postgres test-postgres-ci postgres-up postgres-down e2e vet lint lint-ci tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir help
+.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app test test-short test-postgres test-postgres-ci postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir dev-snapshot help
 
 # Ensure go:embed has at least one file (no-op if frontend is built)
 ensure-embed-dir:
 	@mkdir -p internal/web/dist
-	@test -n "$$(ls internal/web/dist/ 2>/dev/null)" \
-		|| echo ok > internal/web/dist/stub.html
+	@test -f internal/web/dist/.keep \
+		|| printf '%s\n' \
+			'keep embed dir for generated frontend assets' \
+			> internal/web/dist/.keep
 
 # Build the binary (debug, with embedded frontend)
 build: frontend
@@ -56,10 +60,69 @@ frontend:
 	cd frontend && npm install && npm run build
 	rm -rf internal/web/dist
 	cp -r frontend/dist internal/web/dist
+	printf '%s\n' \
+		'keep embed dir for generated frontend assets' \
+		> internal/web/dist/.keep
 
 # Run Vite dev server (use alongside `make dev`)
 frontend-dev:
 	cd frontend && npm run dev
+
+# Build and run agentsview against a fresh snapshot of the prod SQLite DB.
+# Prod DB is never written; sqlite3 .backup is WAL-safe even with prod running.
+# Prod config.toml is NOT copied, so remote PG push is disabled in the snapshot.
+# Overrides:
+#   PROD_DATA_DIR  - source data dir (default: $$HOME/.agentsview)
+#   SNAPSHOT_DIR   - destination dir (default: tmp/prod-snapshot)
+#   RESNAPSHOT=0   - reuse existing snapshot instead of re-cloning
+PROD_DATA_DIR ?= $(HOME)/.agentsview
+SNAPSHOT_DIR ?= tmp/prod-snapshot
+# Resolve SNAPSHOT_DIR so relative and absolute paths both work.
+SNAPSHOT_ABS := $(abspath $(SNAPSHOT_DIR))
+
+# Sentinel file written into a snapshot directory the first time
+# we populate it. Subsequent runs require this marker before
+# touching any contents, so pointing SNAPSHOT_DIR at an
+# unrelated existing directory cannot accidentally delete
+# someone's files. The previous version used rm -rf on the
+# whole directory; that left dangerous edge cases (e.g.
+# SNAPSHOT_DIR=tmp wiping unrelated tmp/ contents) even with a
+# denylist, so we now only ever delete a small set of files we
+# know we wrote.
+SNAPSHOT_MARKER := .agentsview-snapshot
+
+dev-snapshot: build
+	@if [ ! -f "$(PROD_DATA_DIR)/sessions.db" ]; then \
+		echo "error: prod sessions.db not found at $(PROD_DATA_DIR)/sessions.db" >&2; \
+		exit 1; \
+	fi
+	@if [ -z "$(SNAPSHOT_ABS)" ]; then \
+		echo "error: SNAPSHOT_DIR resolved to empty path" >&2; \
+		exit 1; \
+	fi
+	@if [ -d "$(SNAPSHOT_ABS)" ] && [ ! -f "$(SNAPSHOT_ABS)/$(SNAPSHOT_MARKER)" ]; then \
+		if [ -n "$$(ls -A "$(SNAPSHOT_ABS)" 2>/dev/null)" ]; then \
+			echo "error: $(SNAPSHOT_ABS) is non-empty and missing the $(SNAPSHOT_MARKER) marker" >&2; \
+			echo "       refusing to touch a directory we did not create" >&2; \
+			echo "       remove the directory manually if you want to reuse this path" >&2; \
+			exit 1; \
+		fi; \
+	fi
+	@mkdir -p "$(SNAPSHOT_ABS)"
+	@touch "$(SNAPSHOT_ABS)/$(SNAPSHOT_MARKER)"
+	@if [ "$${RESNAPSHOT:-1}" = "1" ] || [ ! -f "$(SNAPSHOT_ABS)/sessions.db" ]; then \
+		echo "Snapshotting $(PROD_DATA_DIR)/sessions.db -> $(SNAPSHOT_ABS)/sessions.db"; \
+		for f in sessions.db sessions.db-wal sessions.db-shm \
+		         config.toml config.json config.json.bak \
+		         debug.log; do \
+			rm -f "$(SNAPSHOT_ABS)/$$f"; \
+		done; \
+		sqlite3 "$(PROD_DATA_DIR)/sessions.db" \
+			".backup $(SNAPSHOT_ABS)/sessions.db"; \
+	else \
+		echo "Reusing existing snapshot at $(SNAPSHOT_ABS)/sessions.db"; \
+	fi
+	AGENTSVIEW_DATA_DIR="$(SNAPSHOT_ABS)" ./agentsview serve --port 0
 
 # Ensure air is installed for backend live reload
 check-air:
@@ -178,6 +241,26 @@ test-postgres: ensure-embed-dir postgres-up
 test-postgres-ci: ensure-embed-dir
 	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/postgres/... -count=1
 
+# Start test SSH container
+ssh-up:
+	docker compose -f docker-compose.test.yml up -d --build --wait sshd
+	docker cp "$$(docker compose -f docker-compose.test.yml ps -q sshd)":/tmp/test_ssh_key testdata/ssh/test_key
+	chmod 600 testdata/ssh/test_key
+
+# Stop test SSH container
+ssh-down:
+	docker compose -f docker-compose.test.yml down sshd
+
+# Run SSH integration tests (starts sshd automatically)
+test-ssh: ensure-embed-dir ssh-up
+	TEST_SSH_HOST=localhost TEST_SSH_PORT=2222 TEST_SSH_USER=testuser \
+		TEST_SSH_KEY=$(CURDIR)/testdata/ssh/test_key \
+		CGO_ENABLED=1 go test -tags "fts5,sshtest" -v ./internal/ssh/... -count=1
+
+# SSH integration tests for CI (sshd already running)
+test-ssh-ci: ensure-embed-dir
+	CGO_ENABLED=1 go test -tags "fts5,sshtest" -v ./internal/ssh/... -count=1
+
 # Run Playwright E2E tests
 e2e:
 	cd frontend && npx playwright test
@@ -187,20 +270,52 @@ vet: ensure-embed-dir
 	go vet -tags fts5 ./...
 
 # Lint Go code and auto-fix where possible (local development)
-lint: ensure-embed-dir
+lint: lint-golangci nilaway
+
+# Run golangci-lint with auto-fixes for local development.
+lint-golangci: ensure-embed-dir
 	@if ! command -v golangci-lint >/dev/null 2>&1; then \
-		echo "golangci-lint not found. Install with: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.10.1" >&2; \
+		echo "golangci-lint not found. Install with: make lint-tools" >&2; \
 		exit 1; \
 	fi
 	golangci-lint run --fix ./...
 
 # Lint Go code without fixing (for CI)
-lint-ci: ensure-embed-dir
+lint-ci: lint-golangci-ci nilaway
+
+# Run golangci-lint without auto-fixes for CI.
+lint-golangci-ci: ensure-embed-dir
 	@if ! command -v golangci-lint >/dev/null 2>&1; then \
-		echo "golangci-lint not found. Install with: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.10.1" >&2; \
+		echo "golangci-lint not found. Install with: make lint-tools" >&2; \
 		exit 1; \
 	fi
 	golangci-lint run ./...
+
+# Build a custom golangci-lint binary with the NilAway module plugin.
+# Strip every repo-local Git env var (GIT_DIR, GIT_INDEX_FILE,
+# GIT_CONFIG_PARAMETERS, etc.) and disable VCS stamping so the inner
+# `git clone` and `go build` don't inherit the parent repo's state.
+# When `make nilaway` runs from a pre-commit hook, git exports those
+# vars pointing at the parent repo, which makes the clone and the
+# VCS-stamped build fail with exit 128. The list comes from
+# `git rev-parse --local-env-vars` so it tracks whatever Git considers
+# repo-local at runtime.
+nilaway-golangci-build:
+	@if ! command -v golangci-lint >/dev/null 2>&1; then \
+		echo "golangci-lint not found. Install with: make lint-tools" >&2; \
+		exit 1; \
+	fi
+	@unset_args=$$(git rev-parse --local-env-vars 2>/dev/null | sed 's/^/-u /' | tr '\n' ' '); \
+	env $$unset_args GOFLAGS=-buildvcs=false \
+		golangci-lint custom --version "$(GOLANGCI_LINT_VERSION)" --name custom-gcl
+
+# Run NilAway through the custom golangci-lint module plugin.
+nilaway: ensure-embed-dir nilaway-golangci-build
+	$(CUSTOM_GCL) run --config .golangci.nilaway.yml ./...
+
+# Install pinned local lint tools.
+lint-tools:
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 # Tidy dependencies
 tidy:
@@ -210,6 +325,10 @@ tidy:
 clean:
 	rm -f agentsview agentsv
 	rm -rf internal/web/dist dist/ tmp/
+	mkdir -p internal/web/dist
+	printf '%s\n' \
+		'keep embed dir for generated frontend assets' \
+		> internal/web/dist/.keep
 
 # Build release binary for current platform (CGO required for sqlite3)
 release: frontend
@@ -254,6 +373,7 @@ help:
 	@echo "  install        - Build and install to ~/.local/bin or GOPATH"
 	@echo ""
 	@echo "  dev            - Run Go server with live reload via air (use with frontend-dev)"
+	@echo "  dev-snapshot   - Run agentsview against a fresh snapshot of prod sessions.db"
 	@echo "  air-install    - Install air for backend live reload"
 	@echo "  frontend       - Build frontend SPA"
 	@echo "  frontend-dev   - Run Vite dev server"
@@ -270,10 +390,16 @@ help:
 	@echo "  test-postgres  - Run PostgreSQL integration tests"
 	@echo "  postgres-up    - Start test PostgreSQL container"
 	@echo "  postgres-down  - Stop test PostgreSQL container"
+	@echo "  test-ssh       - Run SSH integration tests"
+	@echo "  ssh-up         - Start test SSH container"
+	@echo "  ssh-down       - Stop test SSH container"
 	@echo "  e2e            - Run Playwright E2E tests"
 	@echo "  vet            - Run go vet"
-	@echo "  lint           - Run golangci-lint (auto-fix)"
-	@echo "  lint-ci        - Run golangci-lint (no fix, for CI)"
+	@echo "  lint           - Run golangci-lint and NilAway (auto-fix golangci issues)"
+	@echo "  lint-ci        - Run golangci-lint and NilAway (no fix, for CI)"
+	@echo "  lint-golangci  - Run golangci-lint with auto-fix"
+	@echo "  nilaway        - Run NilAway through custom golangci-lint"
+	@echo "  lint-tools     - Install pinned lint tools"
 	@echo "  tidy           - Tidy go.mod"
 	@echo ""
 	@echo "  release        - Release build for current platform"

@@ -9,16 +9,18 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	gosync "sync"
 	"time"
 
-	"github.com/wesm/agentsview/internal/config"
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/insight"
-	"github.com/wesm/agentsview/internal/sync"
-	"github.com/wesm/agentsview/internal/web"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/insight"
+	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/sync"
+	"go.kenn.io/agentsview/internal/web"
 )
 
 // VersionInfo holds build-time version metadata.
@@ -31,14 +33,16 @@ type VersionInfo struct {
 
 // Server is the HTTP server that serves the SPA and REST API.
 type Server struct {
-	mu      gosync.RWMutex
-	cfg     config.Config
-	db      db.Store
-	engine  *sync.Engine
-	mux     *http.ServeMux
-	httpSrv *http.Server
-	version VersionInfo
-	dataDir string
+	mu          gosync.RWMutex
+	cfg         config.Config
+	db          db.Store
+	engine      *sync.Engine
+	sessions    service.SessionService
+	broadcaster *Broadcaster
+	mux         *http.ServeMux
+	httpSrv     *http.Server
+	version     VersionInfo
+	dataDir     string
 
 	// baseCtx, when set, is used as the base context for all
 	// incoming requests. Cancelling it causes SSE handlers to
@@ -76,14 +80,37 @@ func New(
 		log.Fatalf("embedded frontend not found: %v", err)
 	}
 
+	// Pick the backend that matches the concrete store. A local
+	// *db.DB plus a sync engine yields a full read/write backend;
+	// any other combination (PG reader, or local DB with nil
+	// engine when used by a read-only daemon) yields a read-only
+	// backend whose Sync returns db.ErrReadOnly.
+	var sessions service.SessionService
+	if local, ok := database.(*db.DB); ok && engine != nil {
+		sessions = service.NewDirectBackend(local, engine)
+	} else {
+		sessions = service.NewReadOnlyBackend(database)
+	}
+
 	s := &Server{
-		cfg:                cfg,
-		db:                 database,
-		engine:             engine,
-		mux:                http.NewServeMux(),
-		generateStreamFunc: insight.GenerateStream,
-		spaFS:              dist,
-		spaHandler:         http.FileServerFS(dist),
+		cfg:      cfg,
+		db:       database,
+		engine:   engine,
+		sessions: sessions,
+		mux:      http.NewServeMux(),
+		generateStreamFunc: func(
+			ctx context.Context, agent, prompt string,
+			onLog insight.LogFunc,
+		) (insight.Result, error) {
+			return insight.GenerateStreamWithOptions(
+				ctx, agent, prompt, onLog,
+				insight.GenerateOptions{
+					Agents: insightAgentConfig(cfg.Agent),
+				},
+			)
+		},
+		spaFS:      dist,
+		spaHandler: http.FileServerFS(dist),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -94,6 +121,19 @@ func New(
 
 // Option configures a Server.
 type Option func(*Server)
+
+func insightAgentConfig(
+	cfg map[string]config.AgentConfig,
+) map[string]insight.AgentConfig {
+	if len(cfg) == 0 {
+		return nil
+	}
+	agents := make(map[string]insight.AgentConfig, len(cfg))
+	for name, agentCfg := range cfg {
+		agents[name] = insight.AgentConfig{Binary: agentCfg.Binary}
+	}
+	return agents
+}
 
 // WithVersion sets the build-time version metadata.
 func WithVersion(v VersionInfo) Option {
@@ -111,6 +151,13 @@ func WithDataDir(dir string) Option {
 // exit and unblocking graceful shutdown.
 func WithBaseContext(ctx context.Context) Option {
 	return func(s *Server) { s.baseCtx = ctx }
+}
+
+// WithBroadcaster wires an event broadcaster into the server so the
+// /api/v1/events handler has something to subscribe to. Required for
+// live-refresh SSE; absent in PG serve mode where the engine is nil.
+func WithBroadcaster(b *Broadcaster) Option {
+	return func(s *Server) { s.broadcaster = b }
 }
 
 // WithUpdateChecker overrides the update check function,
@@ -157,9 +204,16 @@ func WithGenerateStreamFunc(f insight.GenerateStreamFunc) Option {
 func (s *Server) routes() {
 	// API v1 routes
 	s.mux.Handle("GET /api/v1/sessions", s.withTimeout(s.handleListSessions))
+	s.mux.Handle(
+		"GET /api/v1/sessions/sidebar-index",
+		s.withTimeout(s.handleSidebarSessionIndex),
+	)
 	s.mux.Handle("GET /api/v1/sessions/{id}", s.withTimeout(s.handleGetSession))
 	s.mux.Handle(
 		"GET /api/v1/sessions/{id}/messages", s.withTimeout(s.handleGetMessages),
+	)
+	s.mux.Handle(
+		"GET /api/v1/sessions/{id}/tool-calls", s.withTimeout(s.handleToolCalls),
 	)
 	s.mux.Handle(
 		"GET /api/v1/sessions/{id}/children", s.withTimeout(s.handleGetChildSessions),
@@ -167,9 +221,16 @@ func (s *Server) routes() {
 	s.mux.Handle(
 		"GET /api/v1/sessions/{id}/activity", s.withTimeout(s.handleGetSessionActivity),
 	)
+	s.mux.Handle(
+		"GET /api/v1/sessions/{id}/timing", s.withTimeout(s.handleSessionTiming),
+	)
 	// SSE: Do not use timeout, as this is a long-lived connection.
 	s.mux.HandleFunc(
 		"GET /api/v1/sessions/{id}/watch", s.handleWatchSession,
+	)
+	// SSE: Do not use timeout, as this is a long-lived connection.
+	s.mux.HandleFunc(
+		"GET /api/v1/events", s.handleEvents,
 	)
 	// Export: Do not use timeout handler to support large downloads and avoid buffering.
 	s.mux.Handle(
@@ -178,6 +239,9 @@ func (s *Server) routes() {
 	// Raw: serve the original session file.
 	s.mux.Handle(
 		"GET /api/v1/sessions/{id}/raw", http.HandlerFunc(s.handleRawDownload),
+	)
+	s.mux.Handle(
+		"GET /api/v1/sessions/{id}/md", http.HandlerFunc(s.handleMarkdownSession),
 	)
 	s.mux.Handle(
 		"POST /api/v1/sessions/{id}/publish", s.withTimeout(s.handlePublishSession),
@@ -190,6 +254,9 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/sessions/{id}/search", s.withTimeout(s.handleSearchSession))
 	s.mux.Handle("POST /api/v1/sessions/{id}/open", s.withTimeout(s.handleOpenSession))
 	s.mux.Handle(
+		"POST /api/v1/sessions/sync", s.withTimeout(s.handleSyncSession),
+	)
+	s.mux.Handle(
 		"POST /api/v1/sessions/upload", s.withTimeout(s.handleUploadSession),
 	)
 	s.mux.Handle("GET /api/v1/analytics/summary", s.withTimeout(s.handleAnalyticsSummary))
@@ -201,6 +268,8 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/analytics/velocity", s.withTimeout(s.handleAnalyticsVelocity))
 	s.mux.Handle("GET /api/v1/analytics/tools", s.withTimeout(s.handleAnalyticsTools))
 	s.mux.Handle("GET /api/v1/analytics/top-sessions", s.withTimeout(s.handleAnalyticsTopSessions))
+	s.mux.Handle("GET /api/v1/analytics/signals", s.withTimeout(s.handleAnalyticsSignals))
+	s.mux.Handle("GET /api/v1/trends/terms", s.withTimeout(s.handleTrendsTerms))
 
 	s.mux.Handle("GET /api/v1/usage/summary",
 		s.withTimeout(s.handleUsageSummary))
@@ -213,11 +282,14 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/insights/generate", s.handleGenerateInsight)
 
 	s.mux.Handle("GET /api/v1/search", s.withTimeout(s.handleSearch))
+	s.mux.Handle("GET /api/v1/search/content", s.withTimeout(s.handleSearchContent))
+	s.mux.Handle("GET /api/v1/secrets", s.withTimeout(s.handleListSecrets))
 	s.mux.Handle("GET /api/v1/projects", s.withTimeout(s.handleListProjects))
 	s.mux.Handle("GET /api/v1/machines", s.withTimeout(s.handleListMachines))
 	s.mux.Handle("GET /api/v1/agents", s.withTimeout(s.handleListAgents))
 	s.mux.Handle("GET /api/v1/stats", s.withTimeout(s.handleGetStats))
 	s.mux.Handle("GET /api/v1/version", s.withTimeout(s.handleGetVersion))
+	s.mux.HandleFunc("POST /api/v1/secrets/scan", s.handleScanSecrets)
 	s.mux.HandleFunc("POST /api/v1/sync", s.handleTriggerSync)
 	s.mux.HandleFunc("POST /api/v1/resync", s.handleTriggerResync)
 	s.mux.Handle("GET /api/v1/sync/status", s.withTimeout(s.handleSyncStatus))
@@ -233,6 +305,11 @@ func (s *Server) routes() {
 
 	s.mux.Handle("GET /api/v1/settings", s.withTimeout(s.handleGetSettings))
 	s.mux.Handle("PUT /api/v1/settings", s.withTimeout(s.handleUpdateSettings))
+	s.mux.Handle("GET /api/v1/settings/worktree-mappings", s.withTimeout(s.handleListWorktreeMappings))
+	s.mux.Handle("POST /api/v1/settings/worktree-mappings", s.withTimeout(s.handleCreateWorktreeMapping))
+	s.mux.Handle("PUT /api/v1/settings/worktree-mappings/{id}", s.withTimeout(s.handleUpdateWorktreeMapping))
+	s.mux.Handle("DELETE /api/v1/settings/worktree-mappings/{id}", s.withTimeout(s.handleDeleteWorktreeMapping))
+	s.mux.Handle("POST /api/v1/settings/worktree-mappings/apply", s.withTimeout(s.handleApplyWorktreeMappings))
 
 	s.mux.Handle("GET /api/v1/starred", s.withTimeout(s.handleListStarred))
 	s.mux.Handle("PUT /api/v1/sessions/{id}/star", s.withTimeout(s.handleStarSession))
@@ -383,7 +460,7 @@ func (s *Server) Handler() http.Handler {
 	if bindAll {
 		bindAllIPs = localInterfaceIPs()
 	}
-	h := cspMiddleware(s.cfg.Host, s.cfg.Port, s.cfg.PublicOrigins, bindAllIPs,
+	h := cspMiddleware(s.cfg.Host, s.cfg.Port, s.basePath,
 		s.authMiddleware(
 			hostCheckMiddleware(
 				allowedHosts, bindAll, s.cfg.Port, bindAllIPs,
@@ -423,8 +500,8 @@ func (s *Server) Handler() http.Handler {
 // responses. The policy pins the exact host:port origin so that
 // even if Tauri's compile-time CSP uses a wildcard port, the
 // intersection narrows to the actual runtime port.
-func cspMiddleware(host string, port int, publicOrigins []string, bindAllIPs map[string]bool, next http.Handler) http.Handler {
-	policy := buildCSPPolicy(host, port, publicOrigins, bindAllIPs)
+func cspMiddleware(host string, port int, basePath string, next http.Handler) http.Handler {
+	policy := buildCSPPolicy(host, port, basePath)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Content-Security-Policy", policy)
@@ -435,89 +512,46 @@ func cspMiddleware(host string, port int, publicOrigins []string, bindAllIPs map
 }
 
 // buildCSPPolicy constructs the Content-Security-Policy string.
-// It uses the same loopback/bind-all logic as buildAllowedOrigins
-// to handle IPv6 bracketing, 0.0.0.0/:: normalization, and
-// public origins (proxy/TLS).
 //
-// The server's own origin (host:port) is included explicitly in
-// all directives because WebKitGTK in a Tauri webview may not
-// resolve 'self' to the Go server origin after navigating from
-// tauri://localhost. Public origins and LAN IPs are restricted
-// to connect-src only to limit the script execution surface.
-func buildCSPPolicy(host string, port int, publicOrigins []string, bindAllIPs map[string]bool) string {
+// The server's own origin (host:port) is pinned in the resource
+// directives (default/script/img/style/font) because WebKitGTK in a
+// Tauri webview may not resolve 'self' to the Go server origin after
+// navigating from tauri://localhost.
+//
+// connect-src is intentionally widened to any http/https/ws/wss
+// origin. The "Connect to Remote Server" feature (see
+// frontend/src/lib/api/client.ts) lets the user point the SPA at an
+// arbitrary remote agentsview API origin stored client-side, which
+// this server cannot know when the policy is built. This mirrors the
+// backend, where authenticated remote requests already bypass the
+// host-check and CORS restrictions (see isRemoteAuth in auth.go and
+// corsMiddleware). Security tradeoff: a broad connect-src means that
+// if an XSS ever executed in the app, exfiltration would be easier;
+// the other directives stay pinned so script execution remains gated
+// to 'self'.
+func buildCSPPolicy(host string, port int, basePath string) string {
 	// serverOrigin is the pinned http origin for the configured
-	// host:port, used in all directives so resources load
+	// host:port, used in the resource directives so resources load
 	// correctly regardless of how the webview resolves 'self'.
 	serverOrigin := "http://" + net.JoinHostPort(host, strconv.Itoa(port))
-
-	// connectSrcs collects additional origins for connect-src
-	// (fetch, SSE, WebSocket) — loopback variants, LAN IPs,
-	// and public/proxy origins.
-	connectHTTP := []string{}
-	connectWS := []string{}
-
-	addConnectOrigin := func(h string) {
-		for _, o := range httpOrigin(h, port) {
-			connectHTTP = append(connectHTTP, o)
-			connectWS = append(connectWS, strings.Replace(o, "http://", "ws://", 1))
-		}
-	}
-
-	// Mirror buildAllowedOrigins: when binding to loopback,
-	// include the other loopback variant. When binding to all
-	// interfaces, include all loopback origins plus every
-	// concrete interface IP.
-	switch host {
-	case "127.0.0.1":
-		addConnectOrigin("localhost")
-	case "localhost":
-		addConnectOrigin("127.0.0.1")
-	case "0.0.0.0", "::":
-		addConnectOrigin("127.0.0.1")
-		addConnectOrigin("localhost")
-		addConnectOrigin("::1")
-		for ip := range bindAllIPs {
-			if ip != "127.0.0.1" && ip != "::1" {
-				addConnectOrigin(ip)
-			}
-		}
-	case "::1":
-		addConnectOrigin("127.0.0.1")
-		addConnectOrigin("localhost")
-	}
-
-	for _, origin := range publicOrigins {
-		connectHTTP = append(connectHTTP, origin)
-		connectWS = append(connectWS,
-			strings.NewReplacer(
-				"https://", "wss://",
-				"http://", "ws://",
-			).Replace(origin),
-		)
-	}
-
-	// resource-src: 'self' + pinned server origin (for all resource types)
 	resourceSrc := "'self' " + serverOrigin
 
-	// connect-src: resource-src + loopback/LAN/public origins + ws variants
-	connectParts := []string{resourceSrc}
-	wsOrigin := "ws://" + net.JoinHostPort(host, strconv.Itoa(port))
-	connectParts = append(connectParts, wsOrigin)
-	connectParts = append(connectParts, connectHTTP...)
-	connectParts = append(connectParts, connectWS...)
-	connectSrc := strings.Join(connectParts, " ")
+	baseURI := "'none'"
+	if basePath != "" {
+		baseURI = "'self'"
+	}
 
 	return fmt.Sprintf(
 		"default-src %[1]s; "+
 			"script-src %[1]s; "+
-			"connect-src %[2]s; "+
+			"connect-src 'self' http: https: ws: wss:; "+
 			"img-src %[1]s data:; "+
 			"style-src %[1]s 'unsafe-inline' https://fonts.googleapis.com; "+
 			"font-src %[1]s data: https://fonts.gstatic.com; "+
 			"object-src 'none'; "+
-			"base-uri 'none'; "+
+			"base-uri %[2]s; "+
 			"frame-ancestors 'none'",
-		resourceSrc, connectSrc,
+		resourceSrc, baseURI,
 	)
 }
 
@@ -588,14 +622,50 @@ func hostCheckMiddleware(
 				hostAllowed = isAllowedBindAllHost(r.Host, port, allowedIPs)
 			}
 			if !hostAllowed {
+				allowed := sortedHosts(allowedHosts)
+				log.Printf(
+					"host check rejected %s %s: Host %q not in allowed "+
+						"set %v; if reaching agentsview through a forwarded "+
+						"port or remote host, restart with --public-url "+
+						"<origin> matching your browser URL",
+					r.Method, r.URL.Path, r.Host, allowed,
+				)
 				http.Error(
-					w, "Forbidden", http.StatusForbidden,
+					w, hostRejectionMessage(r.Host, allowed),
+					http.StatusForbidden,
 				)
 				return
 			}
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// sortedHosts returns the allowed Host header values as a sorted
+// slice for deterministic log and error output.
+func sortedHosts(hosts map[string]bool) []string {
+	out := make([]string, 0, len(hosts))
+	for h := range hosts {
+		out = append(out, h)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// hostRejectionMessage builds a self-explaining 403 body for a
+// rejected Host header. It names the offending Host, lists the
+// allowed values, and points at --public-url so users behind SSH
+// port-forwarding, reverse proxies, or remote dev environments
+// (exe.dev, Codespaces, Coder, WSL2) can diagnose without devtools.
+func hostRejectionMessage(host string, allowed []string) string {
+	return fmt.Sprintf(
+		"Forbidden: request Host %q is not in the allowed set %v. "+
+			"If you are reaching agentsview through SSH port-forwarding, "+
+			"a reverse proxy, or a remote dev environment, restart the "+
+			"server with --public-url <origin> matching the URL in your "+
+			"browser (for example --public-url http://%s).",
+		host, allowed, host,
+	)
 }
 
 // httpOrigin formats an HTTP origin string. It uses
@@ -790,6 +860,18 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // FindAvailablePort finds an available port starting from the
 // given port, binding to the specified host.
 func FindAvailablePort(host string, start int) int {
+	if start == 0 {
+		addr := net.JoinHostPort(host, "0")
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			defer ln.Close()
+			if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
+				return tcpAddr.Port
+			}
+		}
+		return start
+	}
+
 	for port := start; port < start+100; port++ {
 		addr := net.JoinHostPort(host, strconv.Itoa(port))
 		ln, err := net.Listen("tcp", addr)

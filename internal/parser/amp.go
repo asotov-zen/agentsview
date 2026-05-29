@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -62,8 +63,8 @@ func ParseAmpSession(
 	traces := root.Get("meta.traces")
 	if traces.IsArray() {
 		traceList := traces.Array()
-		for i := len(traceList) - 1; i >= 0; i-- {
-			t := parseTimestamp(traceList[i].Get("endTime").Str)
+		for _, v := range slices.Backward(traceList) {
+			t := parseTimestamp(v.Get("endTime").Str)
 			if !t.IsZero() {
 				endTime = t
 				break
@@ -100,7 +101,7 @@ func ParseAmpSession(
 			role = RoleAssistant
 		}
 
-		content, hasThinking, hasToolUse, tcs, trs :=
+		content, thinkingText, hasThinking, hasToolUse, tcs, trs :=
 			ExtractTextContent(msg.Get("content"))
 		trs = append(trs, extractAmpToolResults(msg.Get("content"))...)
 		if strings.TrimSpace(content) == "" && len(trs) == 0 {
@@ -119,6 +120,7 @@ func ParseAmpSession(
 			Role:          role,
 			Content:       content,
 			HasThinking:   hasThinking,
+			ThinkingText:  thinkingText,
 			HasToolUse:    hasToolUse,
 			ContentLength: len(content),
 			ToolCalls:     tcs,

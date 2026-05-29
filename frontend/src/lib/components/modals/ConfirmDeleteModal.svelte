@@ -3,6 +3,7 @@
   import { ui } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { truncate } from "../../utils/format.js";
+  import { normalizeMessagePreview } from "../../utils/messages.js";
 
   let deleting = $state(false);
   let deleteBtn = $state<HTMLButtonElement>();
@@ -10,10 +11,14 @@
   let sessionName = $derived.by(() => {
     const s = sessions.activeSession;
     if (!s) return "this session";
-    return truncate(
-      s.display_name ?? s.first_message ?? s.project ?? "this session",
-      60,
-    );
+    const raw =
+      s.display_name
+      ?? (
+        normalizeMessagePreview(s.first_message)
+        || s.project
+        || "this session"
+      );
+    return truncate(raw, 60);
   });
 
   function close() {
@@ -53,12 +58,23 @@
   }}
 />
 
+<!--
+  Overlay is closed via Escape (svelte:window above) and via the
+  Cancel/× buttons inside the modal, so a separate keydown handler
+  here would be redundant.
+-->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
+<!-- svelte-ignore a11y_click_events_have_key_events -->
 <div class="confirm-overlay" onclick={handleOverlayClick}>
   <div class="confirm-modal">
     <div class="confirm-header">
       <h3 class="confirm-title">Delete Session</h3>
-      <button class="close-btn" onclick={close}>&times;</button>
+      <button
+        class="close-btn"
+        onclick={close}
+        title="Close delete confirmation"
+        aria-label="Close delete confirmation"
+      >&times;</button>
     </div>
 
     <div class="confirm-body">

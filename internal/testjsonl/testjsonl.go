@@ -114,6 +114,24 @@ func ClaudeAssistantWithModelJSON(
 	return mustMarshal(m)
 }
 
+// ClaudeQueuedCommandJSON returns a Claude attachment entry of
+// type queued_command — a user message typed and submitted while
+// Claude Code was mid-tool-call.
+func ClaudeQueuedCommandJSON(
+	prompt, timestamp string,
+) string {
+	m := map[string]any{
+		"type":      "attachment",
+		"timestamp": timestamp,
+		"attachment": map[string]any{
+			"type":        "queued_command",
+			"commandMode": "prompt",
+			"prompt":      prompt,
+		},
+	}
+	return mustMarshal(m)
+}
+
 // ClaudeSnapshotJSON returns a Claude snapshot message as a
 // JSON string.
 func ClaudeSnapshotJSON(timestamp string) string {

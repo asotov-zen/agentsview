@@ -5,44 +5,29 @@ package main
 import (
 	"context"
 	"encoding/base64"
-	"flag"
 	"fmt"
 	"log"
 	"os"
-	"strings"
 
-	"github.com/wesm/agentsview/internal/config"
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/parser"
-	"github.com/wesm/agentsview/internal/sync"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/ssh"
+	"go.kenn.io/agentsview/internal/sync"
 )
 
 // SyncConfig holds parsed CLI options for the sync command.
 type SyncConfig struct {
 	Full bool
-}
-
-func parseSyncFlags(args []string) (SyncConfig, error) {
-	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
-	full := fs.Bool(
-		"full", false,
-		"Force a full resync regardless of data version",
-	)
-
-	if err := fs.Parse(args); err != nil {
-		return SyncConfig{}, err
-	}
-
-	if fs.NArg() > 0 {
-		return SyncConfig{}, fmt.Errorf(
-			"unexpected arguments: %s",
-			strings.Join(fs.Args(), " "),
-		)
-	}
-
-	return SyncConfig{
-		Full: *full,
-	}, nil
+	Host string
+	User string
+	Port int
+	// CPUProfile, MemProfile, and Trace are hidden flags that capture a
+	// pprof CPU profile, allocation snapshot, and runtime trace for the
+	// sync pass. Empty strings disable each independently.
+	CPUProfile string
+	MemProfile string
+	Trace      string
 }
 
 func runSync(cfg SyncConfig) {
@@ -57,6 +42,10 @@ func runSync(cfg SyncConfig) {
 
 	setupLogFile(appCfg.DataDir)
 
+	stopProfile := startSyncProfile(cfg)
+	defer stopProfile()
+
+	applyClassifierConfig(appCfg)
 	database, err := db.Open(appCfg.DBPath)
 	if err != nil {
 		fatal("opening database: %v", err)
@@ -64,14 +53,38 @@ func runSync(cfg SyncConfig) {
 	defer database.Close()
 
 	if appCfg.CursorSecret != "" {
-		secret, decErr := base64.StdEncoding.DecodeString(appCfg.CursorSecret)
+		secret, decErr := base64.StdEncoding.DecodeString(
+			appCfg.CursorSecret,
+		)
 		if decErr != nil {
 			fatal("invalid cursor secret: %v", decErr)
 		}
 		database.SetCursorSecret(secret)
 	}
 
+	if cfg.Host != "" {
+		runRemoteSync(appCfg, database, cfg)
+		return
+	}
+
 	runLocalSync(appCfg, database, cfg.Full)
+}
+
+func runRemoteSync(
+	appCfg config.Config, database *db.DB, cfg SyncConfig,
+) {
+	rs := &ssh.RemoteSync{
+		Host:                    cfg.Host,
+		User:                    cfg.User,
+		Port:                    cfg.Port,
+		Full:                    cfg.Full,
+		DB:                      database,
+		BlockedResultCategories: appCfg.ResultContentBlockedCategories,
+	}
+	ctx := context.Background()
+	if _, err := rs.Run(ctx); err != nil {
+		fatal("remote sync: %v", err)
+	}
 }
 
 // runLocalSync runs a local sync (incremental or full resync).
@@ -105,9 +118,12 @@ func runLocalSync(
 	} else {
 		runInitialSync(ctx, engine)
 	}
+	engine.PhaseStats().Log("sync")
 
 	fmt.Println()
-	stats, err := database.GetStats(context.Background(), false, false)
+	stats, err := database.GetStats(
+		context.Background(), false, false,
+	)
 	if err == nil {
 		fmt.Printf(
 			"Database: %d sessions, %d messages\n",

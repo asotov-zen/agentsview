@@ -1,6 +1,10 @@
 package parser
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
 
 func TestNormalizeToolCategory(t *testing.T) {
 	tests := []struct {
@@ -64,20 +68,40 @@ func TestNormalizeToolCategory(t *testing.T) {
 		{"view", "Read"},
 		{"report_intent", "Tool"},
 
-		// Zencoder tools
-		{"WebFetch", "Read"},
+		// Piebald / Zencoder-style built-in tools
+		{"ReadFile", "Read"},
+		{"WriteFile", "Write"},
+		{"EditFile", "Edit"},
+		{"RunTerminalCommand", "Bash"},
+		{"LaunchSubagent", "Task"},
+		{"WebFetch", "Tool"},
+		{"WebSearch", "Tool"},
 		{"TodoWrite", "Tool"},
+		{"AskUserQuestion", "Tool"},
+		{"ProposePlanToUser", "Tool"},
+
+		// Zencoder tools (not already covered above).
 		{"subagent__ZencoderSubagent", "Task"},
 		{"zencoder-rag-mcp__web_search", "Read"},
 		// Zencoder MCP-prefixed subagent variants
 		{"Zencoder_subagent__ZencoderSubagent", "Task"},
 		{"mcp__zen_subagents__spawn_subagent", "Task"},
 
+		// Forge tools
+		{"fs_search", "Grep"},
+		{"patch", "Edit"},
+		{"multi_patch", "Edit"},
+		{"undo", "Edit"},
+		{"remove", "Edit"},
+		{"fetch", "Read"},
+		{"todo_write", "Tool"},
+		{"todo_read", "Tool"},
+		{"parallel", "Task"},
+
 		// Unknown
 		{"view_image", "Other"},
 		{"update_plan", "Other"},
 		{"list_mcp_resources", "Other"},
-		{"AskUserQuestion", "Other"},
 		{"EnterPlanMode", "Other"},
 		{"ExitPlanMode", "Other"},
 		{"", "Other"},
@@ -91,12 +115,8 @@ func TestNormalizeToolCategory(t *testing.T) {
 		}
 		t.Run(testName, func(t *testing.T) {
 			got := NormalizeToolCategory(tt.toolName)
-			if got != tt.want {
-				t.Errorf(
-					"NormalizeToolCategory(%q) = %q, want %q",
-					tt.toolName, got, tt.want,
-				)
-			}
+			assert.Equal(t, tt.want, got,
+				"NormalizeToolCategory(%q)", tt.toolName)
 		})
 	}
 }

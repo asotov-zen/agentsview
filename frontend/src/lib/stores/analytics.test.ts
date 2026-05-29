@@ -4,6 +4,7 @@ import {
   expect,
   vi,
   beforeEach,
+  afterEach,
 } from "vitest";
 import { analytics } from "./analytics.svelte.js";
 import * as api from "../api/client.js";
@@ -29,6 +30,7 @@ vi.mock("../api/client.js", () => ({
   getAnalyticsVelocity: vi.fn(),
   getAnalyticsTools: vi.fn(),
   getAnalyticsTopSessions: vi.fn(),
+  getAnalyticsSignals: vi.fn(),
 }));
 
 
@@ -134,13 +136,65 @@ function mockAllAPIs() {
   vi.mocked(api.getAnalyticsTopSessions).mockResolvedValue(
     makeTopSessions(),
   );
+  vi.mocked(api.getAnalyticsSignals).mockResolvedValue({
+    scored_sessions: 0,
+    unscored_sessions: 0,
+    grade_distribution: {},
+    avg_health_score: null,
+    outcome_distribution: {},
+    outcome_confidence_distribution: {},
+    tool_health: {
+      total_failure_signals: 0,
+      total_retries: 0,
+      total_edit_churn: 0,
+      sessions_with_failures: 0,
+      failure_rate: 0,
+    },
+    context_health: {
+      avg_compaction_count: 0,
+      sessions_with_compaction: 0,
+      mid_task_compaction_count: 0,
+      sessions_with_mid_task_compaction: 0,
+      sessions_with_context_data: 0,
+      avg_context_pressure: null,
+      high_pressure_sessions: 0,
+    },
+    trend: [],
+    by_agent: [],
+    by_project: [],
+  });
+}
+
+async function loadAnalyticsStore() {
+  vi.resetModules();
+  vi.clearAllMocks();
+  mockAllAPIs();
+  return import("./analytics.svelte.js");
 }
 
 function resetStore() {
   analytics.selectedDate = null;
   analytics.project = "";
+  analytics.machine = "";
   analytics.from = "2024-01-01";
   analytics.to = "2024-01-31";
+  analytics.isPinned = false;
+  analytics.windowDays = 365;
+  // Clear cached data fields so each test starts from a clean
+  // "no data" state. Prior tests leave the singleton populated,
+  // which breaks assertions like `loading === true during fetch`
+  // now that loading is only flipped on first-load (no existing
+  // data) rather than every refetch.
+  analytics.summary = null;
+  analytics.activity = null;
+  analytics.heatmap = null;
+  analytics.projects = null;
+  analytics.hourOfWeek = null;
+  analytics.sessionShape = null;
+  analytics.velocity = null;
+  analytics.tools = null;
+  analytics.topSessions = null;
+  analytics.signals = null;
 }
 
 // Note: selectDate and setDateRange invoke API mocks
@@ -414,6 +468,30 @@ describe("AnalyticsStore.setProject", () => {
   );
 });
 
+describe("AnalyticsStore machine filter", () => {
+  it.each([
+    { name: "summary", fn: () => api.getAnalyticsSummary },
+    { name: "activity", fn: () => api.getAnalyticsActivity },
+    { name: "heatmap", fn: () => api.getAnalyticsHeatmap },
+    { name: "projects", fn: () => api.getAnalyticsProjects },
+    { name: "hourOfWeek", fn: () => api.getAnalyticsHourOfWeek },
+    { name: "sessionShape", fn: () => api.getAnalyticsSessionShape },
+    { name: "velocity", fn: () => api.getAnalyticsVelocity },
+    { name: "tools", fn: () => api.getAnalyticsTools },
+    { name: "topSessions", fn: () => api.getAnalyticsTopSessions },
+    { name: "signals", fn: () => api.getAnalyticsSignals },
+  ])("should include machine in $name params", ({ fn }) => {
+    analytics.machine = "host-a,host-b";
+
+    analytics.fetchAll();
+
+    const mock = vi.mocked(fn());
+    expect(mock).toHaveBeenCalled();
+    const params = mock.mock.lastCall?.[0];
+    expect(params?.machine).toBe("host-a,host-b");
+  });
+});
+
 describe("executeFetch concurrency and error handling", () => {
   it("should set loading true during fetch", async () => {
     let resolve!: (v: AnalyticsSummary) => void;
@@ -538,5 +616,90 @@ describe("executeFetch concurrency and error handling", () => {
     resolveSecond(makeSummary());
     await secondFetch;
     expect(analytics.loading.summary).toBe(false);
+  });
+});
+
+describe("AnalyticsStore rolling default date range", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-04-25T12:00:00"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("constructor produces isPinned=false and windowDays=365", async () => {
+    const { analytics } = await loadAnalyticsStore();
+    expect(analytics.isPinned).toBe(false);
+    expect(analytics.windowDays).toBe(365);
+    expect(analytics.from).toBe("2025-04-25");
+    expect(analytics.to).toBe("2026-04-25");
+  });
+
+  it("fetchAll re-derives from/to against the current clock while unpinned", async () => {
+    const { analytics } = await loadAnalyticsStore();
+
+    expect(analytics.from).toBe("2025-04-25");
+    expect(analytics.to).toBe("2026-04-25");
+
+    vi.setSystemTime(new Date("2026-04-26T12:00:00"));
+    await analytics.fetchAll();
+
+    expect(analytics.from).toBe("2025-04-26");
+    expect(analytics.to).toBe("2026-04-26");
+  });
+
+  it("setDateRange pins and subsequent fetchAll does not roll", async () => {
+    const { analytics } = await loadAnalyticsStore();
+    analytics.setDateRange("2026-01-01", "2026-01-15");
+    expect(analytics.isPinned).toBe(true);
+    expect(analytics.from).toBe("2026-01-01");
+    expect(analytics.to).toBe("2026-01-15");
+
+    vi.setSystemTime(new Date("2026-04-26T12:00:00"));
+    await analytics.fetchAll();
+
+    expect(analytics.isPinned).toBe(true);
+    expect(analytics.from).toBe("2026-01-01");
+    expect(analytics.to).toBe("2026-01-15");
+  });
+
+  it("setRollingWindow sets windowDays, clears the pin, and re-derives dates", async () => {
+    const { analytics } = await loadAnalyticsStore();
+    analytics.setDateRange("2026-01-01", "2026-01-15");
+    expect(analytics.isPinned).toBe(true);
+
+    analytics.setRollingWindow(7);
+
+    expect(analytics.isPinned).toBe(false);
+    expect(analytics.windowDays).toBe(7);
+    expect(analytics.from).toBe("2026-04-18");
+    expect(analytics.to).toBe("2026-04-25");
+  });
+
+  it("after setRollingWindow, fetchAll keeps rolling", async () => {
+    const { analytics } = await loadAnalyticsStore();
+    analytics.setRollingWindow(7);
+    expect(analytics.from).toBe("2026-04-18");
+
+    vi.setSystemTime(new Date("2026-04-26T12:00:00"));
+    await analytics.fetchAll();
+
+    expect(analytics.from).toBe("2026-04-19");
+    expect(analytics.to).toBe("2026-04-26");
+  });
+
+  it("setRollingWindow clears any active drill-down (selectedDate/Dow/Hour)", async () => {
+    const { analytics } = await loadAnalyticsStore();
+    analytics.selectedDate = "2026-04-20";
+    analytics.selectedDow = 3;
+    analytics.selectedHour = 14;
+
+    analytics.setRollingWindow(7);
+
+    expect(analytics.selectedDate).toBeNull();
+    expect(analytics.selectedDow).toBeNull();
+    expect(analytics.selectedHour).toBeNull();
   });
 });

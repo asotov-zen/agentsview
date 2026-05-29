@@ -1,18 +1,33 @@
 <script lang="ts">
-  import { onMount, onDestroy, untrack } from "svelte";
-  import { usage } from "../../stores/usage.svelte.js";
-  import { sessions } from "../../stores/sessions.svelte.js";
+  import { onMount, onDestroy, tick, untrack } from "svelte";
+  import {
+    usage,
+    buildUsageUrlParams,
+    mergeUsageAndSessionUrlParams,
+    parseWindowDays,
+  } from "../../stores/usage.svelte.js";
+  import {
+    sessions,
+    filtersToParams,
+    parseFiltersFromParams,
+    splitExcludeProjectParam,
+  } from "../../stores/sessions.svelte.js";
   import { router } from "../../stores/router.svelte.js";
-  import { agentColor } from "../../utils/agents.js";
+  import { events } from "../../stores/events.svelte.js";
   import UsageSummaryCards from "./UsageSummaryCards.svelte";
   import CostTimeSeriesChart from "./CostTimeSeriesChart.svelte";
   import AttributionPanel from "./AttributionPanel.svelte";
   import TopSessionsTable from "./TopSessionsTable.svelte";
   import CacheEfficiencyPanel from "./CacheEfficiencyPanel.svelte";
+  import DateRangeSelector from "../shared/DateRangeSelector.svelte";
+  import SessionFilterControl from "../filters/SessionFilterControl.svelte";
+  import SessionActiveFilters from "../filters/SessionActiveFilters.svelte";
   import FilterDropdown from "./FilterDropdown.svelte";
 
   const REFRESH_MS = 5 * 60 * 1000;
   let refreshTimer: ReturnType<typeof setInterval> | undefined;
+  let unsubEvents: (() => void) | undefined;
+  let mounted = false;
 
   const projectItems = $derived(
     sessions.projects.map((p) => ({
@@ -21,20 +36,9 @@
     })),
   );
 
-  const agentItems = $derived(
-    sessions.agents.map((a) => ({
-      name: a.name,
-      count: a.session_count,
-    })),
-  );
-
   // Track every model we've seen in any summary response or
-  // excluded-model filter — never remove one. This keeps the model
-  // dropdown usable even when landing on a shared URL like
-  // /usage?exclude_model=claude-opus, which would otherwise never
-  // show that model in the dropdown (it's filtered out of
-  // modelTotals on every response) and leave the user unable to
-  // re-include it.
+  // model filter — never remove one. This keeps the model
+  // dropdown usable when landing on a shared filtered URL.
   let knownModels: string[] = $state([]);
 
   function mergeIntoKnownModels(names: string[]): void {
@@ -59,36 +63,108 @@
     untrack(() => mergeIntoKnownModels(fromSummary));
   });
 
-  // Seed from the excluded-model filter so a shared URL like
-  // /usage?exclude_model=foo shows "foo" in the dropdown on first
-  // load, letting the user re-include it without clearing first.
+  // Seed from URL/local model filters before a response arrives.
   $effect(() => {
-    const excluded = usage.excludedModels;
+    const filtered = [
+      usage.selectedModels,
+    ].filter(Boolean).join(",");
     untrack(() => {
-      if (!excluded) return;
-      mergeIntoKnownModels(excluded.split(","));
+      if (!filtered) return;
+      mergeIntoKnownModels(filtered.split(","));
     });
   });
 
   const modelItems = $derived(
     knownModels.map((m) => ({ name: m })),
   );
+  const selectedModels = $derived(
+    usage.selectedModels
+      ? usage.selectedModels.split(",").filter(Boolean)
+      : [],
+  );
+  const sessionUrlParams = $derived(
+    filtersToParams(sessions.filters),
+  );
+  const sessionFilterSignature = $derived(
+    JSON.stringify(sessionUrlParams),
+  );
 
   // URL-init: seed store filters from URL params when landing
-  // on /usage or when the URL changes via back/forward nav.
-  // Uses explicit empty fallbacks so filters CLEAR when params
-  // disappear (e.g., navigating back from /usage?exclude_project=foo
-  // to /usage). On initial mount, onMount() calls fetchAll after
-  // this effect runs, so we skip the refetch on the first run.
-  let urlInitRan = false;
+  // on /usage with a deep-link. A bare /usage preserves the
+  // current store state (restored from localStorage). Only
+  // apply params that are actually present in the URL.
+  const USAGE_FILTER_KEYS = new Set([
+    "from", "to", "window_days",
+    "model", "exclude_model",
+  ]);
+  const SESSION_FILTER_KEYS = new Set([
+    "project", "machine", "agent",
+    "date", "date_from", "date_to",
+    "active_since", "exclude_project",
+    "min_messages", "max_messages", "min_user_messages",
+    "include_one_shot", "include_automated",
+  ]);
+  let urlInitRan = $state(false);
+  let urlWritebackReady = $state(false);
+  let initialFetchDone = $state(false);
   $effect(() => {
     const route = router.route;
     const params = router.params;
     untrack(() => {
       if (route !== "usage") return;
+      const hasDateParam = !!params["from"] || !!params["to"];
+      const parsedWindowDays = parseWindowDays(params["window_days"]);
+      const hasFilterKeys = Object.keys(params).some(
+        (k) =>
+          USAGE_FILTER_KEYS.has(k) ||
+          SESSION_FILTER_KEYS.has(k),
+      );
+      const hasSessionFilterKeys = Object.keys(params).some(
+        (k) => SESSION_FILTER_KEYS.has(k),
+      );
+
       let changed = false;
-      // from/to: use defaults when missing (don't stomp the store
-      // with "" which would break date inputs).
+      let sessionChanged = false;
+
+      // Sync pin state from URL: dated URL pins, undated URL unpins.
+      // Runs before the !hasFilterKeys early return so a fully bare URL
+      // (no exclude_* either) still flips the pin off.
+      if (usage.isPinned !== hasDateParam) {
+        usage.isPinned = hasDateParam;
+        changed = true;
+      }
+
+      // Apply rolling window from URL when present and the URL is
+      // not pinning a specific date range.
+      if (!hasDateParam && parsedWindowDays !== null) {
+        if (usage.windowDays !== parsedWindowDays) {
+          usage.windowDays = parsedWindowDays;
+          changed = true;
+        }
+      }
+
+      if (!hasFilterKeys) {
+        if (changed && urlInitRan) {
+          usage.fetchAll();
+        }
+        urlInitRan = true;
+        return;
+      }
+      if (hasSessionFilterKeys) {
+        const nextSessionParams = filtersToParams(
+          parseFiltersFromParams(params),
+        );
+        const currentSessionParams = filtersToParams(
+          sessions.filters,
+        );
+        if (
+          JSON.stringify(nextSessionParams) !==
+          JSON.stringify(currentSessionParams)
+        ) {
+          sessions.initFromParams(params);
+          sessionChanged = true;
+        }
+      }
       if (params["from"] && params["from"] !== usage.from) {
         usage.from = params["from"];
         changed = true;
@@ -97,24 +173,24 @@
         usage.to = params["to"];
         changed = true;
       }
-      // Exclude params: missing means "nothing excluded", so we
-      // MUST update to "" when the param disappears.
-      const newExProj = params["exclude_project"] ?? "";
-      if (newExProj !== usage.excludedProjects) {
-        usage.excludedProjects = newExProj;
+      const newExProject = splitExcludeProjectParam(
+        params["exclude_project"],
+      ).usageExcludedProjects;
+      if (newExProject !== usage.excludedProjects) {
+        usage.excludedProjects = newExProject;
         changed = true;
       }
-      const newExAgent = params["exclude_agent"] ?? "";
-      if (newExAgent !== usage.excludedAgents) {
-        usage.excludedAgents = newExAgent;
+      if (usage.excludedModels) {
+        usage.excludedModels = "";
         changed = true;
       }
-      const newExModel = params["exclude_model"] ?? "";
-      if (newExModel !== usage.excludedModels) {
-        usage.excludedModels = newExModel;
+      const newModel = params["model"] ?? "";
+      if (newModel !== usage.selectedModels) {
+        usage.selectedModels = newModel;
+        if (newModel) usage.excludedModels = "";
         changed = true;
       }
-      if (changed && urlInitRan) {
+      if ((changed || sessionChanged) && urlInitRan) {
         usage.fetchAll();
       }
       urlInitRan = true;
@@ -124,42 +200,52 @@
   // URL write-back: keep URL params in sync with filter state
   // so users can share/bookmark the view.
   $effect(() => {
-    const from = usage.from;
-    const to = usage.to;
-    const exProj = usage.excludedProjects;
-    const exAgent = usage.excludedAgents;
-    const exModel = usage.excludedModels;
+    const state = {
+      from: usage.from,
+      to: usage.to,
+      isPinned: usage.isPinned,
+      windowDays: usage.windowDays,
+      excludedProjects: usage.excludedProjects,
+      excludedAgents: usage.excludedAgents,
+      excludedModels: usage.excludedModels,
+      selectedModels: usage.selectedModels,
+    };
+    const nextParams = mergeUsageAndSessionUrlParams(
+      buildUsageUrlParams(state),
+      sessionUrlParams,
+    );
+    const ready = urlInitRan && urlWritebackReady;
     untrack(() => {
-      if (router.route !== "usage") return;
-      const params: Record<string, string> = {};
-      if (from) params["from"] = from;
-      if (to) params["to"] = to;
-      if (exProj) params["exclude_project"] = exProj;
-      if (exAgent) params["exclude_agent"] = exAgent;
-      if (exModel) params["exclude_model"] = exModel;
-      router.replaceParams(params);
+      if (!ready || router.route !== "usage") return;
+      router.replaceParams(nextParams);
     });
   });
 
-  function handleFromChange(
-    e: Event & { currentTarget: HTMLInputElement },
-  ) {
-    const val = e.currentTarget.value;
-    if (val) usage.setDateRange(val, usage.to);
-  }
-
-  function handleToChange(
-    e: Event & { currentTarget: HTMLInputElement },
-  ) {
-    const val = e.currentTarget.value;
-    if (val) usage.setDateRange(usage.from, val);
-  }
+  $effect(() => {
+    const signature = sessionFilterSignature;
+    const ready = urlInitRan && urlWritebackReady;
+    untrack(() => {
+      if (!ready || !signature || router.route !== "usage" || !mounted) {
+        return;
+      }
+      if (!initialFetchDone) {
+        initialFetchDone = true;
+      }
+      usage.fetchAll();
+    });
+  });
 
   onMount(() => {
-    usage.fetchAll();
+    mounted = true;
+    tick().then(() => {
+      urlWritebackReady = true;
+    });
     refreshTimer = setInterval(
       () => usage.fetchAll(),
       REFRESH_MS,
+    );
+    unsubEvents = events.subscribeDebounced(
+      () => usage.fetchAll(),
     );
   });
 
@@ -167,26 +253,31 @@
     if (refreshTimer !== undefined) {
       clearInterval(refreshTimer);
     }
+    unsubEvents?.();
   });
 </script>
 
 <div class="usage-page">
   <div class="usage-toolbar">
-    <h2 class="page-title">Usage</h2>
-
     <div class="toolbar-controls">
-      <input
-        type="date"
-        class="date-input"
-        value={usage.from}
-        onchange={handleFromChange}
-      />
-      <span class="date-sep">to</span>
-      <input
-        type="date"
-        class="date-input"
-        value={usage.to}
-        onchange={handleToChange}
+      <div class="usage-filter-anchor">
+        <SessionFilterControl
+          showDisplay={false}
+          showStarred={false}
+          align="left"
+          extraActive={usage.hasActiveFilters || !!sessions.filters.project}
+          onClearExtra={() => {
+            sessions.filters.project = "";
+            usage.clearFilters();
+          }}
+        />
+      </div>
+
+      <DateRangeSelector
+        from={usage.from}
+        to={usage.to}
+        onChange={(from, to) => usage.setDateRange(from, to)}
+        onPreset={(days) => usage.setRollingWindow(days)}
       />
 
       <FilterDropdown
@@ -195,26 +286,19 @@
         excludedCsv={usage.excludedProjects}
         onToggle={(name) => usage.toggleProject(name)}
         onSelectAll={() => usage.selectAllProjects()}
-        onDeselectAll={() => usage.deselectAllProjects(projectItems.map(p => p.name))}
-      />
-
-      <FilterDropdown
-        label="Agent"
-        items={agentItems}
-        excludedCsv={usage.excludedAgents}
-        onToggle={(name) => usage.toggleAgent(name)}
-        onSelectAll={() => usage.selectAllAgents()}
-        onDeselectAll={() => usage.deselectAllAgents(agentItems.map(a => a.name))}
-        color={agentColor}
+        onDeselectAll={() =>
+          usage.deselectAllProjects(projectItems.map((p) => p.name))}
       />
 
       <FilterDropdown
         label="Model"
         items={modelItems}
-        excludedCsv={usage.excludedModels}
+        excludedCsv={usage.selectedModels}
+        mode="include"
         onToggle={(name) => usage.toggleModel(name)}
         onSelectAll={() => usage.selectAllModels()}
-        onDeselectAll={() => usage.deselectAllModels(modelItems.map(m => m.name))}
+        onDeselectAll={() =>
+          usage.deselectAllModels(modelItems.map((m) => m.name))}
       />
 
       <button
@@ -233,16 +317,15 @@
         </svg>
       </button>
 
-      {#if usage.hasActiveFilters}
-        <button
-          class="clear-filters"
-          onclick={() => usage.clearFilters()}
-        >
-          Clear filters
-        </button>
-      {/if}
     </div>
   </div>
+
+  <SessionActiveFilters
+    modelFilters={selectedModels}
+    onClearProjects={() => usage.selectAllProjects()}
+    onRemoveModel={(model) => usage.toggleModel(model)}
+    onClearModels={() => usage.selectAllModels()}
+  />
 
   <div class="usage-content">
     <UsageSummaryCards />
@@ -284,13 +367,6 @@
     flex-shrink: 0;
   }
 
-  .page-title {
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--text-primary);
-    white-space: nowrap;
-  }
-
   .toolbar-controls {
     display: flex;
     align-items: center;
@@ -299,36 +375,10 @@
     flex: 1;
   }
 
-  .date-input {
-    height: 26px;
-    padding: 0 6px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    background: var(--bg-inset);
-    color: var(--text-primary);
-    font-size: 11px;
-    font-family: var(--font-mono);
-  }
-
-  .date-sep {
-    font-size: 11px;
-    color: var(--text-muted);
-  }
-
-  .clear-filters {
-    height: 26px;
-    padding: 0 8px;
-    border: none;
-    background: none;
-    color: var(--text-muted);
-    font-size: 11px;
-    cursor: pointer;
-    text-decoration: underline;
-    text-underline-offset: 2px;
-  }
-
-  .clear-filters:hover {
-    color: var(--text-primary);
+  .usage-filter-anchor {
+    position: relative;
+    display: flex;
+    align-items: center;
   }
 
   .refresh-btn {

@@ -2,8 +2,9 @@ import { test, expect } from "@playwright/test";
 import { SessionsPage } from "./pages/sessions-page";
 
 // Test-fixture assumptions: project-alpha has 2 sessions,
-// project-beta has 3, totalling 8 sessions across all projects.
-const TOTAL_SESSIONS = 8;
+// project-beta has 3, project-duration has 1 (the duration UX
+// showcase), totalling 9 sessions across all projects.
+const TOTAL_SESSIONS = 9;
 const ALPHA_SESSIONS = 2;
 const BETA_SESSIONS = 3;
 
@@ -51,4 +52,29 @@ test.describe("Session list", () => {
       await expect(sp.sessionItems).toHaveCount(expectedCount);
     });
   }
+
+  test("URL updates when filter changes on bare /sessions", async ({
+    page,
+  }) => {
+    await sp.filterByProject("project-alpha");
+    await expect(page).toHaveURL(/[?&]project=project-alpha/);
+  });
+
+  test("URL re-syncs filter from localStorage on tab switch back", async ({
+    page,
+  }) => {
+    // Apply a filter so the URL and localStorage record it.
+    await sp.filterByProject("project-alpha");
+    await expect(page).toHaveURL(/[?&]project=project-alpha/);
+
+    // Switch to Usage; the sessions URL leaves view.
+    await page.locator('.nav-btn[aria-label="Usage"]').click();
+    await expect(page).toHaveURL(/\/usage/);
+
+    // Return to Sessions. The bare /sessions navigation should
+    // re-acquire the filter from localStorage and reflect it
+    // back into the URL so it matches what's displayed.
+    await page.locator('.nav-btn[aria-label="Sessions"]').click();
+    await expect(page).toHaveURL(/[?&]project=project-alpha/);
+  });
 });

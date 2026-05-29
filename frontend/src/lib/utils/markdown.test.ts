@@ -156,6 +156,20 @@ describe("renderMarkdown", () => {
       expect(bq!.textContent!.trim()).toBe("quoted text");
     });
 
+    it("preserves prose around separated blockquotes", () => {
+      const dom = parseHTML(
+        renderMarkdown(
+          "blabla1\n\n> blabla2\n\nblabla3\n\n> blabla4\n\nblabla5",
+        ),
+      );
+      expect(dom.textContent).toContain("blabla1");
+      expect(dom.textContent).toContain("blabla2");
+      expect(dom.textContent).toContain("blabla3");
+      expect(dom.textContent).toContain("blabla4");
+      expect(dom.textContent).toContain("blabla5");
+      expect(dom.querySelectorAll("blockquote")).toHaveLength(2);
+    });
+
     it("renders tables", () => {
       const md = "| A | B |\n| --- | --- |\n| 1 | 2 |";
       const dom = parseHTML(renderMarkdown(md));
@@ -308,6 +322,146 @@ describe("renderMarkdown", () => {
         assertFn(renderMarkdown(input));
       },
     );
+  });
+
+  describe("Claude Code shell shortcuts", () => {
+    it("renders <bash-input> as a shell code block with ! prefix", () => {
+      const dom = parseHTML(
+        renderMarkdown("<bash-input>git pull origin main</bash-input>"),
+      );
+      const code = dom.querySelector("pre > code");
+      expect(code).not.toBeNull();
+      expect(code!.textContent).toBe("!git pull origin main\n");
+      // Tag itself must not survive in the output.
+      expect(dom.innerHTML).not.toMatch(/<\/?bash-input>/);
+    });
+
+    it("preserves multi-line commands in <bash-input>", () => {
+      const dom = parseHTML(
+        renderMarkdown(
+          "<bash-input>cd /tmp\nls -la</bash-input>",
+        ),
+      );
+      const code = dom.querySelector("pre > code");
+      expect(code).not.toBeNull();
+      expect(code!.textContent).toBe("!cd /tmp\nls -la\n");
+    });
+
+    it("renders <bash-stdout> as an unlabelled code block", () => {
+      const dom = parseHTML(
+        renderMarkdown("<bash-stdout>hello world</bash-stdout>"),
+      );
+      const code = dom.querySelector("pre > code");
+      expect(code).not.toBeNull();
+      expect(code!.textContent).toBe("hello world\n");
+      expect(dom.innerHTML).not.toMatch(/<\/?bash-stdout>/);
+    });
+
+    it("renders <bash-stderr> as an unlabelled code block", () => {
+      const dom = parseHTML(
+        renderMarkdown("<bash-stderr>oops</bash-stderr>"),
+      );
+      const code = dom.querySelector("pre > code");
+      expect(code).not.toBeNull();
+      expect(code!.textContent).toBe("oops\n");
+      expect(dom.innerHTML).not.toMatch(/<\/?bash-stderr>/);
+    });
+
+    it("drops empty <bash-stdout> and <bash-stderr> blocks", () => {
+      const dom = parseHTML(
+        renderMarkdown(
+          "<bash-input>true</bash-input>" +
+            "<bash-stdout></bash-stdout>" +
+            "<bash-stderr></bash-stderr>",
+        ),
+      );
+      const codes = dom.querySelectorAll("pre > code");
+      expect(codes.length).toBe(1);
+      expect(codes[0]!.textContent).toBe("!true\n");
+    });
+
+    it("handles input with backticks by picking a longer fence", () => {
+      const dom = parseHTML(
+        renderMarkdown(
+          "<bash-input>echo ```triple``` and ` single`</bash-input>",
+        ),
+      );
+      const code = dom.querySelector("pre > code");
+      expect(code).not.toBeNull();
+      expect(code!.textContent).toBe(
+        "!echo ```triple``` and ` single`\n",
+      );
+    });
+
+    it("handles consecutive input/stdout pair", () => {
+      const dom = parseHTML(
+        renderMarkdown(
+          "<bash-input>echo hi</bash-input>" +
+            "<bash-stdout>hi\n</bash-stdout>",
+        ),
+      );
+      const codes = dom.querySelectorAll("pre > code");
+      expect(codes.length).toBe(2);
+      expect(codes[0]!.textContent).toBe("!echo hi\n");
+      expect(codes[1]!.textContent).toBe("hi\n");
+    });
+
+    it("leaves wrappers inside fenced code blocks alone", () => {
+      // The user is talking ABOUT the tag, not invoking one. The
+      // marked extension runs at the lexer level, so once the
+      // fenced block consumes these characters they are never
+      // re-tokenized as wrappers.
+      const dom = parseHTML(
+        renderMarkdown(
+          "```\n<bash-input>echo hi</bash-input>\n```",
+        ),
+      );
+      const code = dom.querySelector("pre > code");
+      expect(code).not.toBeNull();
+      expect(code!.textContent).toBe(
+        "<bash-input>echo hi</bash-input>\n",
+      );
+    });
+
+    it("tags the input block with language-shell", () => {
+      const html = renderMarkdown(
+        "<bash-input>echo hi</bash-input>",
+      );
+      expect(html).toMatch(
+        /<code[^>]*class="language-shell"/,
+      );
+    });
+
+    it("preserves leading whitespace and indentation in stdout", () => {
+      // Shell output frequently has indentation that's meaningful
+      // (tree output, table layouts, log-line columns). Trimming
+      // would corrupt the transcript.
+      const dom = parseHTML(
+        renderMarkdown(
+          "<bash-stdout>  line one\n    nested\n  line two</bash-stdout>",
+        ),
+      );
+      const code = dom.querySelector("pre > code");
+      expect(code).not.toBeNull();
+      expect(code!.textContent).toBe(
+        "  line one\n    nested\n  line two\n",
+      );
+    });
+
+    it("preserves leading and trailing blank lines in stdout", () => {
+      const dom = parseHTML(
+        renderMarkdown(
+          "<bash-stdout>\n\nbody\n\n</bash-stdout>",
+        ),
+      );
+      const code = dom.querySelector("pre > code");
+      expect(code).not.toBeNull();
+      // marked normalizes the final newline but leading blanks
+      // and the interior blank-line structure are preserved.
+      expect(code!.textContent).toMatch(
+        /^\n\nbody\n/,
+      );
+    });
   });
 
   describe("edge cases", () => {

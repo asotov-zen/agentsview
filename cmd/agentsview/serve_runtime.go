@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/wesm/agentsview/internal/config"
-	"github.com/wesm/agentsview/internal/server"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/server"
 )
 
 type serveRuntimeOptions struct {
@@ -35,7 +35,11 @@ func prepareServeRuntimeConfig(
 
 	port := server.FindAvailablePort(cfg.Host, cfg.Port)
 	if port != cfg.Port {
-		fmt.Printf("Port %d in use, using %d\n", cfg.Port, port)
+		if cfg.Port == 0 {
+			fmt.Printf("Using available port %d\n", port)
+		} else {
+			fmt.Printf("Port %d in use, using %d\n", cfg.Port, port)
+		}
 	}
 	cfg.Port = port
 

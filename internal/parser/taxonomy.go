@@ -46,6 +46,20 @@ func NormalizeToolCategory(rawName string) string {
 	case "search_files", "grep", "grep_search":
 		return "Grep"
 
+	// Antigravity tools
+	case "view_file", "read_url_content":
+		return "Read"
+	case "replace_file_content", "multi_replace_file_content":
+		return "Edit"
+	case "write_to_file":
+		return "Write"
+	case "define_subagent", "invoke_subagent", "manage_subagents",
+		"send_message", "manage_task":
+		return "Task"
+	case "ask_permission", "ask_question", "schedule", "search_web",
+		"generate_image":
+		return "Tool"
+
 	// OpenCode tools (lowercase variants)
 	// Note: "grep" is handled above in the Gemini section.
 	case "read":
@@ -116,11 +130,22 @@ func NormalizeToolCategory(rawName string) string {
 	case "subagents", "agents_list", "session_status":
 		return "Task"
 
+	// Forge tools
+	case "fs_search":
+		return "Grep"
+	case "patch", "multi_patch", "undo", "remove":
+		return "Edit"
+	case "fetch":
+		return "Read"
+	case "todo_write", "todo_read":
+		return "Tool"
+	case "parallel":
+		return "Task"
+
 	// Hermes Agent tools (excluding names already handled above:
 	// read_file→Read, write_file→Write, search_files→Grep,
-	// edit_file→Edit, run_command/execute_command→Bash)
-	case "patch":
-		return "Edit"
+	// edit_file→Edit, run_command/execute_command→Bash,
+	// patch→Edit)
 	case "terminal":
 		return "Bash"
 	case "browser_navigate", "browser_snapshot", "browser_click",
@@ -139,11 +164,23 @@ func NormalizeToolCategory(rawName string) string {
 		"text_to_speech", "cronjob":
 		return "Tool"
 
-	// Zencoder tools (not already covered above)
-	case "WebFetch":
+	// Piebald / Piebald-hosted built-in tools (not already covered above).
+	case "ReadFile":
 		return "Read"
-	case "TodoWrite":
+	case "WriteFile":
+		return "Write"
+	case "EditFile":
+		return "Edit"
+	case "RunTerminalCommand":
+		return "Bash"
+	case "LaunchSubagent":
+		return "Task"
+	case "WebFetch", "WebSearch":
 		return "Tool"
+	case "TodoWrite", "AskUserQuestion", "ProposePlanToUser":
+		return "Tool"
+
+	// Zencoder tools (not already covered above).
 	case "subagent__ZencoderSubagent":
 		return "Task"
 	case "zencoder-rag-mcp__web_search":

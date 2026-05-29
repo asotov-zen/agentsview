@@ -2,6 +2,7 @@
 /agentsview
 /agentsview.exe
 /agentsv
+/custom-gcl
 /testfixture
 *.test.exe
 
@@ -13,7 +14,8 @@ test-results/
 frontend/playwright-report/
 
 # Embedded frontend build output
-internal/web/dist/
+internal/web/dist/*
+!internal/web/dist/.keep
 
 # Test/build artifacts
 /dist/
@@ -44,6 +46,9 @@ __pycache__/
 .gomodcache/
 .gopath/
 
+# SSH test key (extracted from Docker container)
+testdata/ssh/test_key
+
 # Local data
 data/
 sessions/
@@ -51,3 +56,11 @@ html/
 .superset/
 .github/hooks/
 .superpowers/
+.worktrees/
+
+# Visual verification scratch — per-task screenshot/HTML capture dirs.
+.test-data*/
+
+# Antigravity CLI session dir created when AGY runs inside this repo
+.antigravitycli/
+.kata.local.toml
